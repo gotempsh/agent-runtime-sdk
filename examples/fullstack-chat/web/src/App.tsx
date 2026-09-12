@@ -264,6 +264,7 @@ function eventSummary(event: ChatEvent) {
 
 interface NormalizedToolCall {
   key: string;
+  turn: number;
   id: string | null;
   name: string;
   state: ToolChipStep["state"];
@@ -276,8 +277,13 @@ interface NormalizedToolCall {
 
 function normalizedToolCalls(events: ChatEvent[]) {
   const calls: NormalizedToolCall[] = [];
+  let turn = 0;
 
   for (const event of events) {
+    if (event.kind === "message_started") {
+      turn += 1;
+      continue;
+    }
     if (eventType(event) !== "tool_call") continue;
 
     const id = typeof event.payload.id === "string" ? event.payload.id : null;
@@ -289,10 +295,10 @@ function normalizedToolCalls(events: ChatEvent[]) {
       : status === "succeeded"
         ? "output-available"
         : "input-available";
-    let existingIndex = id ? calls.findIndex((call) => call.id === id) : -1;
+    let existingIndex = id ? calls.findIndex((call) => call.turn === turn && call.id === id) : -1;
     if (!id) {
       for (let index = calls.length - 1; index >= 0; index -= 1) {
-        if (calls[index].name === name && calls[index].state === "input-available") {
+        if (calls[index].turn === turn && calls[index].name === name && calls[index].state === "input-available") {
           existingIndex = index;
           break;
         }
@@ -313,7 +319,8 @@ function normalizedToolCalls(events: ChatEvent[]) {
     }
 
     calls.push({
-      key: id ?? `${name}-${event.sequence}`,
+      key: `${turn}-${id ?? `${name}-${event.sequence}`}`,
+      turn,
       id,
       name,
       state,

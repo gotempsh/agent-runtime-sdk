@@ -822,8 +822,27 @@ test("renders Codex models, approval, plan, and fast mode from discovery", async
   expect(failures).toEqual([]);
 });
 
-test("renders concrete Claude generations from native discovery", async ({ page }) => {
+test("renders concrete Claude generations from discovered model metadata", async ({ page }) => {
   const failures = collectBrowserFailures(page);
+  const discovery = readyClaudeInventory();
+  discovery.harnesses[0].models.models = [{
+    id: "sonnet",
+    label: "Sonnet",
+    description: "Sonnet 5 · Efficient for routine tasks",
+    is_default: true,
+    reasoning_efforts: [
+      { id: "off", label: "Off", description: "Disable thinking", is_default: false },
+      { id: "low", label: "Low", description: "Low thinking", is_default: false },
+      { id: "medium", label: "Medium", description: "Medium thinking", is_default: false },
+      { id: "high", label: "High", description: "High thinking", is_default: true },
+      { id: "xhigh", label: "Extra high", description: "Extra high thinking", is_default: false },
+      { id: "max", label: "Max", description: "Maximum thinking", is_default: false },
+      { id: "ultracode", label: "Ultra code", description: "Ultra code thinking", is_default: false },
+    ],
+    service_tiers: [],
+  }];
+  await page.route("**/api/discovery", (route) => route.fulfill({ json: discovery }));
+  await page.route("**/api/chats?*", (route) => route.fulfill({ json: [] }));
   await page.goto("/");
   await page.getByLabel("Harness").selectOption("claude");
 
@@ -839,10 +858,14 @@ test("renders concrete Claude generations from native discovery", async ({ page 
 test("streams a persistent chat and restores multiple messages after reload", async ({ page }) => {
   const failures = collectBrowserFailures(page);
   const chatId = await openFixtureChat(page, "Verify streaming and approval persistence.");
+  const savedResponse = await page.request.get(`/api/chats/${encodeURIComponent(chatId)}`);
+  expect(savedResponse.ok()).toBe(true);
+  const savedView = await savedResponse.json() as { chat: { working_directory: string } };
+  expect(savedView.chat.working_directory).toMatch(/^\//);
 
   await expect(page.getByTestId("chat-status")).toHaveText("Approval needed");
   await expect(page.locator(".chat-header-context h1")).toHaveText("Verify streaming and approval persistence.");
-  await expect(page.locator(".chat-header-folder")).toContainText(".");
+  await expect(page.locator(".chat-header-folder")).toHaveText(savedView.chat.working_directory);
   await expect(page.getByTestId("plan-card")).toContainText("Verify the runtime boundary");
   await expect(page.getByTestId("approval-card")).toContainText("cargo test");
   await page.getByRole("button", { name: "Allow command" }).click();
@@ -907,7 +930,7 @@ test("cancels a response while approval is pending", async ({ page }) => {
   const failures = collectBrowserFailures(page);
   await openFixtureChat(page, "Cancel this turn at its approval boundary.");
   await expect(page.getByTestId("chat-status")).toHaveText("Approval needed");
-  await page.getByRole("button", { name: "Cancel", exact: true }).click();
+  await page.getByRole("button", { name: "Cancel running turn", exact: true }).click();
 
   await expect(page.getByTestId("chat-status")).toHaveText("Cancelled");
   expect(failures).toEqual([]);
