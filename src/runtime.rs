@@ -1832,6 +1832,11 @@ impl AgentRuntime {
                 });
             }
         }
+        // A pre-cancelled turn must never race an immediately available permit
+        // into spawning a provider executable.
+        if request.cancellation.is_cancelled() {
+            return Err(RuntimeError::Cancelled { provider });
+        }
         let permit = tokio::select! {
             _ = request.cancellation.cancelled() => {
                 return Err(RuntimeError::Cancelled { provider });

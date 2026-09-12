@@ -24,15 +24,14 @@ use temps_agent_runtime::retained::{
 use temps_agent_runtime::{
     AccountUsageSnapshot, AdapterOutput, AdapterState, AgentAdapter, AgentRuntime,
     ApprovalDecision, ApprovalRequest, ChatAttachment, ChatQueueStore as DurableChatQueueStore,
-    CommandSpec, ContextWindowUsage, EventSink,
-    ExecutionTransport, HarnessExtensionInventory, HarnessExtensionQuery, HarnessExtensionScope,
-    HarnessInventory, HarnessMcpDefinition, InteractionBroker, InteractionHandler,
-    InteractionRequest, LocalTransport, McpServerManagementRequest, PermissionMode,
-    PermissionSupport, Provider, ProviderReadiness, QuestionAnswer, QuestionRequest,
-    QueuedChatMessage, RunStatus, RuntimeError, SecretString, SkillManagementRequest,
-    SshHostKeyPolicy, SshTransport, TempsSandboxAuth, TempsSandboxTransport, ToolCallStatus,
-    TransportError, TransportErrorKind, TransportSpawnRequest, TurnEvent, TurnRequest, TurnResult,
-    Usage,
+    CommandSpec, ContextWindowUsage, EventSink, ExecutionTransport, HarnessExtensionInventory,
+    HarnessExtensionQuery, HarnessExtensionScope, HarnessInventory, HarnessMcpDefinition,
+    InteractionBroker, InteractionHandler, InteractionRequest, LocalTransport,
+    McpServerManagementRequest, PermissionMode, PermissionSupport, Provider, ProviderReadiness,
+    QuestionAnswer, QuestionRequest, QueuedChatMessage, RunStatus, RuntimeError, SecretString,
+    SkillManagementRequest, SshHostKeyPolicy, SshTransport, TempsSandboxAuth,
+    TempsSandboxTransport, ToolCallStatus, TransportError, TransportErrorKind,
+    TransportSpawnRequest, TurnEvent, TurnRequest, TurnResult, Usage,
 };
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{broadcast, Mutex, RwLock};
@@ -451,7 +450,6 @@ impl PermissionChoice {
             PermissionMode::AcceptEdits => Some(Self::AcceptEdits),
             PermissionMode::Plan => Some(Self::Plan),
             PermissionMode::FullAccess => Some(Self::FullAccess),
-            PermissionMode::Custom(_) => None,
             _ => None,
         }
     }
@@ -459,7 +457,6 @@ impl PermissionChoice {
 
 fn claude_permission_option(mode: &PermissionMode) -> String {
     match mode {
-        PermissionMode::Default => "manual".to_string(),
         PermissionMode::AcceptEdits => "acceptEdits".to_string(),
         PermissionMode::Plan => "plan".to_string(),
         PermissionMode::FullAccess => "bypassPermissions".to_string(),
@@ -1923,7 +1920,6 @@ async fn create_chat(
 
     spawn_turn_chain(
         state,
-        chat_id.clone(),
         Arc::clone(&record),
         body,
         prompt,
@@ -2036,7 +2032,6 @@ async fn start_chat_message(
 
     spawn_turn_chain(
         state,
-        chat_id,
         Arc::clone(&record),
         body,
         prompt,
@@ -2049,7 +2044,6 @@ async fn start_chat_message(
 
 fn spawn_turn_chain(
     state: AppState,
-    chat_id: String,
     record: Arc<ChatRecord>,
     body: ChatMessageRequest,
     prompt: String,
@@ -2058,6 +2052,7 @@ fn spawn_turn_chain(
     resume_session_id: Option<String>,
 ) {
     tokio::spawn(async move {
+        let chat_id = record.snapshot.read().await.id.clone();
         let fallback_body = body.clone();
         execute_turn(
             state.clone(),
@@ -2357,10 +2352,12 @@ fn prompt_with_attachments(content: &str, attachments: &[ChatAttachment]) -> Str
             .media_type
             .as_deref()
             .map_or(String::new(), |value| format!(" [{value}]"));
-        prompt.push_str(&format!(
-            "- {}{}: {}\n",
-            attachment.name, media_type, attachment.uri
-        ));
+        prompt.push_str("- ");
+        prompt.push_str(&attachment.name);
+        prompt.push_str(&media_type);
+        prompt.push_str(": ");
+        prompt.push_str(&attachment.uri);
+        prompt.push('\n');
     }
     prompt
 }
@@ -2801,7 +2798,8 @@ impl EventSink for ChatSink {
                     }
                 }
                 TurnEvent::Usage(usage) => {
-                    snapshot.usage.input_tokens = usage.input_tokens.or(snapshot.usage.input_tokens);
+                    snapshot.usage.input_tokens =
+                        usage.input_tokens.or(snapshot.usage.input_tokens);
                     snapshot.usage.output_tokens =
                         usage.output_tokens.or(snapshot.usage.output_tokens);
                     snapshot.usage.cache_creation_input_tokens = usage
@@ -3040,7 +3038,9 @@ impl AgentAdapter for DemoAdapter {
                 output.events.push(TurnEvent::Usage(usage));
             }
             "account_usage" => {
-                if let Ok(usage) = serde_json::from_value::<AccountUsageSnapshot>(value["usage"].clone()) {
+                if let Ok(usage) =
+                    serde_json::from_value::<AccountUsageSnapshot>(value["usage"].clone())
+                {
                     output.events.push(TurnEvent::AccountUsageUpdated { usage });
                 }
             }
@@ -3198,7 +3198,7 @@ async fn demo_provider_process() -> ExitCode {
     .await;
     emit_frame(
         &mut output,
-        json!({ "type": "usage", "input_tokens": 48, "output_tokens": 19, "context_used_tokens": 128000, "context_limit_tokens": 200000, "model": "claude-sonnet-5", "cost_usd": 0.0 }),
+        json!({ "type": "usage", "input_tokens": 48, "output_tokens": 19, "context_used_tokens": 128_000, "context_limit_tokens": 200_000, "model": "claude-sonnet-5", "cost_usd": 0.0 }),
     )
     .await;
     emit_frame(
@@ -3209,8 +3209,8 @@ async fn demo_provider_process() -> ExitCode {
                 "provider": "claude",
                 "plan": "pro",
                 "windows": [
-                    { "id": "five_hour", "kind": "session", "used_percent": 63.0, "duration_minutes": 300, "resets_at_unix_seconds": now_secs() + 7200 },
-                    { "id": "seven_day", "kind": "weekly", "used_percent": 41.0, "duration_minutes": 10080, "resets_at_unix_seconds": now_secs() + 432000 }
+                    { "id": "five_hour", "kind": "session", "used_percent": 63.0, "duration_minutes": 300, "resets_at_unix_seconds": now_secs() + 7_200 },
+                    { "id": "seven_day", "kind": "weekly", "used_percent": 41.0, "duration_minutes": 10_080, "resets_at_unix_seconds": now_secs() + 432_000 }
                 ],
                 "credits": null
             }
@@ -3246,6 +3246,13 @@ fn now_secs() -> u64 {
 #[cfg(test)]
 mod upload_tests {
     use super::*;
+
+    #[test]
+    fn custom_claude_permission_option_is_preserved() {
+        let mode = PermissionMode::Custom("custom-policy".to_owned());
+        assert_eq!(claude_permission_option(&mode), "custom-policy");
+        assert_eq!(claude_permission_option(&PermissionMode::Default), "manual");
+    }
 
     async fn test_chat_record(model: Option<&str>) -> (tempfile::TempDir, Arc<ChatRecord>) {
         let directory = tempfile::tempdir().expect("temporary chat directory");
