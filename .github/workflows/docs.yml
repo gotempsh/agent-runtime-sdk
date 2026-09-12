@@ -27,7 +27,7 @@ jobs:
       - name: Build portal and generated API
         working-directory: site
         env:
-          DOCS_BASE: /temps-agent-runtime/
+          DOCS_BASE: /agent-runtime-sdk/
         run: bun run build
       - uses: actions/upload-pages-artifact@v3
         with:
