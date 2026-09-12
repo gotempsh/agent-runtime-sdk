@@ -926,23 +926,18 @@ fn parse_control_directory(stdout: &[u8]) -> TransportResult<String> {
             false,
         )
     })?;
-    let path = Path::new(directory);
-    let valid_name = path
-        .file_name()
-        .and_then(OsStr::to_str)
-        .is_some_and(|name| {
-            name.strip_prefix("temps-agent-runtime.")
-                .is_some_and(|suffix| {
-                    suffix.len() == 10 && suffix.bytes().all(|byte| byte.is_ascii_alphanumeric())
-                })
-        });
-    if !path.is_absolute()
-        || path.components().any(|component| {
-            matches!(
-                component,
-                std::path::Component::ParentDir | std::path::Component::CurDir
-            )
-        })
+    // The directory belongs to a POSIX SSH host even when this client runs on Windows.
+    let valid_name = directory.rsplit('/').next().is_some_and(|name| {
+        name.strip_prefix("temps-agent-runtime.")
+            .is_some_and(|suffix| {
+                suffix.len() == 10 && suffix.bytes().all(|byte| byte.is_ascii_alphanumeric())
+            })
+    });
+    if !directory.starts_with('/')
+        || directory
+            .split('/')
+            .any(|component| component == "." || component == "..")
+        || directory.contains(['\\', '\r', '\n'])
         || !valid_name
     {
         return Err(TransportError::new(
@@ -1481,6 +1476,15 @@ mod tests {
         let escaped =
             b"\0TEMPS_AGENT_RUNTIME_CONTROL_DIRECTORY\0/tmp/../temps-agent-runtime.A1b2C3d4E5\0";
         assert!(parse_control_directory(escaped).is_err());
+        for invalid in [
+            b"\0TEMPS_AGENT_RUNTIME_CONTROL_DIRECTORY\0/tmp/./temps-agent-runtime.A1b2C3d4E5\0"
+                .as_slice(),
+            b"\0TEMPS_AGENT_RUNTIME_CONTROL_DIRECTORY\0/tmp\\other/temps-agent-runtime.A1b2C3d4E5\0",
+            b"\0TEMPS_AGENT_RUNTIME_CONTROL_DIRECTORY\0/tmp/temps-agent-runtime.A1b2C3d4E5\r\0",
+            b"\0TEMPS_AGENT_RUNTIME_CONTROL_DIRECTORY\0/tmp/temps-agent-runtime.A1b2C3d4E5\n\0",
+        ] {
+            assert!(parse_control_directory(invalid).is_err());
+        }
         let predictable =
             b"\0TEMPS_AGENT_RUNTIME_CONTROL_DIRECTORY\0/tmp/temps-agent-runtime-test.pid\0";
         assert!(parse_control_directory(predictable).is_err());
