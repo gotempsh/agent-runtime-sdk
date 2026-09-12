@@ -564,9 +564,18 @@ test("replays Claude native subagents with nested activity and tools", async ({ 
 
 test("discovers local harnesses and exposes typed target errors", async ({ page }) => {
   const failures = collectBrowserFailures(page);
+  const discoveryResponse = await page.request.post("/api/discovery", { data: { target: { kind: "local" } } });
+  expect(discoveryResponse.ok()).toBe(true);
+  const discovery = await discoveryResponse.json() as { harnesses: { provider: string; status: string }[] };
+  expect(discovery.harnesses.map((harness) => harness.provider)).toEqual(["claude", "codex", "open_code"]);
+  expect(discovery.harnesses.every((harness) => ["ready", "not_installed", "incompatible", "unavailable"].includes(harness.status))).toBe(true);
   await page.goto("/");
   await expect(page.getByLabel("Execution target", { exact: true })).toHaveValue("local");
-  await expect(page.getByLabel("Harness").locator("option")).toHaveCount(3, { timeout: 20_000 });
+  if (discovery.harnesses.some((harness) => harness.status === "ready")) {
+    await expect(page.getByLabel("Harness")).toBeVisible();
+  } else {
+    await expect(page.getByText("No harnesses available on this target")).toBeVisible();
+  }
   await expect(page.getByText("Use deterministic provider", { exact: true })).toHaveCount(0);
 
   await openConnectionPicker(page);
@@ -784,6 +793,8 @@ test("selects and keeps a remote working directory for an SSH chat", async ({ pa
 
 test("keeps onboarding vertically scrollable in a short viewport", async ({ page }) => {
   const failures = collectBrowserFailures(page);
+  await page.route("**/api/discovery", (route) => route.fulfill({ json: readyClaudeInventory() }));
+  await page.route("**/api/chats?*", (route) => route.fulfill({ json: [] }));
   await page.setViewportSize({ width: 390, height: 560 });
   await page.goto("/");
   await openConnectionPicker(page);
@@ -807,6 +818,40 @@ test("keeps onboarding vertically scrollable in a short viewport", async ({ page
 
 test("renders Codex models, approval, plan, and fast mode from discovery", async ({ page }) => {
   const failures = collectBrowserFailures(page);
+  const discovery = readyClaudeInventory();
+  const control = (id: string, label: string, kind: string, options: { id: string; label: string; is_default: boolean }[]) => ({
+    id, label, kind,
+    options: options.map((option) => ({ ...option, description: option.label, dangerous: false })),
+  });
+  const codex = {
+    ...discovery.harnesses[0],
+    provider: "codex",
+    permissions: { ...discovery.harnesses[0].permissions, plan: false, live_approvals: false, live_questions: false },
+    control_groups: [
+      control("approval_policy", "Approval", "permission", [
+        { id: "on-request", label: "On request", is_default: true },
+        { id: "never", label: "Never ask", is_default: false },
+      ]),
+      control("sandbox_mode", "Sandbox", "sandbox", [
+        { id: "workspace-write", label: "Workspace write", is_default: true },
+        { id: "read-only", label: "Read only", is_default: false },
+      ]),
+      control("collaboration_mode", "Mode", "collaboration", [
+        { id: "default", label: "Work", is_default: true },
+        { id: "plan", label: "Plan", is_default: false },
+      ]),
+    ],
+    models: { status: "ready", source: "fixture", models: [{
+      id: "gpt-5.6-sol", label: "GPT-5.6 Sol", description: "Codex model", is_default: true,
+      reasoning_efforts: ["low", "medium", "high", "xhigh", "max", "ultra"].map((id) => ({
+        id, label: ({ low: "Low", medium: "Medium", high: "High", xhigh: "Extra high", max: "Max", ultra: "Ultra" } as Record<string, string>)[id],
+        description: id, is_default: id === "low",
+      })),
+      service_tiers: [{ id: "priority", label: "Fast", description: "Faster response", is_default: false }],
+    }], error: null },
+  };
+  await page.route("**/api/discovery", (route) => route.fulfill({ json: { ...discovery, harnesses: [codex] } }));
+  await page.route("**/api/chats?*", (route) => route.fulfill({ json: [] }));
   await page.goto("/");
   await page.getByLabel("Harness").selectOption("codex");
 
@@ -822,8 +867,27 @@ test("renders Codex models, approval, plan, and fast mode from discovery", async
   expect(failures).toEqual([]);
 });
 
-test("renders concrete Claude generations from native discovery", async ({ page }) => {
+test("renders concrete Claude generations from discovered model metadata", async ({ page }) => {
   const failures = collectBrowserFailures(page);
+  const discovery = readyClaudeInventory();
+  discovery.harnesses[0].models.models = [{
+    id: "sonnet",
+    label: "Sonnet",
+    description: "Sonnet 5 · Efficient for routine tasks",
+    is_default: true,
+    reasoning_efforts: [
+      { id: "off", label: "Off", description: "Disable thinking", is_default: false },
+      { id: "low", label: "Low", description: "Low thinking", is_default: false },
+      { id: "medium", label: "Medium", description: "Medium thinking", is_default: false },
+      { id: "high", label: "High", description: "High thinking", is_default: true },
+      { id: "xhigh", label: "Extra high", description: "Extra high thinking", is_default: false },
+      { id: "max", label: "Max", description: "Maximum thinking", is_default: false },
+      { id: "ultracode", label: "Ultra code", description: "Ultra code thinking", is_default: false },
+    ],
+    service_tiers: [],
+  }];
+  await page.route("**/api/discovery", (route) => route.fulfill({ json: discovery }));
+  await page.route("**/api/chats?*", (route) => route.fulfill({ json: [] }));
   await page.goto("/");
   await page.getByLabel("Harness").selectOption("claude");
 
@@ -839,10 +903,14 @@ test("renders concrete Claude generations from native discovery", async ({ page 
 test("streams a persistent chat and restores multiple messages after reload", async ({ page }) => {
   const failures = collectBrowserFailures(page);
   const chatId = await openFixtureChat(page, "Verify streaming and approval persistence.");
+  const savedResponse = await page.request.get(`/api/chats/${encodeURIComponent(chatId)}`);
+  expect(savedResponse.ok()).toBe(true);
+  const savedView = await savedResponse.json() as { chat: { working_directory: string } };
+  expect(savedView.chat.working_directory).toMatch(/^\//);
 
   await expect(page.getByTestId("chat-status")).toHaveText("Approval needed");
   await expect(page.locator(".chat-header-context h1")).toHaveText("Verify streaming and approval persistence.");
-  await expect(page.locator(".chat-header-folder")).toContainText(".");
+  await expect(page.locator(".chat-header-folder")).toHaveText(savedView.chat.working_directory);
   await expect(page.getByTestId("plan-card")).toContainText("Verify the runtime boundary");
   await expect(page.getByTestId("approval-card")).toContainText("cargo test");
   await page.getByRole("button", { name: "Allow command" }).click();
@@ -907,7 +975,7 @@ test("cancels a response while approval is pending", async ({ page }) => {
   const failures = collectBrowserFailures(page);
   await openFixtureChat(page, "Cancel this turn at its approval boundary.");
   await expect(page.getByTestId("chat-status")).toHaveText("Approval needed");
-  await page.getByRole("button", { name: "Cancel", exact: true }).click();
+  await page.getByRole("button", { name: "Cancel running turn", exact: true }).click();
 
   await expect(page.getByTestId("chat-status")).toHaveText("Cancelled");
   expect(failures).toEqual([]);
