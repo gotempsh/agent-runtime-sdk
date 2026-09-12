@@ -1,0 +1,35 @@
+[package]
+name = "agent-runtime-fullstack-example"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+async-stream = "0.3"
+async-trait = "0.1"
+axum = { version = "0.8", features = ["macros", "multipart"] }
+futures-core = "0.3"
+ring = "0.17"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+temps-agent-runtime = { path = "../..", features = ["temps-sandbox"] }
+thiserror = "2"
+tokio = { version = "1.43", features = ["io-std", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = "0.7"
+tokio-rusqlite = "0.6"
+tower-http = { version = "0.6", features = ["fs", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+too_many_lines = "allow"

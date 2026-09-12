@@ -1,0 +1,8 @@
+{
+  "date": "2026-09-01",
+  "font_stack": "none before portal",
+  "palette": "none before portal",
+  "motion": "motion-cut",
+  "spacing": "none before portal",
+  "framework": "new Vite React portal"
+}

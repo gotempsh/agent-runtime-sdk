@@ -1,0 +1,21 @@
+name: Feature request
+description: Propose a provider, protocol, or runtime capability
+title: "feat: "
+labels: [enhancement]
+body:
+  - type: textarea
+    attributes:
+      label: Use case
+      description: What application outcome is currently blocked?
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Proposed contract
+      description: Describe normalized behavior, not only provider-native flags.
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Security and compatibility considerations
+      description: Note permissions, secrets, sandboxing, and CLI versions.

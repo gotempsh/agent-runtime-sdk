@@ -1,0 +1,6 @@
+temps-agent-runtime
+Copyright 2026 Temps contributors
+
+This product invokes optional third-party command-line tools. Claude Code,
+Codex, OpenCode, and Nono are separate projects governed by their own licenses
+and terms. They are not redistributed by this crate.

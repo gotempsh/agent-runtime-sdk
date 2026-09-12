@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - name: Verify independently selectable features
+        env:
+          RUSTFLAGS: -D warnings
+        run: |
+          cargo check --locked --no-default-features
+          for feature in claude codex opencode nono ssh temps-sandbox; do
+            cargo check --locked --no-default-features --features "$feature"
+          done
+      - name: Verify package contents
+        run: |
+          python3 scripts/check-package.py --self-test
+          python3 scripts/check-package.py
+      - name: Verify standalone package build
+        run: cargo package --locked
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked --all-features
+      - run: cargo doc --all-features --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - run: cargo check --locked --all-targets --all-features
+
+  fullstack-example:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: examples/fullstack-chat/web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+      - run: bunx playwright install --with-deps chromium
+      - run: bun run lint
+      - run: cargo clippy --manifest-path ../Cargo.toml --all-targets -- -D warnings
+      - run: bun run e2e

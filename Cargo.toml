@@ -1,0 +1,123 @@
+[package]
+name = "temps-agent-runtime"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+license = "MIT OR Apache-2.0"
+authors = ["temps-agent-runtime contributors"]
+description = "Run Claude Code, Codex, and OpenCode from Rust through one typed, sandbox-aware event stream"
+repository = "https://github.com/gotempsh/agent-runtime-sdk"
+homepage = "https://github.com/gotempsh/agent-runtime-sdk"
+documentation = "https://docs.rs/temps-agent-runtime"
+readme = "README.md"
+keywords = ["agents", "claude", "codex", "opencode", "sandbox"]
+categories = ["api-bindings", "asynchronous", "development-tools"]
+include = [
+  "/src/**",
+  "/examples/*.rs",
+  "/tests/**",
+  "/docs/**",
+  "/Cargo.toml",
+  "/README.md",
+  "/CHANGELOG.md",
+  "/LICENSE-MIT",
+  "/LICENSE-APACHE",
+  "/NOTICE",
+  "/CONTRIBUTING.md",
+  "/SECURITY.md",
+  "/CODE_OF_CONDUCT.md",
+]
+
+[features]
+default = ["claude", "codex", "opencode", "nono", "ssh"]
+claude = []
+codex = []
+opencode = []
+nono = []
+ssh = []
+temps-sandbox = ["dep:base64", "dep:reqwest"]
+
+[dependencies]
+async-trait = "0.1"
+base64 = { version = "0.22", optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1.43", features = ["fs", "io-util", "macros", "process", "rt", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+url = "2"
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.30", features = ["process", "signal"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1.43", features = ["macros", "rt-multi-thread"] }
+
+[[example]]
+name = "run_turn"
+required-features = ["claude"]
+
+[[example]]
+name = "nono"
+required-features = ["claude", "nono"]
+
+[[example]]
+name = "live_smoke"
+required-features = ["claude", "codex", "opencode", "nono"]
+
+[[example]]
+name = "process_lifetime_smoke"
+required-features = ["claude", "codex", "opencode"]
+
+[[example]]
+name = "claude_subagent_smoke"
+required-features = ["claude"]
+
+[[example]]
+name = "agent_relay_claude_live"
+required-features = ["claude"]
+
+[[example]]
+name = "ssh_codex_smoke"
+required-features = ["codex", "ssh"]
+
+[[example]]
+name = "ssh_transport_smoke"
+required-features = ["ssh"]
+
+[[example]]
+name = "account_usage"
+required-features = ["claude", "codex"]
+
+[[example]]
+name = "temps_sandbox_smoke"
+required-features = ["claude", "temps-sandbox"]
+
+[[example]]
+name = "temps_codex_smoke"
+required-features = ["codex", "temps-sandbox"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+doc_markdown = "allow"
+format_collect = "allow"
+ignored_unit_patterns = "allow"
+missing_errors_doc = "allow"
+needless_pass_by_value = "allow"
+return_self_not_must_use = "allow"
+struct_excessive_bools = "allow"
+too_many_lines = "allow"

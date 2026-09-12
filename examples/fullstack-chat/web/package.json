@@ -1,0 +1,51 @@
+{
+  "name": "agent-runtime-fullstack-example-web",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1 --port 7789",
+    "build": "tsc -b && vite build",
+    "lint": "eslint .",
+    "e2e": "playwright test"
+  },
+  "dependencies": {
+    "@fontsource-variable/inter": "^5.3.0",
+    "@lobehub/icons": "^5.16.0",
+    "@radix-ui/react-dialog": "^1.1.23",
+    "@radix-ui/react-slot": "^1.3.3",
+    "@radix-ui/react-use-controllable-state": "^1.2.6",
+    "ai": "^7.0.90",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "glimm": "^0.3.0",
+    "lucide-react": "^0.468.0",
+    "motion": "^13.1.1",
+    "radix-ui": "^1.6.7",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1",
+    "shadcn": "^4.19.1",
+    "tailwind-merge": "^3.4.0",
+    "tw-animate-css": "^1.4.0",
+    "use-stick-to-bottom": "^1.1.6"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.17.0",
+    "@playwright/test": "^1.52.0",
+    "@tailwindcss/vite": "^4.1.0",
+    "@types/node": "^22.10.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^4.3.4",
+    "eslint": "^9.17.0",
+    "eslint-plugin-react-hooks": "^5.0.0",
+    "eslint-plugin-react-refresh": "^0.4.16",
+    "globals": "^15.14.0",
+    "tailwindcss": "^4.1.0",
+    "typescript": "~5.7.2",
+    "typescript-eslint": "^8.19.1",
+    "vite": "^6.0.5"
+  }
+}

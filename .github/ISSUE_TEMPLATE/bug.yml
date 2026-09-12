@@ -1,0 +1,31 @@
+name: Bug report
+description: Report a reproducible runtime, adapter, or sandbox defect
+title: "bug: "
+labels: [bug]
+body:
+  - type: textarea
+    attributes:
+      label: What happened?
+      description: Include expected and actual behavior without secrets or prompts.
+    validations:
+      required: true
+  - type: input
+    attributes:
+      label: Crate version or commit
+    validations:
+      required: true
+  - type: input
+    attributes:
+      label: OS, provider CLI version, and Nono version
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Minimal reproduction
+      description: Redact credentials, repository content, and user data.
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Relevant diagnostics
+      description: Include only bounded, reviewed output.
