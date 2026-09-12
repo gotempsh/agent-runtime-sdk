@@ -107,8 +107,7 @@ fn load_or_create_secret_key(database_path: &Path) -> StoreResult<[u8; 32]> {
         return random_bytes();
     }
     let key_path = std::env::var_os("AGENT_RUNTIME_EXAMPLE_SSH_KEY")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| database_path.with_extension("ssh-key"));
+        .map_or_else(|| database_path.with_extension("ssh-key"), PathBuf::from);
     if key_path.exists() {
         let mut key = [0_u8; 32];
         let mut file = std::fs::File::open(&key_path)?;
