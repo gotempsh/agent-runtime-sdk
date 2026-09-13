@@ -447,6 +447,26 @@ mod tests {
     }
 
     #[test]
+    fn preserves_nested_missing_session_diagnostic() {
+        let adapter = OpenCode::default();
+        let mut state = AdapterState::default();
+        let output = adapter
+            .parse_line(
+                r#"{"type":"error","error":{"code":"session_not_found","message":"Session not found: old-session"}}"#,
+                &mut state,
+            )
+            .expect("OpenCode error parses");
+
+        assert!(output.terminal);
+        let failure = state.terminal_failure.expect("terminal failure");
+        assert_eq!(failure.diagnostic, "Session not found: old-session");
+        assert_eq!(
+            failure.provider_code.as_deref(),
+            Some("opencode::session_not_found")
+        );
+    }
+
+    #[test]
     fn maps_safe_and_automatic_permission_modes() {
         let temp = tempfile::tempdir().unwrap();
         let executable = temp.path().join("opencode");
