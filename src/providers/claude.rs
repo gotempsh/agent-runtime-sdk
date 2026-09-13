@@ -1192,9 +1192,23 @@ impl AgentAdapter for Claude {
                 state.result.status = if failed {
                     let diagnostic = value
                         .get("result")
-                        .or_else(|| value.pointer("/error/message"))
-                        .or_else(|| value.get("error"))
                         .and_then(Value::as_str)
+                        .filter(|message| !message.trim().is_empty())
+                        .or_else(|| value.pointer("/error/message").and_then(Value::as_str))
+                        .or_else(|| value.get("error").and_then(Value::as_str))
+                        // Claude's streaming JSON result can omit `result`
+                        // and put the actionable failure only in `errors`.
+                        .or_else(|| {
+                            value
+                                .get("errors")
+                                .and_then(Value::as_array)
+                                .and_then(|errors| {
+                                    errors
+                                        .iter()
+                                        .filter_map(Value::as_str)
+                                        .find(|message| !message.trim().is_empty())
+                                })
+                        })
                         .unwrap_or("Claude reported an error")
                         .to_string();
                     let provider_code = value
@@ -2674,6 +2688,31 @@ mod tests {
             Some("claude::error_during_execution")
         );
         assert_eq!(failure.diagnostic, "authentication failed for secret");
+    }
+
+    #[test]
+    fn retains_errors_array_when_claude_omits_result_text() {
+        let adapter = Claude::default();
+        let mut state = AdapterState::default();
+        let output = adapter
+            .parse_line(
+                r#"{"type":"result","subtype":"error_during_execution","is_error":true,"errors":["No conversation found with session ID: old-session"]}"#,
+                &mut state,
+            )
+            .expect("Claude result parses");
+
+        assert!(output.terminal);
+        assert!(output.events.is_empty());
+        let failure = state.terminal_failure.expect("terminal failure");
+        assert_eq!(
+            failure.diagnostic,
+            "No conversation found with session ID: old-session"
+        );
+        assert_eq!(failure.delivery, DeliveryState::Accepted);
+        assert_eq!(
+            failure.provider_code.as_deref(),
+            Some("claude::error_during_execution")
+        );
     }
 
     #[test]
