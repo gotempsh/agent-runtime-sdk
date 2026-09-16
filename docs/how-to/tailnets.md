@@ -112,6 +112,15 @@ MagicDNS names. Leave it `false` for unrestricted profiles. It requires
 `NonoMode::Run`, and a profile that blocks all network access cannot be
 combined with a tailnet.
 
+## What stays reachable
+
+The split proxy only decides which destinations go through the daemon. A
+userspace `tailscaled` dials addresses that are not its own peers through the
+host's normal network stack, so anything the host can already reach, including
+the host's own system Tailscale login, remains reachable exactly as it is for
+an unproxied process. Use the sandbox's network policy to restrict that; the
+tailnet adds reachability, it does not remove any.
+
 ## Failure modes
 
 - `TailnetError::Unavailable` when `tailscaled` or `tailscale` is missing;

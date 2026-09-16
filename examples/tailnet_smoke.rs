@@ -18,7 +18,7 @@ use temps_agent_runtime::tailnet::{TailnetDaemon, TailnetSpec, TailnetState, Tai
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-const LOGIN_WAIT: Duration = Duration::from_secs(15 * 60);
+const LOGIN_WAIT: Duration = Duration::from_secs(60 * 60);
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
