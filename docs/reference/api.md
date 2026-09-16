@@ -71,8 +71,10 @@ reservation. Dropping the wrapper without shutdown keeps the directory
 reserved until process exit; separate host processes must use distinct private
 state roots.
 
-The `tailnet` feature implements this contract with `TailscaleProvider` while
-preserving the concrete `TailnetDaemon` and `TailnetAccess` APIs.
+The `tailnet` feature implements this contract with `TailscaleProvider` and
+`HeadscaleProvider` while preserving the concrete `TailnetDaemon` and
+`TailnetAccess` APIs. Headscale uses the same userspace Tailscale data plane,
+with a validated HTTPS coordination-server URL supplied to `tailscale up`.
 
 ## Primary types
 

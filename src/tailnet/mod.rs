@@ -35,6 +35,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::{Mutex, RwLock};
+use url::Url;
 
 use crate::adapter::CommandSpec;
 use crate::network::{
@@ -68,6 +69,10 @@ pub const ENVIRONMENT_PREFIX: &str = "TEMPS_TAILNET_";
 /// Stable identifier for the built-in Tailscale network provider.
 pub const TAILSCALE_PROVIDER_ID: NetworkProviderId =
     NetworkProviderId::from_validated_static("tailscale");
+
+/// Stable identifier for the built-in Headscale network provider.
+pub const HEADSCALE_PROVIDER_ID: NetworkProviderId =
+    NetworkProviderId::from_validated_static("headscale");
 
 /// Built-in provider backed by the open-source `tailscaled` daemon.
 #[derive(Debug, Clone)]
@@ -130,6 +135,86 @@ impl NetworkProvider for TailscaleProvider {
             .await
             .map_err(|error| {
                 NetworkError::provider(TAILSCALE_PROVIDER_ID.clone(), "start", error)
+            })?;
+        Ok(Arc::new(daemon))
+    }
+}
+
+/// Headscale provider backed by the Tailscale userspace daemon and CLI.
+///
+/// Headscale supplies the coordination server; the open-source Tailscale
+/// client remains the data plane. Control-server URLs must use HTTPS and may
+/// not contain embedded credentials, query parameters, or fragments.
+#[derive(Clone)]
+pub struct HeadscaleProvider {
+    binaries: TailscaleBinaries,
+    login_server: Url,
+    accept_routes: bool,
+    upload_logs: bool,
+}
+
+impl HeadscaleProvider {
+    /// Configure a provider for one Headscale control server.
+    pub fn new(
+        binaries: TailscaleBinaries,
+        login_server: impl AsRef<str>,
+    ) -> Result<Self, TailnetError> {
+        Ok(Self {
+            binaries,
+            login_server: validate_headscale_login_server(login_server.as_ref())?,
+            accept_routes: true,
+            upload_logs: false,
+        })
+    }
+
+    /// Canonical Headscale control-server URL passed to the Tailscale CLI.
+    pub fn login_server(&self) -> &str {
+        self.login_server.as_str()
+    }
+
+    /// Control whether sessions accept provider-advertised subnet routes.
+    pub fn with_accept_routes(mut self, accept_routes: bool) -> Self {
+        self.accept_routes = accept_routes;
+        self
+    }
+
+    /// Control upload of daemon logs to the configured coordination server.
+    pub fn with_upload_logs(mut self, upload_logs: bool) -> Self {
+        self.upload_logs = upload_logs;
+        self
+    }
+}
+
+#[async_trait::async_trait]
+impl NetworkProvider for HeadscaleProvider {
+    fn id(&self) -> NetworkProviderId {
+        HEADSCALE_PROVIDER_ID.clone()
+    }
+
+    fn capabilities(&self) -> NetworkProviderCapabilities {
+        NetworkProviderCapabilities::new(true, true, true)
+    }
+
+    async fn start(
+        &self,
+        spec: NetworkInstanceSpec,
+    ) -> Result<Arc<dyn NetworkSession>, NetworkError> {
+        let mut tailnet = TailnetSpec::new(spec.name, spec.state_dir, self.binaries.clone())
+            .and_then(|tailnet| tailnet.with_login_server(self.login_server.as_str()))
+            .map_err(|error| {
+                NetworkError::provider(HEADSCALE_PROVIDER_ID.clone(), "validate", error)
+            })?;
+        if let Some(node_name) = spec.node_name {
+            tailnet = tailnet.with_hostname(node_name).map_err(|error| {
+                NetworkError::provider(HEADSCALE_PROVIDER_ID.clone(), "validate", error)
+            })?;
+        }
+        tailnet.accept_routes = self.accept_routes;
+        tailnet.upload_logs = self.upload_logs;
+        let daemon = TailnetDaemon::start_tailscale(tailnet)
+            .await
+            .map_err(|error| {
+                NetworkError::provider(HEADSCALE_PROVIDER_ID.clone(), "start", error)
             })?;
         Ok(Arc::new(daemon))
     }
@@ -221,8 +306,8 @@ pub struct TailnetStatus {
     pub state: TailnetState,
     /// Current step or last error, safe to show verbatim.
     pub detail: String,
-    /// Login URL to open in a browser signed into the wanted Tailscale
-    /// account. Present only while a login is pending.
+    /// Login URL to open in a browser and complete provider authentication.
+    /// Present only while a login is pending.
     pub auth_url: Option<String>,
     /// Tailnet organization name reported by Tailscale, e.g. `example.com`.
     pub tailnet_name: Option<String>,
@@ -352,7 +437,7 @@ impl TailnetAccess {
             .map(|suffix| format!(" MagicDNS names end in .{suffix}."))
             .unwrap_or_default();
         format!(
-            "This session has access to the Tailscale tailnet \"{org}\" (tailnet \"{name}\").{suffix} \
+            "This session has access to the private network \"{org}\" (connection \"{name}\").{suffix} \
              HTTP and HTTPS requests to tailnet hosts work transparently through the configured proxy environment. \
              For SSH use `ssh -F \"${prefix}SSH_CONFIG\" <host>` (or `GIT_SSH_COMMAND=\"ssh -F ${prefix}SSH_CONFIG\"` for git). \
              Raw TCP clients can use the SOCKS5 proxy in ${prefix}SOCKS. \
@@ -411,6 +496,10 @@ pub struct TailnetSpec {
     pub accept_routes: bool,
     /// Upload daemon logs to Tailscale support. Off by default.
     pub upload_logs: bool,
+    /// Alternate coordination server passed to `tailscale up`.
+    login_server: Option<Url>,
+    provider_id: NetworkProviderId,
+    provider_name: &'static str,
 }
 
 impl TailnetSpec {
@@ -436,6 +525,9 @@ impl TailnetSpec {
             binaries,
             accept_routes: true,
             upload_logs: false,
+            login_server: None,
+            provider_id: TAILSCALE_PROVIDER_ID.clone(),
+            provider_name: "Tailscale",
         })
     }
 
@@ -444,6 +536,40 @@ impl TailnetSpec {
         self.hostname = normalize_hostname(Some(hostname.as_ref()), &self.name)?;
         Ok(self)
     }
+
+    /// Use a Headscale coordination server for this userspace daemon.
+    pub fn with_login_server(
+        mut self,
+        login_server: impl AsRef<str>,
+    ) -> Result<Self, TailnetError> {
+        self.login_server = Some(validate_headscale_login_server(login_server.as_ref())?);
+        self.provider_id = HEADSCALE_PROVIDER_ID.clone();
+        self.provider_name = "Headscale";
+        Ok(self)
+    }
+}
+
+fn validate_headscale_login_server(value: &str) -> Result<Url, TailnetError> {
+    let value = value.trim();
+    let parsed = crate::url_security::validate_http_endpoint(value).map_err(|message| {
+        TailnetError::Invalid {
+            field: "login_server",
+            message: message.to_string(),
+        }
+    })?;
+    if parsed.scheme() != "https" {
+        return Err(TailnetError::Invalid {
+            field: "login_server",
+            message: "must use HTTPS so coordination credentials are not exposed".into(),
+        });
+    }
+    if parsed.query().is_some() {
+        return Err(TailnetError::Invalid {
+            field: "login_server",
+            message: "must not contain a query string".into(),
+        });
+    }
+    Ok(parsed)
 }
 
 /// Validate and normalize a user-supplied tailnet label.
@@ -905,7 +1031,10 @@ impl TailnetDaemon {
                 ),
                 Some(status) if status.needs_login() => (
                     TailnetState::NeedsLogin,
-                    "Log in to a Tailscale account to join a tailnet".to_string(),
+                    format!(
+                        "Complete {} authentication to join this network",
+                        self.inner.spec.provider_name
+                    ),
                 ),
                 Some(status) => (
                     TailnetState::Starting,
@@ -984,7 +1113,10 @@ impl TailnetDaemon {
             {
                 let mut state = self.inner.state.write().await;
                 state.auth_url = None;
-                state.detail_override = Some("Requesting a login URL from Tailscale".into());
+                state.detail_override = Some(format!(
+                    "Requesting a login URL from {}",
+                    self.inner.spec.provider_name
+                ));
                 state.updated_at_ms = now_ms();
             }
             let daemon = self.clone();
@@ -1008,14 +1140,7 @@ impl TailnetDaemon {
         let spec = &self.inner.spec;
         let mut command = tokio::process::Command::new(&spec.binaries.tailscale);
         command
-            .arg(format!("--socket={}", self.inner.socket_path.display()))
-            .arg("up")
-            .arg("--json")
-            .arg("--reset")
-            .arg(format!("--hostname={}", spec.hostname))
-            .arg("--accept-dns=false")
-            .arg(format!("--accept-routes={}", spec.accept_routes))
-            .arg(format!("--timeout={}s", LOGIN_TIMEOUT.as_secs()))
+            .args(login_arguments(spec, &self.inner.socket_path))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -1038,7 +1163,12 @@ impl TailnetDaemon {
                 let url = UpJsonLine::parse(&line)
                     .map(|parsed| parsed.auth_url)
                     .filter(|url| !url.is_empty())
-                    .or_else(|| tailscale::extract_auth_url(&line));
+                    .or_else(|| {
+                        tailscale::extract_auth_url(
+                            &line,
+                            for_stdout.inner.spec.login_server.as_ref(),
+                        )
+                    });
                 if let Some(url) = url {
                     for_stdout.set_auth_url(url).await;
                 }
@@ -1052,7 +1182,9 @@ impl TailnetDaemon {
             let mut lines = BufReader::new(stderr).lines();
             let mut last = String::new();
             while let Ok(Some(line)) = lines.next_line().await {
-                if let Some(url) = tailscale::extract_auth_url(&line) {
+                if let Some(url) =
+                    tailscale::extract_auth_url(&line, for_stderr.inner.spec.login_server.as_ref())
+                {
                     for_stderr.set_auth_url(url).await;
                 } else if !line.trim().is_empty() {
                     last = line.chars().take(400).collect();
@@ -1090,10 +1222,10 @@ impl TailnetDaemon {
     async fn set_auth_url(&self, url: String) {
         let mut state = self.inner.state.write().await;
         state.auth_url = Some(url);
-        state.detail_override = Some(
-            "Open the login URL in a browser signed into the Tailscale account for this tailnet"
-                .into(),
-        );
+        state.detail_override = Some(format!(
+            "Open the login URL in a browser and complete {} authentication for this network",
+            self.inner.spec.provider_name
+        ));
         state.updated_at_ms = now_ms();
     }
 
@@ -1178,6 +1310,23 @@ impl TailnetDaemon {
     }
 }
 
+fn login_arguments(spec: &TailnetSpec, socket_path: &Path) -> Vec<OsString> {
+    let mut arguments = vec![
+        format!("--socket={}", socket_path.display()).into(),
+        "up".into(),
+        "--json".into(),
+        "--reset".into(),
+        format!("--hostname={}", spec.hostname).into(),
+        "--accept-dns=false".into(),
+        format!("--accept-routes={}", spec.accept_routes).into(),
+        format!("--timeout={}s", LOGIN_TIMEOUT.as_secs()).into(),
+    ];
+    if let Some(login_server) = &spec.login_server {
+        arguments.push(format!("--login-server={login_server}").into());
+    }
+    arguments
+}
+
 #[async_trait::async_trait]
 impl NetworkSession for TailnetDaemon {
     async fn status(&self) -> NetworkSessionStatus {
@@ -1189,13 +1338,13 @@ impl NetworkSession for TailnetDaemon {
             .await
             .map(network_status)
             .map_err(|error| {
-                NetworkError::provider(TAILSCALE_PROVIDER_ID.clone(), "authenticate", error)
+                NetworkError::provider(self.inner.spec.provider_id.clone(), "authenticate", error)
             })
     }
 
     async fn deauthenticate(&self) -> Result<(), NetworkError> {
         TailnetDaemon::logout(self).await.map_err(|error| {
-            NetworkError::provider(TAILSCALE_PROVIDER_ID.clone(), "deauthenticate", error)
+            NetworkError::provider(self.inner.spec.provider_id.clone(), "deauthenticate", error)
         })
     }
 
@@ -1203,7 +1352,9 @@ impl NetworkSession for TailnetDaemon {
         TailnetDaemon::stop(self)
             .await
             .map(network_status)
-            .map_err(|error| NetworkError::provider(TAILSCALE_PROVIDER_ID.clone(), "stop", error))
+            .map_err(|error| {
+                NetworkError::provider(self.inner.spec.provider_id.clone(), "stop", error)
+            })
     }
 
     async fn restart(&self) -> Result<NetworkSessionStatus, NetworkError> {
@@ -1211,7 +1362,7 @@ impl NetworkSession for TailnetDaemon {
             .await
             .map(network_status)
             .map_err(|error| {
-                NetworkError::provider(TAILSCALE_PROVIDER_ID.clone(), "restart", error)
+                NetworkError::provider(self.inner.spec.provider_id.clone(), "restart", error)
             })
     }
 
@@ -1220,7 +1371,7 @@ impl NetworkSession for TailnetDaemon {
             .await
             .map(|access| Arc::new(access) as Arc<dyn NetworkAccess>)
             .map_err(|error| {
-                NetworkError::provider(TAILSCALE_PROVIDER_ID.clone(), "resolve access", error)
+                NetworkError::provider(self.inner.spec.provider_id.clone(), "resolve access", error)
             })
     }
 }
@@ -1302,6 +1453,37 @@ mod tests {
         assert!(capabilities.interactive_authentication);
         assert!(capabilities.userspace_networking);
         assert!(capabilities.split_proxy);
+    }
+
+    #[test]
+    fn headscale_is_a_distinct_provider_with_a_validated_control_server() {
+        let temp = tempfile::tempdir().unwrap();
+        let tailscaled = temp.path().join("tailscaled");
+        let tailscale = temp.path().join("tailscale");
+        std::fs::write(&tailscaled, "stub").unwrap();
+        std::fs::write(&tailscale, "stub").unwrap();
+        let binaries = TailscaleBinaries::new(tailscaled, tailscale).unwrap();
+        let provider =
+            HeadscaleProvider::new(binaries.clone(), "https://headscale.example.test/control")
+                .unwrap();
+        assert_eq!(provider.id(), HEADSCALE_PROVIDER_ID);
+        assert_eq!(
+            provider.login_server(),
+            "https://headscale.example.test/control"
+        );
+        assert!(provider.capabilities().interactive_authentication);
+
+        for invalid in [
+            "http://headscale.example.test",
+            "https://user:secret@headscale.example.test",
+            "https://headscale.example.test?token=secret",
+            "https://headscale.example.test/#fragment",
+        ] {
+            assert!(
+                HeadscaleProvider::new(binaries.clone(), invalid).is_err(),
+                "accepted unsafe control server {invalid}"
+            );
+        }
     }
 
     fn access() -> TailnetAccess {
@@ -1435,6 +1617,32 @@ mod tests {
         assert!(!spec.upload_logs);
         assert!(spec.accept_routes);
         assert!(spec.with_hostname("not valid").is_err());
+    }
+
+    #[test]
+    fn headscale_login_server_is_one_structured_cli_argument() {
+        let temp = tempfile::tempdir().unwrap();
+        let tailscaled = temp.path().join("tailscaled");
+        let tailscale = temp.path().join("tailscale");
+        std::fs::write(&tailscaled, "stub").unwrap();
+        std::fs::write(&tailscale, "stub").unwrap();
+        let binaries = TailscaleBinaries::new(tailscaled, tailscale).unwrap();
+        let spec = TailnetSpec::new("client", temp.path().join("state"), binaries)
+            .unwrap()
+            .with_login_server("https://headscale.example.test")
+            .unwrap();
+        assert_eq!(spec.provider_id, HEADSCALE_PROVIDER_ID);
+        let arguments = login_arguments(&spec, Path::new("/tmp/headscale.sock"));
+        assert!(arguments
+            .iter()
+            .any(|argument| argument == "--login-server=https://headscale.example.test/"));
+        assert_eq!(
+            arguments
+                .iter()
+                .filter(|argument| argument.to_string_lossy().starts_with("--login-server="))
+                .count(),
+            1
+        );
     }
 
     #[test]

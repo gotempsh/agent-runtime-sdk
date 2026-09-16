@@ -25,8 +25,9 @@ Private-network lifecycle is defined by the provider-neutral
 `network::NetworkAccess` traits. `NetworkProviderRegistry` stores different
 providers behind one object-safe interface and assigns provider identity to
 the returned session, so persisted selection cannot disagree with a session's
-self-reported identity. `TailscaleProvider` implements these contracts, while
-the existing `TailnetDaemon::start` API remains available unchanged.
+self-reported identity. `TailscaleProvider` and `HeadscaleProvider` implement
+these contracts, while the existing `TailnetDaemon::start` API remains
+available unchanged.
 
 `NetworkAccess` applies provider-specific environment and exposes generic
 sandbox requirements. A future WireGuard implementation can return an empty
@@ -56,6 +57,37 @@ let status = session.session().status().await;
 # }
 ```
 
+For a self-hosted Headscale control plane, register a distinct provider and
+select `HEADSCALE_PROVIDER_ID`. Headscale still uses the installed Tailscale
+client and userspace daemon for its data plane:
+
+```rust,no_run
+use std::sync::Arc;
+use temps_agent_runtime::network::{NetworkInstanceSpec, NetworkProviderRegistry};
+use temps_agent_runtime::tailnet::{
+    HEADSCALE_PROVIDER_ID, HeadscaleProvider, TailscaleBinaries,
+};
+
+# async fn start() -> Result<(), Box<dyn std::error::Error>> {
+let binaries = TailscaleBinaries::discover()?;
+let headscale = HeadscaleProvider::new(binaries, "https://vpn.example.com")?;
+let mut providers = NetworkProviderRegistry::new();
+providers.register(Arc::new(headscale))?;
+let spec = NetworkInstanceSpec::new(
+    "client-a",
+    "/var/lib/agent/networks/client-a",
+)?;
+let session = providers.start(&HEADSCALE_PROVIDER_ID, spec).await?;
+# let _ = session;
+# Ok(())
+# }
+```
+
+The control-server URL must be absolute HTTPS and cannot contain embedded
+credentials, a query string, or a fragment. Authentication remains the
+interactive URL returned by the configured Headscale server. The SDK passes
+the URL as one CLI argument and never builds a shell command.
+
 Provider implementations own every process, route, interface, and credential
 they create. Startup must clean partial resources when cancelled; stopping a
 session must revoke connectivity before reporting success; dropping the last
@@ -69,7 +101,8 @@ private state roots.
 
 ## Requirements
 
-The open-source daemon and CLI must be installed: `brew install tailscale` on
+The open-source daemon and CLI must be installed for both providers:
+`brew install tailscale` on
 macOS (the App Store app does not ship `tailscaled`), the distribution package
 on Linux, or the MSI on Windows. `TailscaleBinaries::discover()` searches
 `PATH` and the common install locations; `install_hint()` returns platform
