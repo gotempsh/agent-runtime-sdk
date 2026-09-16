@@ -176,9 +176,9 @@ pub struct TailnetStatus {
 /// Everything a provider launch needs from a connected tailnet.
 ///
 /// The structure is a snapshot; it stays valid while the daemon that produced
-/// it runs. Obtain a fresh one per turn with [`TailnetDaemon::access`].
+/// it runs. Obtain a fresh one per turn with [`TailnetDaemon::access`]. It is
+/// plain data so hosts can build fixtures for their own launch tests.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
 pub struct TailnetAccess {
     /// Application label of the tailnet.
     pub name: String,
