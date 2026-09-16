@@ -19,6 +19,12 @@ Versioning and Keep a Changelog conventions.
 
 ### Added
 
+- Optional `tailnet` feature: supervised per-agent userspace `tailscaled`
+  daemons (`TailnetDaemon`) with a loopback split proxy, browser login URL
+  reporting, and a `TailnetAccess` that applies proxy and `TEMPS_TAILNET_*`
+  environment to any provider command. `NonoExecution::tailnet` opens the
+  daemon's ports, socket, and ssh config inside the sandbox and can chain
+  Nono's filtering proxy into the split proxy.
 - Explicit `ProviderProbeContext` for transport-local catalog and account-usage
   discovery with bounded secret environment injection, redacted diagnostics,
   and typed provider authentication and availability failures.

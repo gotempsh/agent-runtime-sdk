@@ -11,6 +11,7 @@ pin and test the CLI versions used in production.
 | `codex` | yes | `providers::Codex` `exec --json` adapter |
 | `opencode` | yes | `providers::OpenCode` JSON adapter |
 | `nono` | yes | profile management and per-turn Nono execution |
+| `tailnet` | yes | per-agent userspace Tailscale daemons and split proxy |
 | `ssh` | yes | OpenSSH execution transport |
 | `temps-sandbox` | no | optional Temps sandbox HTTP transport |
 

@@ -10,6 +10,7 @@ import customSandbox from "../../../docs/how-to/custom-sandbox.md?raw";
 import customTransport from "../../../docs/how-to/custom-transport.md?raw";
 import harnessDiscovery from "../../../docs/how-to/discover-harnesses.md?raw";
 import nono from "../../../docs/how-to/nono.md?raw";
+import tailnets from "../../../docs/how-to/tailnets.md?raw";
 import recovery from "../../../docs/how-to/recover-sandbox-denials.md?raw";
 import migration from "../../../docs/MIGRATION.md?raw";
 import api from "../../../docs/reference/api.md?raw";
@@ -106,6 +107,14 @@ export const docs: DocPage[] = [
     description: "Generate, validate, and apply Nono profiles around a provider turn.",
     category: "How-to guides",
     body: nono,
+  },
+  {
+    slug: "tailnets",
+    sourcePath: "docs/how-to/tailnets.md",
+    title: "Give an agent its own tailnet",
+    description: "Run a per-agent userspace Tailscale daemon and apply it to any provider turn, with or without Nono.",
+    category: "How-to guides",
+    body: tailnets,
   },
   {
     slug: "sandbox-recovery",

@@ -254,6 +254,21 @@ pub struct NonoExecution {
     /// but it is a consequential persistent trust change and is never enabled
     /// automatically. It is supported only by [`NonoMode::Run`].
     pub trust_proxy_ca: bool,
+    /// Tailnet the supervised process may reach through its split proxy.
+    ///
+    /// The tailnet's proxy environment is applied to the wrapped command, its
+    /// loopback ports, control socket, and ssh config are opened, and Nono's
+    /// own destination filtering stays in place.
+    #[cfg(feature = "tailnet")]
+    pub tailnet: Option<crate::tailnet::TailnetAccess>,
+    /// Chain Nono's destination-filtering proxy into the tailnet split proxy.
+    ///
+    /// Required when the profile allowlists destinations, because Nono then
+    /// replaces the proxy environment with its own proxy. Leave it `false`
+    /// for unrestricted profiles so the process talks to the split proxy
+    /// directly. It is supported only by [`NonoMode::Run`].
+    #[cfg(feature = "tailnet")]
+    pub tailnet_chain_proxy: bool,
 }
 
 impl NonoExecution {
@@ -268,6 +283,10 @@ impl NonoExecution {
             listen_ports: Vec::new(),
             credentials: Vec::new(),
             trust_proxy_ca: false,
+            #[cfg(feature = "tailnet")]
+            tailnet: None,
+            #[cfg(feature = "tailnet")]
+            tailnet_chain_proxy: false,
         };
         execution.validate()?;
         Ok(execution)
@@ -286,6 +305,10 @@ impl NonoExecution {
             listen_ports: Vec::new(),
             credentials: Vec::new(),
             trust_proxy_ca: false,
+            #[cfg(feature = "tailnet")]
+            tailnet: None,
+            #[cfg(feature = "tailnet")]
+            tailnet_chain_proxy: false,
         };
         execution.validate()?;
         Ok(execution)
@@ -327,6 +350,21 @@ impl NonoExecution {
                 field: "trust_proxy_ca",
                 message: "proxy CA trust requires NonoMode::Run".to_string(),
             });
+        }
+        #[cfg(feature = "tailnet")]
+        if self.tailnet_chain_proxy {
+            if self.tailnet.is_none() {
+                return Err(NonoError::Invalid {
+                    field: "tailnet_chain_proxy",
+                    message: "proxy chaining requires a tailnet".to_string(),
+                });
+            }
+            if self.mode == NonoMode::Wrap {
+                return Err(NonoError::Invalid {
+                    field: "tailnet_chain_proxy",
+                    message: "tailnet proxy chaining requires NonoMode::Run".to_string(),
+                });
+            }
         }
         Ok(())
     }
@@ -370,6 +408,14 @@ impl NonoExecution {
             });
             args.push(grant.path.as_os_str().to_owned());
         }
+        #[cfg(feature = "tailnet")]
+        let inner = match &self.tailnet {
+            Some(tailnet) => {
+                args.extend(tailnet.nono_arguments(self.tailnet_chain_proxy));
+                tailnet.apply(inner)
+            }
+            None => inner,
+        };
         Ok(inner.wrap_with(&self.executable, args, Some("--".into())))
     }
 }
@@ -906,6 +952,94 @@ mod tests {
             wrapped.args.last(),
             Some(&OsString::from("name with spaces"))
         );
+    }
+
+    #[cfg(feature = "tailnet")]
+    fn tailnet_access() -> crate::tailnet::TailnetAccess {
+        crate::tailnet::TailnetAccess {
+            name: "gala".into(),
+            tailnet_name: Some("gala.games".into()),
+            magic_dns_suffix: Some("jerboa-altered.ts.net".into()),
+            proxy_addr: "127.0.0.1:41001".parse().unwrap(),
+            socks_addr: "127.0.0.1:41002".parse().unwrap(),
+            socket_path: PathBuf::from("/data/tailnets/abcd/ts.sock"),
+            tailscale: PathBuf::from("/opt/homebrew/bin/tailscale"),
+            ssh_config_path: PathBuf::from("/data/tailnets/abcd/ssh_config"),
+        }
+    }
+
+    #[cfg(feature = "tailnet")]
+    #[test]
+    fn wrap_applies_tailnet_environment_and_opens_its_ports() {
+        let temp = tempfile::tempdir().unwrap();
+        let nono = temp.path().join("nono");
+        std::fs::write(&nono, "stub").unwrap();
+        let mut execution = NonoExecution::new(&nono, "claude-code").unwrap();
+        execution.tailnet = Some(tailnet_access());
+        let wrapped = execution
+            .wrap(CommandSpec::new("codex"), Path::new("/work/project"))
+            .unwrap();
+        let text = wrapped
+            .args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(!text.contains(&"--upstream-proxy".to_string()));
+        assert!(text.windows(2).any(|w| w == ["--open-port", "41001"]));
+        assert!(text
+            .windows(2)
+            .any(|w| w == ["--allow-unix-socket", "/data/tailnets/abcd/ts.sock"]));
+        assert_eq!(
+            wrapped.environment.get(&OsString::from("HTTPS_PROXY")),
+            Some(&OsString::from("http://127.0.0.1:41001"))
+        );
+        assert_eq!(
+            wrapped
+                .environment
+                .get(&OsString::from("TEMPS_TAILNET_NAME")),
+            Some(&OsString::from("gala"))
+        );
+        let separator = text.iter().position(|arg| arg == "--").unwrap();
+        assert_eq!(text[separator + 1], "codex");
+
+        execution.tailnet_chain_proxy = true;
+        let wrapped = execution
+            .wrap(CommandSpec::new("codex"), Path::new("/work/project"))
+            .unwrap();
+        let text = wrapped
+            .args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(text
+            .windows(2)
+            .any(|w| w == ["--upstream-proxy", "127.0.0.1:41001"]));
+    }
+
+    #[cfg(feature = "tailnet")]
+    #[test]
+    fn tailnet_proxy_chaining_requires_a_tailnet_and_run_mode() {
+        let temp = tempfile::tempdir().unwrap();
+        let nono = temp.path().join("nono");
+        std::fs::write(&nono, "stub").unwrap();
+        let mut execution = NonoExecution::new(&nono, "claude-code").unwrap();
+        execution.tailnet_chain_proxy = true;
+        assert!(matches!(
+            execution.wrap(CommandSpec::new("codex"), Path::new("/work")),
+            Err(NonoError::Invalid {
+                field: "tailnet_chain_proxy",
+                ..
+            })
+        ));
+        execution.tailnet = Some(tailnet_access());
+        execution.mode = NonoMode::Wrap;
+        assert!(matches!(
+            execution.wrap(CommandSpec::new("codex"), Path::new("/work")),
+            Err(NonoError::Invalid {
+                field: "tailnet_chain_proxy",
+                ..
+            })
+        ));
     }
 
     #[test]

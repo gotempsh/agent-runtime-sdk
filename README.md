@@ -148,6 +148,8 @@ For sandbox setup, read [Manage Nono sandboxes](docs/how-to/nono.md) or
 [Implement a sandbox backend](docs/how-to/custom-sandbox.md). For durable
 profile updates and retry, read
 [Recover a denied sandbox step](docs/how-to/recover-sandbox-denials.md).
+To give an agent one Tailscale network without changing the host's own
+login, read [Give an agent its own tailnet](docs/how-to/tailnets.md).
 For target onboarding, read
 [Discover provider harnesses](docs/how-to/discover-harnesses.md).
 For host-scoped skills and MCP servers, read
@@ -196,6 +198,7 @@ For context meters and automatic/manual compaction in a durable host, read
 - [Embedding a retained runtime daemon](docs/daemon-stream.md)
 - [Quickstart tutorial](docs/tutorials/quickstart.md)
 - [How to manage Nono sandboxes](docs/how-to/nono.md)
+- [How to give an agent its own tailnet](docs/how-to/tailnets.md)
 - [How to implement a sandbox backend](docs/how-to/custom-sandbox.md)
 - [How to implement a custom execution transport](docs/how-to/custom-transport.md)
 - [How to discover harnesses on a target](docs/how-to/discover-harnesses.md)

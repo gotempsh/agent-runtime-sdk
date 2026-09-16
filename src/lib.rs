@@ -6,7 +6,9 @@
 //! UI, HTTP APIs, authorization, and scheduling.
 //!
 //! The optional [`nono`] module manages and applies Nono profiles without
-//! silently falling back to unsandboxed execution.
+//! silently falling back to unsandboxed execution. The optional [`tailnet`]
+//! module gives an agent its own Tailscale network identity through a
+//! supervised userspace `tailscaled`.
 
 mod adapter;
 mod chat;
@@ -40,6 +42,9 @@ pub mod providers;
 
 #[cfg(feature = "nono")]
 pub mod nono;
+
+#[cfg(feature = "tailnet")]
+pub mod tailnet;
 
 pub use adapter::{
     AccountUsageProbeSpec, AdapterOutput, AdapterState, AgentAdapter, AuthenticationProbeSpec,
