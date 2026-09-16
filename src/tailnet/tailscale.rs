@@ -315,10 +315,29 @@ pub(crate) async fn run_cli(
             message: if stderr.is_empty() {
                 format!("exited with {}", output.status)
             } else {
-                stderr.chars().take(1024).collect()
+                redact_auth_urls(stderr).chars().take(1024).collect()
             },
         })
     }
+}
+
+fn redact_auth_urls(text: &str) -> String {
+    const PREFIX: &str = "https://login.tailscale.com/";
+    let mut redacted = String::with_capacity(text.len());
+    let mut remaining = text;
+    while let Some(start) = remaining.find(PREFIX) {
+        redacted.push_str(&remaining[..start]);
+        let after = &remaining[start + PREFIX.len()..];
+        let token_len = after
+            .find(|character: char| {
+                character.is_whitespace() || matches!(character, '"' | '\'' | ',' | ']' | '}' | ')')
+            })
+            .unwrap_or(after.len());
+        redacted.push_str("[REDACTED LOGIN URL]");
+        remaining = &after[token_len..];
+    }
+    redacted.push_str(remaining);
+    redacted
 }
 
 #[cfg(test)]
@@ -337,6 +356,14 @@ mod tests {
         "nodekey:def": {"HostName": "grafana", "DNSName": "grafana.jerboa-altered.ts.net.", "TailscaleIPs": ["100.100.1.1"], "Online": true}
       }
     }"#;
+
+    #[test]
+    fn redacts_login_urls_from_cli_failures() {
+        let redacted =
+            redact_auth_urls("login at https://login.tailscale.com/a/sensitive-token, then retry");
+        assert_eq!(redacted, "login at [REDACTED LOGIN URL], then retry");
+        assert!(!redacted.contains("sensitive-token"));
+    }
 
     #[test]
     fn parses_status_and_builds_route_table() {

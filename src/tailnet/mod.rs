@@ -38,7 +38,9 @@ use tokio::sync::{Mutex, RwLock};
 
 use crate::adapter::CommandSpec;
 use crate::network::{
-    InteractiveNetworkSession, NetworkProvider, NetworkProviderCapabilities, NetworkSession,
+    NetworkAccess, NetworkError, NetworkInstanceSpec, NetworkProvider, NetworkProviderCapabilities,
+    NetworkProviderId, NetworkSandboxRequirements, NetworkSession, NetworkSessionState,
+    NetworkSessionStatus,
 };
 use crate::services::{
     ManagedProcessError, ManagedProcessId, ManagedProcessSpec, ManagedProcessStatus,
@@ -64,32 +66,72 @@ const CLI_TIMEOUT: Duration = Duration::from_secs(10);
 pub const ENVIRONMENT_PREFIX: &str = "TEMPS_TAILNET_";
 
 /// Stable identifier for the built-in Tailscale network provider.
-pub const TAILSCALE_PROVIDER_ID: &str = "tailscale";
+pub const TAILSCALE_PROVIDER_ID: NetworkProviderId =
+    NetworkProviderId::from_validated_static("tailscale");
 
 /// Built-in provider backed by the open-source `tailscaled` daemon.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct TailscaleProvider;
+#[derive(Debug, Clone)]
+pub struct TailscaleProvider {
+    binaries: TailscaleBinaries,
+    accept_routes: bool,
+    upload_logs: bool,
+}
 
-#[async_trait::async_trait]
-impl NetworkProvider for TailscaleProvider {
-    type Specification = TailnetSpec;
-    type Session = TailnetDaemon;
-    type Error = TailnetError;
-
-    fn id(&self) -> &'static str {
-        TAILSCALE_PROVIDER_ID
-    }
-
-    fn capabilities(&self) -> NetworkProviderCapabilities {
-        NetworkProviderCapabilities {
-            interactive_authentication: true,
-            userspace_networking: true,
-            split_proxy: true,
+impl TailscaleProvider {
+    /// Configure the provider with matching `tailscaled` and `tailscale`
+    /// executables.
+    pub fn new(binaries: TailscaleBinaries) -> Self {
+        Self {
+            binaries,
+            accept_routes: true,
+            upload_logs: false,
         }
     }
 
-    async fn start(&self, spec: Self::Specification) -> Result<Self::Session, Self::Error> {
-        TailnetDaemon::start_tailscale(spec).await
+    /// Control whether sessions accept provider-advertised subnet routes.
+    pub fn with_accept_routes(mut self, accept_routes: bool) -> Self {
+        self.accept_routes = accept_routes;
+        self
+    }
+
+    /// Control upload of daemon logs to Tailscale support.
+    pub fn with_upload_logs(mut self, upload_logs: bool) -> Self {
+        self.upload_logs = upload_logs;
+        self
+    }
+}
+
+#[async_trait::async_trait]
+impl NetworkProvider for TailscaleProvider {
+    fn id(&self) -> NetworkProviderId {
+        TAILSCALE_PROVIDER_ID.clone()
+    }
+
+    fn capabilities(&self) -> NetworkProviderCapabilities {
+        NetworkProviderCapabilities::new(true, true, true)
+    }
+
+    async fn start(
+        &self,
+        spec: NetworkInstanceSpec,
+    ) -> Result<Arc<dyn NetworkSession>, NetworkError> {
+        let mut tailnet = TailnetSpec::new(spec.name, spec.state_dir, self.binaries.clone())
+            .map_err(|error| {
+                NetworkError::provider(TAILSCALE_PROVIDER_ID.clone(), "validate", error)
+            })?;
+        if let Some(node_name) = spec.node_name {
+            tailnet = tailnet.with_hostname(node_name).map_err(|error| {
+                NetworkError::provider(TAILSCALE_PROVIDER_ID.clone(), "validate", error)
+            })?;
+        }
+        tailnet.accept_routes = self.accept_routes;
+        tailnet.upload_logs = self.upload_logs;
+        let daemon = TailnetDaemon::start_tailscale(tailnet)
+            .await
+            .map_err(|error| {
+                NetworkError::provider(TAILSCALE_PROVIDER_ID.clone(), "start", error)
+            })?;
+        Ok(Arc::new(daemon))
     }
 }
 
@@ -172,7 +214,7 @@ pub enum TailnetState {
 }
 
 /// Observable status of a tailnet daemon.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct TailnetStatus {
     /// Lifecycle state.
@@ -204,6 +246,28 @@ pub struct TailnetStatus {
     pub socks_port: u16,
     /// Last state-change time as Unix milliseconds.
     pub updated_at_ms: u64,
+}
+
+impl std::fmt::Debug for TailnetStatus {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TailnetStatus")
+            .field("state", &self.state)
+            .field("detail", &self.detail)
+            .field("authentication_pending", &self.auth_url.is_some())
+            .field("tailnet_name", &self.tailnet_name)
+            .field("magic_dns_suffix", &self.magic_dns_suffix)
+            .field("self_dns_name", &self.self_dns_name)
+            .field("self_ips", &self.self_ips)
+            .field("online_peers", &self.online_peers)
+            .field("total_peers", &self.total_peers)
+            .field("pid", &self.pid)
+            .field("restart_count", &self.restart_count)
+            .field("proxy_port", &self.proxy_port)
+            .field("socks_port", &self.socks_port)
+            .field("updated_at_ms", &self.updated_at_ms)
+            .finish()
+    }
 }
 
 /// Everything a provider launch needs from a connected tailnet.
@@ -580,7 +644,7 @@ impl TailnetDaemon {
     /// [`Self::login`]. Existing state in `spec.state_dir` is reused, so a
     /// previously logged-in tailnet reconnects without a new login.
     pub async fn start(spec: TailnetSpec) -> Result<Self, TailnetError> {
-        TailscaleProvider.start(spec).await
+        Self::start_tailscale(spec).await
     }
 
     async fn start_tailscale(spec: TailnetSpec) -> Result<Self, TailnetError> {
@@ -1116,39 +1180,87 @@ impl TailnetDaemon {
 
 #[async_trait::async_trait]
 impl NetworkSession for TailnetDaemon {
-    type Status = TailnetStatus;
-    type Access = TailnetAccess;
-    type Error = TailnetError;
-
-    fn provider_id(&self) -> &'static str {
-        TAILSCALE_PROVIDER_ID
+    async fn status(&self) -> NetworkSessionStatus {
+        network_status(TailnetDaemon::status(self).await)
     }
 
-    async fn status(&self) -> Self::Status {
-        TailnetDaemon::status(self).await
+    async fn authenticate(&self) -> Result<NetworkSessionStatus, NetworkError> {
+        TailnetDaemon::login(self)
+            .await
+            .map(network_status)
+            .map_err(|error| {
+                NetworkError::provider(TAILSCALE_PROVIDER_ID.clone(), "authenticate", error)
+            })
     }
 
-    async fn stop(&self) -> Result<Self::Status, Self::Error> {
-        TailnetDaemon::stop(self).await
+    async fn deauthenticate(&self) -> Result<(), NetworkError> {
+        TailnetDaemon::logout(self).await.map_err(|error| {
+            NetworkError::provider(TAILSCALE_PROVIDER_ID.clone(), "deauthenticate", error)
+        })
     }
 
-    async fn restart(&self) -> Result<Self::Status, Self::Error> {
-        TailnetDaemon::restart(self).await
+    async fn stop(&self) -> Result<NetworkSessionStatus, NetworkError> {
+        TailnetDaemon::stop(self)
+            .await
+            .map(network_status)
+            .map_err(|error| NetworkError::provider(TAILSCALE_PROVIDER_ID.clone(), "stop", error))
     }
 
-    async fn access(&self) -> Result<Self::Access, Self::Error> {
-        TailnetDaemon::access(self).await
+    async fn restart(&self) -> Result<NetworkSessionStatus, NetworkError> {
+        TailnetDaemon::restart(self)
+            .await
+            .map(network_status)
+            .map_err(|error| {
+                NetworkError::provider(TAILSCALE_PROVIDER_ID.clone(), "restart", error)
+            })
+    }
+
+    async fn access(&self) -> Result<Arc<dyn NetworkAccess>, NetworkError> {
+        TailnetDaemon::access(self)
+            .await
+            .map(|access| Arc::new(access) as Arc<dyn NetworkAccess>)
+            .map_err(|error| {
+                NetworkError::provider(TAILSCALE_PROVIDER_ID.clone(), "resolve access", error)
+            })
     }
 }
 
-#[async_trait::async_trait]
-impl InteractiveNetworkSession for TailnetDaemon {
-    async fn authenticate(&self) -> Result<Self::Status, Self::Error> {
-        TailnetDaemon::login(self).await
+impl NetworkAccess for TailnetAccess {
+    fn environment(&self) -> BTreeMap<OsString, OsString> {
+        TailnetAccess::environment(self)
     }
 
-    async fn deauthenticate(&self) -> Result<(), Self::Error> {
-        TailnetDaemon::logout(self).await
+    fn guidance(&self) -> String {
+        TailnetAccess::guidance(self)
+    }
+
+    fn sandbox_requirements(&self) -> NetworkSandboxRequirements {
+        NetworkSandboxRequirements {
+            loopback_ports: vec![self.proxy_addr.port(), self.socks_addr.port()],
+            unix_sockets: vec![self.socket_path.clone()],
+            readable_files: vec![self.ssh_config_path.clone()],
+            upstream_proxy: Some(self.proxy_addr.to_string()),
+        }
+    }
+}
+
+fn network_status(status: TailnetStatus) -> NetworkSessionStatus {
+    NetworkSessionStatus {
+        state: match status.state {
+            TailnetState::Stopped => NetworkSessionState::Stopped,
+            TailnetState::Starting => NetworkSessionState::Starting,
+            TailnetState::NeedsLogin => NetworkSessionState::NeedsAuthentication,
+            TailnetState::Running => NetworkSessionState::Running,
+            TailnetState::Failed => NetworkSessionState::Failed,
+        },
+        detail: status.detail,
+        authentication_url: status.auth_url,
+        network_name: status.tailnet_name,
+        dns_suffix: status.magic_dns_suffix,
+        self_addresses: status.self_ips,
+        online_peers: Some(status.online_peers),
+        total_peers: Some(status.total_peers),
+        updated_at_ms: status.updated_at_ms,
     }
 }
 
@@ -1176,25 +1288,15 @@ async fn prepare_state_dir(path: &Path) -> Result<(), TailnetError> {
 mod tests {
     use super::*;
 
-    fn assert_tailscale_provider_contract<P>()
-    where
-        P: NetworkProvider<
-            Specification = TailnetSpec,
-            Session = TailnetDaemon,
-            Error = TailnetError,
-        >,
-        P::Session: InteractiveNetworkSession<
-            Status = TailnetStatus,
-            Access = TailnetAccess,
-            Error = TailnetError,
-        >,
-    {
-    }
-
     #[test]
     fn tailscale_implements_provider_contract_with_declared_capabilities() {
-        assert_tailscale_provider_contract::<TailscaleProvider>();
-        let provider = TailscaleProvider;
+        let temp = tempfile::tempdir().unwrap();
+        let tailscaled = temp.path().join("tailscaled");
+        let tailscale = temp.path().join("tailscale");
+        std::fs::write(&tailscaled, "stub").unwrap();
+        std::fs::write(&tailscale, "stub").unwrap();
+        let binaries = TailscaleBinaries::new(tailscaled, tailscale).unwrap();
+        let provider: Arc<dyn NetworkProvider> = Arc::new(TailscaleProvider::new(binaries));
         assert_eq!(provider.id(), TAILSCALE_PROVIDER_ID);
         let capabilities = provider.capabilities();
         assert!(capabilities.interactive_authentication);
@@ -1409,6 +1511,7 @@ mod tests {
             status.auth_url.as_deref(),
             Some("https://login.tailscale.com/a/stub")
         );
+        assert!(!format!("{status:?}").contains("/a/stub"));
         assert!(daemon.access().await.is_err());
         assert!(temp.path().join("state/ssh_config").is_file());
 
@@ -1430,5 +1533,45 @@ mod tests {
         let stopped = daemon.stop().await.unwrap();
         assert_eq!(stopped.state, TailnetState::Stopped);
         assert!(stopped.pid.is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn provider_registry_starts_and_stops_a_tailscale_session() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let tailscaled = temp.path().join("tailscaled");
+        std::fs::write(
+            &tailscaled,
+            "#!/bin/sh\nfor arg in \"$@\"; do case \"$arg\" in --socket=*) sock=\"${arg#--socket=}\";; esac; done\ntouch \"$sock\"\nsleep 60\n",
+        )
+        .unwrap();
+        let tailscale = temp.path().join("tailscale");
+        std::fs::write(
+            &tailscale,
+            "#!/bin/sh\necho '{\"BackendState\":\"NeedsLogin\",\"AuthURL\":\"https://login.tailscale.com/a/stub\",\"Peer\":null}'\n",
+        )
+        .unwrap();
+        for path in [&tailscaled, &tailscale] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let binaries = TailscaleBinaries::new(tailscaled, tailscale).unwrap();
+        let mut registry = crate::network::NetworkProviderRegistry::new();
+        registry
+            .register(Arc::new(TailscaleProvider::new(binaries)))
+            .unwrap();
+        let spec = NetworkInstanceSpec::new("stub", temp.path().join("state")).unwrap();
+        let session = registry.start(&TAILSCALE_PROVIDER_ID, spec).await.unwrap();
+        assert_eq!(session.provider_id(), &TAILSCALE_PROVIDER_ID);
+        assert_eq!(
+            session.session().status().await.state,
+            NetworkSessionState::NeedsAuthentication
+        );
+        assert_eq!(
+            session.shutdown().await.unwrap().state,
+            NetworkSessionState::Stopped
+        );
     }
 }

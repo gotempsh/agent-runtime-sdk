@@ -19,6 +19,9 @@ Versioning and Keep a Changelog conventions.
 
 ### Added
 
+- Object-safe private-network provider, session, access, and registry contracts
+  with validated provider IDs, explicit cancellation/teardown requirements,
+  provider-neutral sandbox requirements, and a built-in `TailscaleProvider`.
 - Optional `tailnet` feature: supervised per-agent userspace `tailscaled`
   daemons (`TailnetDaemon`) with a loopback split proxy, browser login URL
   reporting, and a `TailnetAccess` that applies proxy and `TEMPS_TAILNET_*`

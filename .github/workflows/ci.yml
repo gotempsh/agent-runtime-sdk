@@ -24,7 +24,7 @@ jobs:
           RUSTFLAGS: -D warnings
         run: |
           cargo check --locked --no-default-features
-          for feature in claude codex opencode nono ssh temps-sandbox; do
+          for feature in claude codex opencode nono ssh tailnet temps-sandbox; do
             cargo check --locked --no-default-features --features "$feature"
           done
       - name: Verify package contents
