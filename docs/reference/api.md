@@ -49,6 +49,31 @@ The public adapter trait is the extension point for Codex app-server, OpenCode
 server, or SDK-backed adapters. Such adapters should preserve the normalized
 contract and establish compatibility coverage before replacing a CLI adapter.
 
+## Private-network providers
+
+`NetworkProviderRegistry` stores heterogeneous, trusted in-process
+`NetworkProvider` implementations under validated `NetworkProviderId` values.
+It returns a `ManagedNetworkSession` whose provider identity is assigned by the
+registry rather than repeated by the implementation. `NetworkSession` exposes
+status, authentication, teardown, restart, and launch access through an
+object-safe interface. Providers without interactive authentication return
+`NetworkError::Unsupported` from that operation.
+
+`NetworkAccess` supplies launch environment, agent guidance, and
+`NetworkSandboxRequirements`. Capability values only select UI and onboarding;
+they are self-reported and must never authorize privileged operations or prove
+traffic isolation. Provider startup is cancellation-safe, session teardown
+revokes connectivity before success, and the final session owner cleans up
+ephemeral provider resources. Authentication URLs and access configuration are
+sensitive and should not be persisted or logged. `ManagedNetworkSession::shutdown`
+awaits provider teardown before releasing its process-wide state-directory
+reservation. Dropping the wrapper without shutdown keeps the directory
+reserved until process exit; separate host processes must use distinct private
+state roots.
+
+The `tailnet` feature implements this contract with `TailscaleProvider` while
+preserving the concrete `TailnetDaemon` and `TailnetAccess` APIs.
+
 ## Primary types
 
 ### `AgentRuntimeBuilder`

@@ -21,31 +21,51 @@ signed into one tailnet while agents work on others at the same time.
 ## Provider boundary
 
 Private-network lifecycle is defined by the provider-neutral
-`network::NetworkProvider` and `network::NetworkSession` traits. Interactive
-identity is a separate `network::InteractiveNetworkSession` trait, so a
-provider with static configuration is not forced to invent a browser-login
-flow. `TailscaleProvider` implements these contracts, and `TailnetDaemon::start`
-remains as a compatibility convenience that delegates to it.
+`network::NetworkProvider`, `network::NetworkSession`, and
+`network::NetworkAccess` traits. `NetworkProviderRegistry` stores different
+providers behind one object-safe interface and assigns provider identity to
+the returned session, so persisted selection cannot disagree with a session's
+self-reported identity. `TailscaleProvider` implements these contracts, while
+the existing `TailnetDaemon::start` API remains available unchanged.
 
-Provider specifications, status, errors, and launch access are associated
-types. This is deliberate: a future WireGuard implementation can expose an
-interface and routes instead of pretending it owns a Tailscale socket or CLI.
-Use `NetworkProvider::capabilities()` to decide whether to show interactive
-authentication, userspace-networking, or split-proxy controls.
+`NetworkAccess` applies provider-specific environment and exposes generic
+sandbox requirements. A future WireGuard implementation can return an empty
+environment when its interface and routes need no per-process configuration.
+Provider capabilities are trusted UI/discovery hints only: never use them as
+proof of isolation or to skip authorization and privilege prompts.
 
 ```rust,no_run
-use temps_agent_runtime::network::NetworkProvider;
-use temps_agent_runtime::tailnet::{TailnetSpec, TailscaleBinaries, TailscaleProvider};
+use std::sync::Arc;
+use temps_agent_runtime::network::{NetworkInstanceSpec, NetworkProviderRegistry};
+use temps_agent_runtime::tailnet::{
+    TAILSCALE_PROVIDER_ID, TailscaleBinaries, TailscaleProvider,
+};
 
 # async fn start() -> Result<(), Box<dyn std::error::Error>> {
-let provider = TailscaleProvider;
 let binaries = TailscaleBinaries::discover()?;
-let spec = TailnetSpec::new("client-a", "/var/lib/agent/tailnets/client-a", binaries)?;
-let daemon = provider.start(spec).await?;
-# let _ = daemon;
+let mut providers = NetworkProviderRegistry::new();
+providers.register(Arc::new(TailscaleProvider::new(binaries)))?;
+let spec = NetworkInstanceSpec::new(
+    "client-a",
+    "/var/lib/agent/tailnets/client-a",
+)?;
+let session = providers.start(&TAILSCALE_PROVIDER_ID, spec).await?;
+let status = session.session().status().await;
+# let _ = status;
 # Ok(())
 # }
 ```
+
+Provider implementations own every process, route, interface, and credential
+they create. Startup must clean partial resources when cancelled; stopping a
+session must revoke connectivity before reporting success; dropping the last
+session must clean up ephemeral resources. Authentication URLs are ephemeral
+sensitive data and must not be persisted or logged. End managed sessions with
+`ManagedNetworkSession::shutdown()` before reusing their state directory. A
+dropped session keeps that directory reserved until process exit because
+best-effort asynchronous teardown is not sufficient proof that reuse is safe.
+The reservation is process-wide; separate host processes must use distinct
+private state roots.
 
 ## Requirements
 
