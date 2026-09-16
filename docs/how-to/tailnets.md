@@ -18,6 +18,35 @@ signed into one tailnet while agents work on others at the same time.
 - The module reports the login URL. The application owns persistence of which
   tailnets exist, its UI, and the browser login step.
 
+## Provider boundary
+
+Private-network lifecycle is defined by the provider-neutral
+`network::NetworkProvider` and `network::NetworkSession` traits. Interactive
+identity is a separate `network::InteractiveNetworkSession` trait, so a
+provider with static configuration is not forced to invent a browser-login
+flow. `TailscaleProvider` implements these contracts, and `TailnetDaemon::start`
+remains as a compatibility convenience that delegates to it.
+
+Provider specifications, status, errors, and launch access are associated
+types. This is deliberate: a future WireGuard implementation can expose an
+interface and routes instead of pretending it owns a Tailscale socket or CLI.
+Use `NetworkProvider::capabilities()` to decide whether to show interactive
+authentication, userspace-networking, or split-proxy controls.
+
+```rust,no_run
+use temps_agent_runtime::network::NetworkProvider;
+use temps_agent_runtime::tailnet::{TailnetSpec, TailscaleBinaries, TailscaleProvider};
+
+# async fn start() -> Result<(), Box<dyn std::error::Error>> {
+let provider = TailscaleProvider;
+let binaries = TailscaleBinaries::discover()?;
+let spec = TailnetSpec::new("client-a", "/var/lib/agent/tailnets/client-a", binaries)?;
+let daemon = provider.start(spec).await?;
+# let _ = daemon;
+# Ok(())
+# }
+```
+
 ## Requirements
 
 The open-source daemon and CLI must be installed: `brew install tailscale` on

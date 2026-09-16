@@ -37,6 +37,9 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::{Mutex, RwLock};
 
 use crate::adapter::CommandSpec;
+use crate::network::{
+    InteractiveNetworkSession, NetworkProvider, NetworkProviderCapabilities, NetworkSession,
+};
 use crate::services::{
     ManagedProcessError, ManagedProcessId, ManagedProcessSpec, ManagedProcessStatus,
     ManagedProcessSupervisor, RestartPolicy,
@@ -59,6 +62,36 @@ const STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(20);
 const CLI_TIMEOUT: Duration = Duration::from_secs(10);
 /// Environment variable prefix for every non-proxy variable a tailnet adds.
 pub const ENVIRONMENT_PREFIX: &str = "TEMPS_TAILNET_";
+
+/// Stable identifier for the built-in Tailscale network provider.
+pub const TAILSCALE_PROVIDER_ID: &str = "tailscale";
+
+/// Built-in provider backed by the open-source `tailscaled` daemon.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TailscaleProvider;
+
+#[async_trait::async_trait]
+impl NetworkProvider for TailscaleProvider {
+    type Specification = TailnetSpec;
+    type Session = TailnetDaemon;
+    type Error = TailnetError;
+
+    fn id(&self) -> &'static str {
+        TAILSCALE_PROVIDER_ID
+    }
+
+    fn capabilities(&self) -> NetworkProviderCapabilities {
+        NetworkProviderCapabilities {
+            interactive_authentication: true,
+            userspace_networking: true,
+            split_proxy: true,
+        }
+    }
+
+    async fn start(&self, spec: Self::Specification) -> Result<Self::Session, Self::Error> {
+        TailnetDaemon::start_tailscale(spec).await
+    }
+}
 
 /// Failures of the tailnet subsystem.
 #[derive(Debug, thiserror::Error)]
@@ -547,6 +580,10 @@ impl TailnetDaemon {
     /// [`Self::login`]. Existing state in `spec.state_dir` is reused, so a
     /// previously logged-in tailnet reconnects without a new login.
     pub async fn start(spec: TailnetSpec) -> Result<Self, TailnetError> {
+        TailscaleProvider.start(spec).await
+    }
+
+    async fn start_tailscale(spec: TailnetSpec) -> Result<Self, TailnetError> {
         prepare_state_dir(&spec.state_dir).await?;
         let socket_path = socket_path_for(&spec.state_dir);
         // A stale socket from a crashed daemon makes the new one refuse to
@@ -1077,6 +1114,44 @@ impl TailnetDaemon {
     }
 }
 
+#[async_trait::async_trait]
+impl NetworkSession for TailnetDaemon {
+    type Status = TailnetStatus;
+    type Access = TailnetAccess;
+    type Error = TailnetError;
+
+    fn provider_id(&self) -> &'static str {
+        TAILSCALE_PROVIDER_ID
+    }
+
+    async fn status(&self) -> Self::Status {
+        TailnetDaemon::status(self).await
+    }
+
+    async fn stop(&self) -> Result<Self::Status, Self::Error> {
+        TailnetDaemon::stop(self).await
+    }
+
+    async fn restart(&self) -> Result<Self::Status, Self::Error> {
+        TailnetDaemon::restart(self).await
+    }
+
+    async fn access(&self) -> Result<Self::Access, Self::Error> {
+        TailnetDaemon::access(self).await
+    }
+}
+
+#[async_trait::async_trait]
+impl InteractiveNetworkSession for TailnetDaemon {
+    async fn authenticate(&self) -> Result<Self::Status, Self::Error> {
+        TailnetDaemon::login(self).await
+    }
+
+    async fn deauthenticate(&self) -> Result<(), Self::Error> {
+        TailnetDaemon::logout(self).await
+    }
+}
+
 async fn prepare_state_dir(path: &Path) -> Result<(), TailnetError> {
     tokio::fs::create_dir_all(path)
         .await
@@ -1100,6 +1175,32 @@ async fn prepare_state_dir(path: &Path) -> Result<(), TailnetError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_tailscale_provider_contract<P>()
+    where
+        P: NetworkProvider<
+            Specification = TailnetSpec,
+            Session = TailnetDaemon,
+            Error = TailnetError,
+        >,
+        P::Session: InteractiveNetworkSession<
+            Status = TailnetStatus,
+            Access = TailnetAccess,
+            Error = TailnetError,
+        >,
+    {
+    }
+
+    #[test]
+    fn tailscale_implements_provider_contract_with_declared_capabilities() {
+        assert_tailscale_provider_contract::<TailscaleProvider>();
+        let provider = TailscaleProvider;
+        assert_eq!(provider.id(), TAILSCALE_PROVIDER_ID);
+        let capabilities = provider.capabilities();
+        assert!(capabilities.interactive_authentication);
+        assert!(capabilities.userspace_networking);
+        assert!(capabilities.split_proxy);
+    }
 
     fn access() -> TailnetAccess {
         TailnetAccess {
