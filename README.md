@@ -148,8 +148,8 @@ For sandbox setup, read [Manage Nono sandboxes](docs/how-to/nono.md) or
 [Implement a sandbox backend](docs/how-to/custom-sandbox.md). For durable
 profile updates and retry, read
 [Recover a denied sandbox step](docs/how-to/recover-sandbox-denials.md).
-To give an agent one Tailscale network without changing the host's own
-login, read [Give an agent its own tailnet](docs/how-to/tailnets.md).
+To give an agent one Tailscale or Headscale network without changing the
+host's own login, read [Give an agent its own tailnet](docs/how-to/tailnets.md).
 For target onboarding, read
 [Discover provider harnesses](docs/how-to/discover-harnesses.md).
 For host-scoped skills and MCP servers, read

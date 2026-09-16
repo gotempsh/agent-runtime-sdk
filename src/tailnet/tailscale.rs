@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::Deserialize;
+use url::Url;
 
 use super::proxy::RouteTable;
 use super::TailnetError;
@@ -272,10 +273,21 @@ impl UpJsonLine {
 }
 
 /// Fallback for CLIs that print the login URL as text.
-pub(crate) fn extract_auth_url(line: &str) -> Option<String> {
-    line.split_whitespace()
-        .find(|token| token.starts_with("https://login.tailscale.com/"))
-        .map(|token| token.trim_end_matches(['.', ',']).to_string())
+pub(crate) fn extract_auth_url(line: &str, login_server: Option<&Url>) -> Option<String> {
+    line.split_whitespace().find_map(|token| {
+        let candidate = token.trim_end_matches(['.', ',', ')', ']', '}']);
+        let parsed = Url::parse(candidate).ok()?;
+        let is_tailscale =
+            parsed.scheme() == "https" && parsed.host_str() == Some("login.tailscale.com");
+        let is_headscale = login_server.is_some_and(|server| same_origin(server, &parsed));
+        (is_tailscale || is_headscale).then(|| candidate.to_string())
+    })
+}
+
+fn same_origin(left: &Url, right: &Url) -> bool {
+    left.scheme() == right.scheme()
+        && left.host_str() == right.host_str()
+        && left.port_or_known_default() == right.port_or_known_default()
 }
 
 /// Run `tailscale --socket <socket> <args>` with a deadline. Returns stdout
@@ -424,10 +436,28 @@ mod tests {
         assert_eq!(line.auth_url, "https://login.tailscale.com/a/xyz");
         assert!(UpJsonLine::parse("To authenticate, visit:").is_none());
         assert_eq!(
-            extract_auth_url("To authenticate, visit:\n\thttps://login.tailscale.com/a/xyz"),
+            extract_auth_url(
+                "To authenticate, visit:\n\thttps://login.tailscale.com/a/xyz",
+                None,
+            ),
             Some("https://login.tailscale.com/a/xyz".to_string())
         );
-        assert_eq!(extract_auth_url("Success."), None);
+        let headscale = Url::parse("https://vpn.example.test").unwrap();
+        assert_eq!(
+            extract_auth_url(
+                "Register at https://vpn.example.test/register/sensitive-auth-id.",
+                Some(&headscale),
+            ),
+            Some("https://vpn.example.test/register/sensitive-auth-id".to_string())
+        );
+        assert_eq!(
+            extract_auth_url(
+                "Ignore https://vpn.example.test.attacker.invalid/register/token",
+                Some(&headscale),
+            ),
+            None
+        );
+        assert_eq!(extract_auth_url("Success.", None), None);
     }
 
     #[test]
