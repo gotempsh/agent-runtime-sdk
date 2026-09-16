@@ -10,6 +10,10 @@
 //!   `100.64.0.0/10`, `fd7a:115c:a1e0::/48`) is forwarded through the
 //!   tailscaled SOCKS5 listener, with the name left unresolved so tailscaled
 //!   resolves MagicDNS itself;
+//! - any other name is resolved first; if it points at a tailnet address
+//!   (a custom DNS record such as `app.internal.example.com -> 100.x.y.z`)
+//!   it is forwarded through tailscaled by that address, because the
+//!   embedding host has no route to the CGNAT range without a TUN device;
 //! - everything else is connected directly from the embedding process.
 //!
 //! The proxy speaks plain `CONNECT host:port` (what every HTTPS client,
@@ -189,11 +193,23 @@ async fn serve_connection(
             (host.clone(), *port)
         }
     };
-    let via_tailnet = routes.read().await.is_tailnet_host(&host);
-    let upstream = if via_tailnet {
-        connect_via_socks5(socks.addr, &host, port).await
+    let by_name = routes.read().await.is_tailnet_host(&host);
+    let route = if by_name {
+        Route::Tailnet(host.clone())
     } else {
-        TcpStream::connect((host.as_str(), port)).await
+        match tokio::net::lookup_host((host.as_str(), port)).await {
+            Ok(resolved) => route_for_resolved(resolved.collect()),
+            // Unresolvable here; let the direct connect produce the error.
+            Err(_) => Route::Direct(Vec::new()),
+        }
+    };
+    let via_tailnet = matches!(route, Route::Tailnet(_));
+    let upstream = match &route {
+        Route::Tailnet(target) => connect_via_socks5(socks.addr, target, port).await,
+        Route::Direct(addrs) if addrs.is_empty() => {
+            TcpStream::connect((host.as_str(), port)).await
+        }
+        Route::Direct(addrs) => TcpStream::connect(addrs.as_slice()).await,
     };
     let mut upstream = match upstream {
         Ok(stream) => stream,
@@ -226,6 +242,29 @@ async fn serve_connection(
     }
     let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
     Ok(())
+}
+
+/// Where one proxied connection goes after classification.
+#[derive(Debug, PartialEq, Eq)]
+enum Route {
+    /// Hand this target (a name tailscaled resolves, or a tailnet IP literal)
+    /// to the tailscaled SOCKS5 listener.
+    Tailnet(String),
+    /// Connect directly to these already-resolved addresses. Empty means the
+    /// name could not be resolved here; the caller falls back to a plain
+    /// by-name connect so the client sees the resolver's own error.
+    Direct(Vec<SocketAddr>),
+}
+
+/// A name the route table does not know may still be a tailnet destination:
+/// operators commonly publish `internal.example.com -> 100.x.y.z` in public
+/// or split DNS. Without a TUN device the host cannot reach that address
+/// directly, so prefer the tailnet whenever resolution yields one.
+fn route_for_resolved(resolved: Vec<SocketAddr>) -> Route {
+    match resolved.iter().find(|addr| is_tailnet_ip(addr.ip())) {
+        Some(addr) => Route::Tailnet(addr.ip().to_string()),
+        None => Route::Direct(resolved),
+    }
 }
 
 /// Read up to and including the blank line that ends the request head.
@@ -406,6 +445,31 @@ mod tests {
         assert!(!table.is_tailnet_host("10.0.0.5"));
         assert!(!table.is_tailnet_host(""));
         assert!(!RouteTable::default().is_tailnet_host("stage-node-dcdn-cache"));
+    }
+
+    #[test]
+    fn custom_dns_names_resolving_to_tailnet_addresses_route_via_tailnet() {
+        let public: SocketAddr = "93.184.216.34:443".parse().unwrap();
+        let cgnat: SocketAddr = "100.126.62.28:443".parse().unwrap();
+        let ula: SocketAddr = "[fd7a:115c:a1e0::3401:9f70]:443".parse().unwrap();
+        // A public name behind a Tailscale IP (split or public DNS record).
+        assert_eq!(
+            route_for_resolved(vec![cgnat]),
+            Route::Tailnet("100.126.62.28".into())
+        );
+        assert_eq!(
+            route_for_resolved(vec![ula]),
+            Route::Tailnet("fd7a:115c:a1e0::3401:9f70".into())
+        );
+        // Dual answers: the tailnet address wins, since the host cannot
+        // reach it any other way and the public one may be a decoy/NAT.
+        assert_eq!(
+            route_for_resolved(vec![public, cgnat]),
+            Route::Tailnet("100.126.62.28".into())
+        );
+        // Ordinary public destinations keep their resolved addresses.
+        assert_eq!(route_for_resolved(vec![public]), Route::Direct(vec![public]));
+        assert_eq!(route_for_resolved(Vec::new()), Route::Direct(Vec::new()));
     }
 
     #[test]
