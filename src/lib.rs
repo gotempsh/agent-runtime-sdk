@@ -5,10 +5,11 @@
 //! typed [`TurnEvent`] model. Applications retain ownership of persistence,
 //! UI, HTTP APIs, authorization, and scheduling.
 //!
-//! The optional [`nono`] module manages and applies Nono profiles without
+//! The [`network`] module defines provider-neutral private-network lifecycle
+//! contracts. The optional [`nono`] module manages and applies Nono profiles without
 //! silently falling back to unsandboxed execution. The optional [`tailnet`]
-//! module gives an agent its own Tailscale network identity through a
-//! supervised userspace `tailscaled`.
+//! module implements those contracts for Tailscale and gives an agent its own
+//! network identity through a supervised userspace `tailscaled`.
 
 mod adapter;
 mod chat;
@@ -18,6 +19,7 @@ mod extensions;
 mod interactions;
 pub mod journal;
 pub mod lifecycle;
+pub mod network;
 mod process;
 pub mod protocol;
 pub mod protocol_client;
