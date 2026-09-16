@@ -484,6 +484,10 @@ struct DaemonState {
     auth_url: Option<String>,
     /// Detail that overrides the derived one, e.g. a login failure.
     detail_override: Option<String>,
+    /// Why the last status refresh failed while the process was alive. A
+    /// daemon that does not answer is never reported as connected, however
+    /// good its last snapshot looked.
+    unreachable: Option<String>,
     updated_at_ms: u64,
 }
 
@@ -592,6 +596,7 @@ impl TailnetDaemon {
                 tailscale: None,
                 auth_url: None,
                 detail_override: None,
+                unreachable: None,
                 updated_at_ms: now_ms(),
             }),
             login: Mutex::new(None),
@@ -665,6 +670,9 @@ impl TailnetDaemon {
                 ticker.tick().await;
                 let Some(inner) = weak.upgrade() else { return };
                 let daemon = TailnetDaemon { inner };
+                if daemon.heal_missing_socket().await {
+                    continue;
+                }
                 let _ = daemon.refresh().await;
             }
         });
@@ -675,20 +683,57 @@ impl TailnetDaemon {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(task);
     }
 
+    /// A daemon whose control socket vanished (another process that shared
+    /// the path unlinked it on exit, a tmp cleaner ran) can never be reached
+    /// again without a relaunch. Returns `true` when a restart was issued.
+    async fn heal_missing_socket(&self) -> bool {
+        let alive = self
+            .inner
+            .supervisor
+            .snapshot(&self.inner.process)
+            .await
+            .is_ok_and(|snapshot| snapshot.status == ManagedProcessStatus::Running);
+        if !alive || self.inner.socket_path.exists() {
+            return false;
+        }
+        {
+            let mut state = self.inner.state.write().await;
+            state.unreachable = Some("control socket disappeared; relaunching tailscaled".into());
+            state.updated_at_ms = now_ms();
+        }
+        let _ = self.restart().await;
+        true
+    }
+
     /// Query `tailscale status` now, update the split proxy's routes and the
     /// generated ssh config, and return the new status.
+    ///
+    /// A failed query marks the daemon unreachable, so [`Self::status`]
+    /// stops reporting it as connected until a later refresh succeeds.
     pub async fn refresh(&self) -> Result<TailnetStatus, TailnetError> {
-        let output = tailscale::run_cli(
-            &self.inner.spec.binaries.tailscale,
-            &self.inner.socket_path,
-            &["status", "--json"],
-            CLI_TIMEOUT,
-        )
-        .await?;
-        let status = StatusJson::parse(&output).map_err(|error| TailnetError::Cli {
-            command: "tailscale status --json".into(),
-            message: format!("could not parse output: {error}"),
-        })?;
+        let queried = async {
+            let output = tailscale::run_cli(
+                &self.inner.spec.binaries.tailscale,
+                &self.inner.socket_path,
+                &["status", "--json"],
+                CLI_TIMEOUT,
+            )
+            .await?;
+            StatusJson::parse(&output).map_err(|error| TailnetError::Cli {
+                command: "tailscale status --json".into(),
+                message: format!("could not parse output: {error}"),
+            })
+        }
+        .await;
+        let status = match queried {
+            Ok(status) => status,
+            Err(error) => {
+                let mut state = self.inner.state.write().await;
+                state.unreachable = Some(error.to_string());
+                state.updated_at_ms = now_ms();
+                return Err(error);
+            }
+        };
         let routes = status.route_table();
         if let Some(proxy) = self.inner.proxy.lock().await.as_ref() {
             proxy.set_routes(routes.clone()).await;
@@ -696,6 +741,7 @@ impl TailnetDaemon {
         self.write_ssh_config(&routes).await;
         {
             let mut state = self.inner.state.write().await;
+            state.unreachable = None;
             if status.is_running() {
                 state.auth_url = None;
                 state.detail_override = None;
@@ -741,6 +787,13 @@ impl TailnetDaemon {
         let state = self.inner.state.read().await;
         let tailscale = state.tailscale.as_ref();
         let (lifecycle, mut detail) = match snapshot.as_ref().map(|snapshot| snapshot.status) {
+            Some(ManagedProcessStatus::Running) if state.unreachable.is_some() => (
+                TailnetState::Starting,
+                format!(
+                    "tailscaled is not answering: {}",
+                    state.unreachable.as_deref().unwrap_or_default()
+                ),
+            ),
             Some(ManagedProcessStatus::Running) => match tailscale {
                 Some(status) if status.is_running() => (
                     TailnetState::Running,
@@ -977,6 +1030,7 @@ impl TailnetDaemon {
             state.auth_url = None;
             state.tailscale = None;
             state.detail_override = None;
+            state.unreachable = None;
             state.updated_at_ms = now_ms();
         }
         Ok(self.status().await)
@@ -1256,6 +1310,22 @@ mod tests {
         );
         assert!(daemon.access().await.is_err());
         assert!(temp.path().join("state/ssh_config").is_file());
+
+        // A vanished control socket is healed by relaunching the daemon.
+        std::fs::remove_file(daemon.socket_path()).unwrap();
+        assert!(daemon.heal_missing_socket().await);
+        assert!(daemon.socket_path().exists());
+        assert!(daemon.status().await.restart_count >= 1);
+        assert!(!daemon.heal_missing_socket().await);
+
+        // A daemon that stops answering is no longer reported as connected.
+        std::fs::write(&tailscale, "#!/bin/sh\nexit 1\n").unwrap();
+        assert!(daemon.refresh().await.is_err());
+        let status = daemon.status().await;
+        assert_eq!(status.state, TailnetState::Starting, "{status:?}");
+        assert!(status.detail.contains("not answering"), "{status:?}");
+        assert!(daemon.access().await.is_err());
+
         let stopped = daemon.stop().await.unwrap();
         assert_eq!(stopped.state, TailnetState::Stopped);
         assert!(stopped.pid.is_none());

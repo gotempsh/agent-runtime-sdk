@@ -24,7 +24,9 @@ Versioning and Keep a Changelog conventions.
   reporting, and a `TailnetAccess` that applies proxy and `TEMPS_TAILNET_*`
   environment to any provider command. `NonoExecution::tailnet` opens the
   daemon's ports, socket, and ssh config inside the sandbox and can chain
-  Nono's filtering proxy into the split proxy.
+  Nono's filtering proxy into the split proxy. The daemon relaunches
+  itself when its control socket disappears and never reports a daemon
+  that stopped answering as connected.
 - Explicit `ProviderProbeContext` for transport-local catalog and account-usage
   discovery with bounded secret environment injection, redacted diagnostics,
   and typed provider authentication and availability failures.
