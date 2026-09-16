@@ -67,6 +67,10 @@ name = "nono"
 required-features = ["claude", "nono"]
 
 [[example]]
+name = "tailnet_smoke"
+required-features = ["tailnet"]
+
+[[example]]
 name = "live_smoke"
 required-features = ["claude", "codex", "opencode", "nono"]
 
