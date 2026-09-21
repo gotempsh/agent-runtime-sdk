@@ -89,12 +89,18 @@ pub(super) const FRAME_SUBSCRIBED: &str = "@subscribed";
 /// The returned streams are live immediately; the task behind them polls the
 /// server for readiness first and emits [`FRAME_READY`] once it answers.
 pub(super) fn connect(port: u16) -> ProtocolStreams {
-    let (runtime_side, bridge_side) = tokio::io::duplex(BRIDGE_BUFFER_BYTES);
-    let (reader, writer) = tokio::io::split(runtime_side);
-    tokio::spawn(run_bridge(port, bridge_side));
+    // Two independent pipes rather than the two halves of one. Splitting a
+    // single duplex stream would keep it alive until *both* halves drop, so
+    // the runtime closing its writer at the end of a turn would never reach
+    // the bridge as end-of-input — and the bridge would keep the reader open
+    // while the runtime waited for it to close. Separate pipes make each
+    // direction close on its own.
+    let (runtime_reader, bridge_writer) = tokio::io::duplex(BRIDGE_BUFFER_BYTES);
+    let (bridge_reader, runtime_writer) = tokio::io::duplex(BRIDGE_BUFFER_BYTES);
+    tokio::spawn(run_bridge(port, bridge_reader, bridge_writer));
     ProtocolStreams {
-        reader: Box::new(reader),
-        writer: Box::new(writer),
+        reader: Box::new(runtime_reader),
+        writer: Box::new(runtime_writer),
     }
 }
 
@@ -104,8 +110,7 @@ fn address(port: u16) -> SocketAddr {
 
 /// Drive one turn's HTTP traffic until the state machine stops writing or the
 /// server stops answering.
-async fn run_bridge(port: u16, bridge_side: DuplexStream) {
-    let (incoming, outgoing) = tokio::io::split(bridge_side);
+async fn run_bridge(port: u16, incoming: DuplexStream, outgoing: DuplexStream) {
     let outgoing = std::sync::Arc::new(tokio::sync::Mutex::new(outgoing));
 
     if let Err(error) = wait_until_ready(port).await {
@@ -234,7 +239,7 @@ async fn perform(
 async fn stream_events(
     port: u16,
     path: String,
-    outgoing: std::sync::Arc<tokio::sync::Mutex<tokio::io::WriteHalf<DuplexStream>>>,
+    outgoing: std::sync::Arc<tokio::sync::Mutex<DuplexStream>>,
 ) {
     let stream = match TcpStream::connect(address(port)).await {
         Ok(stream) => stream,
