@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
+use super::codex_app_server;
 use crate::adapter::{inspect_executable, resolve_executable, AdapterState};
 use crate::error::classify_provider_failure;
 use crate::lifecycle::DeliveryState;
@@ -86,11 +87,32 @@ fn append_model_relay(
     Ok(())
 }
 
-/// Codex CLI adapter using `codex exec --json`.
+/// Transport used to run one Codex turn.
+///
+/// Both modes produce the same normalized [`TurnEvent`] stream. They differ in
+/// what the harness can ask for while a turn is running.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CodexTurnMode {
+    /// One-shot `codex exec --json`. Output only: the CLI resolves approvals
+    /// itself from the configured policy and cannot ask the user anything.
+    #[default]
+    Exec,
+    /// Bidirectional `codex app-server` JSON-RPC over stdio.
+    ///
+    /// Adds live approvals, `requestUserInput` questions, incremental text and
+    /// reasoning deltas, and a cooperative `turn/interrupt` on cancellation.
+    /// Requires a transport with
+    /// [`interactive_stdin`](crate::TransportCapabilities::interactive_stdin).
+    AppServer,
+}
+
+/// Codex CLI adapter using `codex exec --json` or `codex app-server`.
 #[derive(Debug, Clone, Default)]
 pub struct Codex {
     executable: Option<PathBuf>,
     trusted_http_model_relay_origin: Option<String>,
+    turn_mode: CodexTurnMode,
 }
 
 impl Codex {
@@ -99,7 +121,28 @@ impl Codex {
         Self {
             executable: Some(path.into()),
             trusted_http_model_relay_origin: None,
+            turn_mode: CodexTurnMode::default(),
         }
+    }
+
+    /// Drive turns through `codex app-server` instead of `codex exec --json`.
+    pub fn app_server() -> Self {
+        Self::default().with_turn_mode(CodexTurnMode::AppServer)
+    }
+
+    /// Select the transport used for turns.
+    pub fn with_turn_mode(mut self, mode: CodexTurnMode) -> Self {
+        self.turn_mode = mode;
+        self
+    }
+
+    /// Transport this adapter uses for turns.
+    pub fn turn_mode(&self) -> CodexTurnMode {
+        self.turn_mode
+    }
+
+    fn app_server_mode(&self) -> bool {
+        self.turn_mode == CodexTurnMode::AppServer
     }
 
     /// Explicitly trusts one plaintext HTTP origin for a host-isolated model relay.
@@ -166,6 +209,64 @@ fn catalog_protocol(message: &str) -> RuntimeError {
         provider: Provider::Codex,
         message: message.into(),
     }
+}
+
+/// Resolve the Codex approval policy, collaboration mode, and sandbox mode
+/// for one request, validating every provider-native selection.
+///
+/// `Ok(None)` means the caller asked for unrestricted access without naming a
+/// native control, which `exec` expresses as
+/// `--dangerously-bypass-approvals-and-sandbox` and the app server expresses
+/// as `never` + `danger-full-access`.
+pub(super) fn resolve_controls(request: &TurnRequest) -> Result<Option<(&str, &str, &str)>> {
+    let has_native_options = ["approval_policy", "collaboration_mode", "sandbox_mode"]
+        .iter()
+        .any(|key| request.harness_options.contains_key(*key));
+    if !has_native_options && matches!(request.permission_mode, PermissionMode::FullAccess) {
+        return Ok(None);
+    }
+    let approval = request.harness_options.get("approval_policy").map_or_else(
+        || match &request.permission_mode {
+            PermissionMode::Custom(value) => value.as_str(),
+            _ => "on-request",
+        },
+        String::as_str,
+    );
+    if !["untrusted", "on-request", "never"].contains(&approval) {
+        return Err(RuntimeError::InvalidRequest {
+            field: "harness_options.approval_policy",
+            message: format!("unsupported Codex approval policy `{approval}`"),
+        });
+    }
+    let collaboration = request.harness_options.get("collaboration_mode").map_or(
+        if matches!(request.permission_mode, PermissionMode::Plan) {
+            "plan"
+        } else {
+            "default"
+        },
+        String::as_str,
+    );
+    if !["default", "plan"].contains(&collaboration) {
+        return Err(RuntimeError::InvalidRequest {
+            field: "harness_options.collaboration_mode",
+            message: format!("unsupported Codex collaboration mode `{collaboration}`"),
+        });
+    }
+    let sandbox = request.harness_options.get("sandbox_mode").map_or(
+        if collaboration == "plan" {
+            "read-only"
+        } else {
+            "workspace-write"
+        },
+        String::as_str,
+    );
+    if !["read-only", "workspace-write", "danger-full-access"].contains(&sandbox) {
+        return Err(RuntimeError::InvalidRequest {
+            field: "harness_options.sandbox_mode",
+            message: format!("unsupported Codex sandbox mode `{sandbox}`"),
+        });
+    }
+    Ok(Some((approval, collaboration, sandbox)))
 }
 
 fn codex_config_string(value: &str) -> Result<String> {
@@ -404,7 +505,7 @@ fn codex_window(id: &str, value: &Value) -> Option<AccountUsageWindow> {
     })
 }
 
-fn codex_account_usage(value: &Value) -> Option<AccountUsageSnapshot> {
+pub(super) fn codex_account_usage(value: &Value) -> Option<AccountUsageSnapshot> {
     let container = value
         .get("rateLimits")
         .or_else(|| value.get("rate_limits"))
@@ -470,8 +571,10 @@ impl AgentAdapter for Codex {
             plan: false,
             full_access: true,
             custom: true,
-            live_approvals: false,
-            live_questions: false,
+            // `exec --json` has no channel back into a running turn; the app
+            // server answers both kinds of request over its JSON-RPC stdio.
+            live_approvals: self.app_server_mode(),
+            live_questions: self.app_server_mode(),
         }
     }
 
@@ -734,6 +837,21 @@ impl AgentAdapter for Codex {
 
     fn command(&self, request: &TurnRequest) -> Result<CommandSpec> {
         let mut spec = CommandSpec::new(self.configured_executable());
+        if self.app_server_mode() {
+            spec.args.push("app-server".into());
+            append_http_mcp_launch_context(&mut spec, request)?;
+            append_model_relay(
+                &mut spec,
+                request,
+                self.trusted_http_model_relay_origin.as_deref(),
+            )?;
+            // Every other turn parameter travels in `thread/start` and
+            // `turn/start`, which `prepare_turn` builds and `parse_line` sends
+            // once the app server accepts the handshake.
+            spec.initial_stdin = Some(codex_app_server::handshake());
+            spec.interactive_stdin = true;
+            return Ok(spec);
+        }
         spec.args.extend([
             "exec".into(),
             "--json".into(),
@@ -745,54 +863,7 @@ impl AgentAdapter for Codex {
             request,
             self.trusted_http_model_relay_origin.as_deref(),
         )?;
-        let has_native_options = ["approval_policy", "collaboration_mode", "sandbox_mode"]
-            .iter()
-            .any(|key| request.harness_options.contains_key(*key));
-        if !has_native_options && matches!(request.permission_mode, PermissionMode::FullAccess) {
-            spec.args
-                .push("--dangerously-bypass-approvals-and-sandbox".into());
-        } else {
-            let approval = request.harness_options.get("approval_policy").map_or_else(
-                || match &request.permission_mode {
-                    PermissionMode::Custom(value) => value.as_str(),
-                    _ => "on-request",
-                },
-                String::as_str,
-            );
-            if !["untrusted", "on-request", "never"].contains(&approval) {
-                return Err(RuntimeError::InvalidRequest {
-                    field: "harness_options.approval_policy",
-                    message: format!("unsupported Codex approval policy `{approval}`"),
-                });
-            }
-            let collaboration = request.harness_options.get("collaboration_mode").map_or(
-                if matches!(request.permission_mode, PermissionMode::Plan) {
-                    "plan"
-                } else {
-                    "default"
-                },
-                String::as_str,
-            );
-            if !["default", "plan"].contains(&collaboration) {
-                return Err(RuntimeError::InvalidRequest {
-                    field: "harness_options.collaboration_mode",
-                    message: format!("unsupported Codex collaboration mode `{collaboration}`"),
-                });
-            }
-            let sandbox = request.harness_options.get("sandbox_mode").map_or(
-                if collaboration == "plan" {
-                    "read-only"
-                } else {
-                    "workspace-write"
-                },
-                String::as_str,
-            );
-            if !["read-only", "workspace-write", "danger-full-access"].contains(&sandbox) {
-                return Err(RuntimeError::InvalidRequest {
-                    field: "harness_options.sandbox_mode",
-                    message: format!("unsupported Codex sandbox mode `{sandbox}`"),
-                });
-            }
+        if let Some((approval, collaboration, sandbox)) = resolve_controls(request)? {
             spec.args.extend(["--sandbox".into(), sandbox.into()]);
             let approval =
                 serde_json::to_string(approval).map_err(|error| RuntimeError::Protocol {
@@ -809,6 +880,9 @@ impl AgentAdapter for Codex {
                     "model_reasoning_effort=\"medium\"".into(),
                 ]);
             }
+        } else {
+            spec.args
+                .push("--dangerously-bypass-approvals-and-sandbox".into());
         }
         if let Some(reasoning) = request.reasoning.as_deref() {
             let reasoning =
@@ -841,7 +915,23 @@ impl AgentAdapter for Codex {
         Ok(spec)
     }
 
+    fn prepare_turn(&self, request: &TurnRequest, state: &mut AdapterState) -> Result<()> {
+        if self.app_server_mode() {
+            codex_app_server::prepare_turn(request, state)?;
+        }
+        Ok(())
+    }
+
+    fn interrupt_request(&self, state: &AdapterState) -> Option<Vec<u8>> {
+        self.app_server_mode()
+            .then(|| codex_app_server::interrupt(state))
+            .flatten()
+    }
+
     fn parse_line(&self, line: &str, state: &mut AdapterState) -> Result<AdapterOutput> {
+        if self.app_server_mode() {
+            return codex_app_server::parse_line(line, state);
+        }
         let value: Value = serde_json::from_str(line).map_err(|error| RuntimeError::Protocol {
             provider: Provider::Codex,
             message: format!("invalid JSON event: {error}"),
@@ -955,18 +1045,24 @@ impl AgentAdapter for Codex {
     fn approval_response(
         &self,
         _request: &ApprovalRequest,
-        _original: &Value,
-        _decision: ApprovalDecision,
+        original: &Value,
+        decision: ApprovalDecision,
     ) -> Result<Option<Vec<u8>>> {
-        Ok(None)
+        if !self.app_server_mode() {
+            return Ok(None);
+        }
+        codex_app_server::approval_response(original, decision).map(Some)
     }
     fn question_response(
         &self,
         _request: &QuestionRequest,
-        _original: &Value,
-        _answer: Option<QuestionAnswer>,
+        original: &Value,
+        answer: Option<QuestionAnswer>,
     ) -> Result<Option<Vec<u8>>> {
-        Ok(None)
+        if !self.app_server_mode() {
+            return Ok(None);
+        }
+        codex_app_server::question_response(original, answer).map(Some)
     }
 }
 
