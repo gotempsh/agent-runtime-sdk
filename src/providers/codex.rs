@@ -669,6 +669,9 @@ impl AgentAdapter for Codex {
             // `codex exec --image` and the app server's `localImage` user
             // input both read the file on the execution host.
             native_image_attachments: true,
+            // `thread/tokenUsage/updated` reports the active window and the
+            // model's limit; `exec --json` reports turn totals only.
+            context_window_usage: self.app_server_mode(),
         }
     }
 

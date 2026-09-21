@@ -61,6 +61,10 @@ pub struct TurnCapabilities {
     /// Applications and the retained runtime stop describing those files in
     /// prompt text, because the provider receives the image itself.
     pub native_image_attachments: bool,
+    /// The adapter emits [`ContextWindowUsage`] snapshots while a turn runs,
+    /// so an application can show live context occupancy instead of only the
+    /// terminal token totals.
+    pub context_window_usage: bool,
 }
 
 impl fmt::Debug for LaunchContext {

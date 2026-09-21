@@ -467,7 +467,10 @@ impl RuntimeTurnExecutor for AgentRuntime {
                 .is_some_and(|support| support.live_approvals || support.live_questions),
             configurable_auto_compaction: provider == Provider::Claude,
             manual_compaction: provider == Provider::Claude,
-            context_window_usage: provider == Provider::Claude,
+            context_window_usage: provider == Provider::Claude
+                || self
+                    .turn_capabilities(provider)
+                    .is_ok_and(|capabilities| capabilities.context_window_usage),
             native_image_attachments: self
                 .turn_capabilities(provider)
                 .is_ok_and(|capabilities| capabilities.native_image_attachments),

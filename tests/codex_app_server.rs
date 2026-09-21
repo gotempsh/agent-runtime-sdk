@@ -394,6 +394,10 @@ async fn the_app_server_mode_advertises_live_interactions() {
 
     assert!(support.live_approvals);
     assert!(support.live_questions);
+
+    let turn = runtime.turn_capabilities(Provider::Codex).unwrap();
+    assert!(turn.context_window_usage);
+    assert!(turn.native_image_attachments);
 }
 
 #[tokio::test]
@@ -433,6 +437,35 @@ async fn an_approval_is_accepted_through_the_interaction_handler() {
         .events()
         .iter()
         .any(|event| matches!(event, TurnEvent::ApprovalRequested(_))));
+}
+
+#[tokio::test]
+async fn a_turn_streams_the_active_context_window_for_the_selected_model() {
+    let transport = AppServer::new(Script::Approval);
+    let events = Collector::default();
+    let responder = Responder::new(ApprovalDecision::Allow, None);
+    let runtime = runtime(transport);
+    let mut request = request();
+    request.model = Some("gpt-5-codex".to_string());
+
+    let result = runtime
+        .run(request, &events, Some(&responder))
+        .await
+        .unwrap();
+
+    let usage = events
+        .events()
+        .into_iter()
+        .find_map(|event| match event {
+            TurnEvent::Usage(usage) => usage.context_window,
+            _ => None,
+        })
+        .expect("the turn reported context-window occupancy");
+    assert_eq!(usage.used_tokens, Some(154));
+    assert_eq!(usage.limit_tokens, Some(272_000));
+    assert_eq!(usage.model.as_deref(), Some("gpt-5-codex"));
+    assert!(!usage.estimated);
+    assert_eq!(result.usage.context_window, Some(usage));
 }
 
 #[tokio::test]

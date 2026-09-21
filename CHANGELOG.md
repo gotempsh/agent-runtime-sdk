@@ -42,6 +42,12 @@ Versioning and Keep a Changelog conventions.
   `localImage` `turn/start` inputs, and the retained runtime no longer appends
   their host paths to the prompt. Providers without native support keep the
   existing path-text behavior.
+- Context-window fidelity for Codex `app-server` turns. Token-usage
+  notifications are attributed to the active thread, the emitted
+  `ContextWindowUsage` is labelled with the resolved (or requested) model, and
+  `TurnCapabilities::context_window_usage` plus the existing
+  `RuntimeDriverCapabilities::context_window_usage` now report Codex
+  app-server support so applications can gate a context meter.
 - `TurnEvent::AsyncQuestionRequested` for a question the turn did not wait on
   (Codex `isBlocking: false`). The runtime answers the provider immediately so
   the turn keeps running; hosts show the question as open and deliver the

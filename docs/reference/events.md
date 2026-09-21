@@ -24,6 +24,14 @@ and whether occupancy was estimated from provider components. Cached input still
 occupies context. Keep an unknown limit as `None` and avoid presenting a guessed
 percentage.
 
+Claude and Codex in `app-server` mode report occupancy natively: Codex's
+`thread/tokenUsage/updated` carries the latest model request (`tokenUsage.last`)
+and the model's `modelContextWindow`, labelled with the resolved or requested
+model. A later snapshot replaces the earlier one, so a compaction correctly
+shrinks the reported window. `codex exec --json` reports turn token totals only;
+`AgentRuntime::turn_capabilities(provider).context_window_usage` tells the two
+apart before a product surfaces a context meter.
+
 `AccountUsageUpdated` is deliberately separate from `Usage`. It reports account
 allocation, not tokens consumed by one turn. Every `AccountUsageWindow` carries
 a provider-native stable ID, a provider-neutral `session`/`weekly`/`other`

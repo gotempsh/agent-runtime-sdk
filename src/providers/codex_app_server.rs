@@ -60,6 +60,9 @@ struct TurnState {
     turn_params: Value,
     /// Whether this turn resumes an existing Codex thread.
     resume: bool,
+    /// Model requested for this turn, used to label context-window usage
+    /// before the app server reports the thread's resolved model.
+    model: Option<String>,
     /// Thread identifier reported by the app server.
     thread_id: Option<String>,
     /// Turn identifier required by `turn/interrupt`.
@@ -190,6 +193,7 @@ pub(super) fn prepare_turn(request: &TurnRequest, state: &mut AdapterState) -> R
             thread_params,
             turn_params,
             resume: request.session_id.is_some(),
+            model: request.model.clone(),
             ..TurnState::default()
         },
     );
@@ -475,7 +479,21 @@ fn notification(
             }
         }
         "thread/tokenUsage/updated" => {
-            let usage = token_usage(&params);
+            // A notification for another thread (the app server can host
+            // several) must not be charged against this turn.
+            let reported = params.get("threadId").and_then(Value::as_str);
+            if let (Some(reported), Some(current)) = (reported, turn.thread_id.as_deref()) {
+                if reported != current {
+                    return;
+                }
+            }
+            let model = state
+                .result
+                .model
+                .as_deref()
+                .or(turn.model.as_deref())
+                .map(str::to_owned);
+            let usage = token_usage(&params, model);
             if usage != Usage::default() {
                 super::merge_usage(&mut state.result.usage, &usage);
                 output.events.push(TurnEvent::Usage(usage));
@@ -504,7 +522,7 @@ fn notification(
             if let Some(model) = completed.get("model").and_then(Value::as_str) {
                 state.result.model = Some(model.to_string());
             }
-            let usage = token_usage(completed);
+            let usage = token_usage(completed, state.result.model.clone());
             if usage != Usage::default() {
                 super::merge_usage(&mut state.result.usage, &usage);
                 output.events.push(TurnEvent::Usage(usage));
@@ -695,7 +713,12 @@ fn tool_event(item: &Value, completed: bool) -> Option<TurnEvent> {
 }
 
 /// Normalize `thread/tokenUsage/updated`'s camelCase counters.
-fn token_usage(params: &Value) -> Usage {
+///
+/// Context occupancy is the *latest* model request (`tokenUsage.last`), not
+/// the thread total: a compaction shrinks the active window even though the
+/// thread's cumulative totals keep growing. `model` labels the snapshot so an
+/// application can show which model's window is being filled.
+fn token_usage(params: &Value, model: Option<String>) -> Usage {
     let container = params
         .get("tokenUsage")
         .or_else(|| params.get("usage"))
@@ -713,7 +736,7 @@ fn token_usage(params: &Value) -> Usage {
                 .get("modelContextWindow")
                 .and_then(Value::as_u64)
                 .filter(|limit| *limit > 0),
-            model: None,
+            model,
             estimated: false,
         }),
         cost_usd: None,
@@ -1011,6 +1034,109 @@ mod tests {
         assert!(output.events.is_empty());
         assert_eq!(state.result.text, "Done");
         assert!(state.saw_text_delta);
+    }
+
+    fn token_usage_frame(thread: &str, total: u64) -> String {
+        json!({"jsonrpc": "2.0", "method": "thread/tokenUsage/updated", "params": {
+            "threadId": thread, "turnId": "turn-1",
+            "tokenUsage": {
+                "last": {"inputTokens": 120, "outputTokens": 34, "cachedInputTokens": 64,
+                    "cacheWriteInputTokens": 8, "totalTokens": total},
+                "total": {"inputTokens": 900, "outputTokens": 400, "totalTokens": 1300},
+                "modelContextWindow": 272_000
+            }
+        }})
+        .to_string()
+    }
+
+    /// Open a thread so token-usage notifications can be attributed to it.
+    fn started_turn(model: Option<&str>) -> AdapterState {
+        let mut request = TurnRequest::new(Provider::Codex, ".", "inspect");
+        request.model = model.map(str::to_owned);
+        let mut state = AdapterState::default();
+        prepare_turn(&request, &mut state).unwrap();
+        parse_line(r#"{"jsonrpc":"2.0","id":1,"result":{}}"#, &mut state).unwrap();
+        parse_line(
+            r#"{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thread-1"}}}"#,
+            &mut state,
+        )
+        .unwrap();
+        state
+    }
+
+    #[test]
+    fn token_usage_reports_the_active_context_window_against_the_selected_model() {
+        let mut state = started_turn(Some("gpt-5-codex"));
+
+        let output = parse_line(&token_usage_frame("thread-1", 154), &mut state).unwrap();
+
+        let [TurnEvent::Usage(usage)] = output.events.as_slice() else {
+            panic!("expected one usage event, got {:?}", output.events);
+        };
+        assert_eq!(usage.input_tokens, Some(120));
+        assert_eq!(usage.output_tokens, Some(34));
+        assert_eq!(usage.cache_read_input_tokens, Some(64));
+        assert_eq!(usage.cache_creation_input_tokens, Some(8));
+        let window = usage.context_window.clone().expect("context window");
+        assert_eq!(window.used_tokens, Some(154));
+        assert_eq!(window.limit_tokens, Some(272_000));
+        assert_eq!(window.model.as_deref(), Some("gpt-5-codex"));
+        assert!(!window.estimated);
+        assert_eq!(state.result.usage.context_window, usage.context_window);
+    }
+
+    #[test]
+    fn a_later_context_snapshot_replaces_the_earlier_one() {
+        let mut state = started_turn(None);
+        parse_line(&token_usage_frame("thread-1", 154), &mut state).unwrap();
+
+        parse_line(&token_usage_frame("thread-1", 96), &mut state).unwrap();
+
+        let window = state
+            .result
+            .usage
+            .context_window
+            .clone()
+            .expect("context window");
+        assert_eq!(
+            window.used_tokens,
+            Some(96),
+            "compaction shrinks the active window; usage must not accumulate"
+        );
+    }
+
+    #[test]
+    fn token_usage_for_another_thread_is_not_charged_against_this_turn() {
+        let mut state = started_turn(Some("gpt-5-codex"));
+
+        let output = parse_line(&token_usage_frame("thread-other", 999), &mut state).unwrap();
+
+        assert!(output.events.is_empty());
+        assert_eq!(state.result.usage, Usage::default());
+    }
+
+    #[test]
+    fn the_model_reported_by_the_thread_labels_the_context_window() {
+        let mut request = TurnRequest::new(Provider::Codex, ".", "inspect");
+        request.model = Some("requested-model".into());
+        let mut state = AdapterState::default();
+        prepare_turn(&request, &mut state).unwrap();
+        parse_line(r#"{"jsonrpc":"2.0","id":1,"result":{}}"#, &mut state).unwrap();
+        parse_line(
+            r#"{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thread-1","model":"resolved-model"}}}"#,
+            &mut state,
+        )
+        .unwrap();
+
+        let output = parse_line(&token_usage_frame("thread-1", 154), &mut state).unwrap();
+
+        let [TurnEvent::Usage(usage)] = output.events.as_slice() else {
+            panic!("expected one usage event");
+        };
+        assert_eq!(
+            usage.context_window.as_ref().unwrap().model.as_deref(),
+            Some("resolved-model")
+        );
     }
 
     #[test]
