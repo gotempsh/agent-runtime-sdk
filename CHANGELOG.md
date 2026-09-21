@@ -19,6 +19,25 @@ Versioning and Keep a Changelog conventions.
 
 ### Added
 
+- Bidirectional Codex support through `codex app-server`. `CodexTurnMode`
+  selects the transport; `Codex::app_server()` drives JSON-RPC over stdio with
+  live approvals (`accept`/`acceptForSession`/`decline`),
+  `item/tool/requestUserInput` questions, incremental text and reasoning
+  deltas, thread token usage, thread resume and fork, and a cooperative
+  `turn/interrupt` on cancellation. `PermissionSupport` reports
+  `live_approvals`/`live_questions` in that mode. The default
+  `codex exec --json` transport is unchanged.
+- `TurnEvent::AsyncQuestionRequested` for a question the turn did not wait on
+  (Codex `isBlocking: false`). The runtime answers the provider immediately so
+  the turn keeps running; hosts show the question as open and deliver the
+  answer as a follow-up prompt.
+- `ApprovalDecision::AllowForSession` for providers with a session-scoped
+  grant. Adapters without one treat it as `Allow`.
+- `AgentAdapter::prepare_turn` (seed per-turn parser state from the validated
+  request), `AgentAdapter::interrupt_request` (encode a cooperative interrupt
+  the runtime writes before terminating a cancelled turn), and
+  `AdapterOutput::writes` (provider frames the runtime writes to stdin without
+  waiting for an application decision). All three are additive with defaults.
 - Object-safe private-network provider, session, access, and registry contracts
   with validated provider IDs, explicit cancellation/teardown requirements,
   provider-neutral sandbox requirements, and built-in `TailscaleProvider` and

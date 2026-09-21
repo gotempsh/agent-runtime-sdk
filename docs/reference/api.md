@@ -8,7 +8,7 @@ pin and test the CLI versions used in production.
 | Feature | Default | Adds |
 | --- | --- | --- |
 | `claude` | yes | `providers::Claude` stream-JSON adapter |
-| `codex` | yes | `providers::Codex` `exec --json` adapter |
+| `codex` | yes | `providers::Codex` `exec --json` and `app-server` adapter |
 | `opencode` | yes | `providers::OpenCode` JSON adapter |
 | `nono` | yes | profile management and per-turn Nono execution |
 | `tailnet` | yes | per-agent userspace Tailscale daemons and split proxy |
@@ -39,15 +39,43 @@ features.
 | `Plan` | yes | yes, read-only sandbox | yes, built-in `plan` agent |
 | `FullAccess` | yes | yes | yes, `--auto`; explicit configured denies remain |
 | Custom mode | yes | yes, native approval policy | yes, configured agent |
-| Live approvals | yes | no (`exec` is configured non-interactively) | no (`run` is non-interactive) |
-| Live user questions | yes | no | no |
+| Live approvals | yes | app-server mode only (`exec` is configured non-interactively) | no (`run` is non-interactive) |
+| Live user questions | yes | app-server mode only, blocking and async | no |
+| Cooperative interrupt on cancellation | no | app-server mode only (`turn/interrupt`) | no |
 | Structured launch context | system prompt, exact tools, stdio/HTTP MCP, strict MCP | additive HTTP MCP | rejected |
 | Prompt kept out of argv | yes | yes | no; current `run` CLI uses message args |
-| Current backend | CLI stream JSON | `codex exec --json` | `opencode run --format json` |
+| Current backend | CLI stream JSON | `codex exec --json` (default) or `codex app-server` | `opencode run --format json` |
 
-The public adapter trait is the extension point for Codex app-server, OpenCode
-server, or SDK-backed adapters. Such adapters should preserve the normalized
-contract and establish compatibility coverage before replacing a CLI adapter.
+The public adapter trait is the extension point for OpenCode server or
+SDK-backed adapters. Such adapters should preserve the normalized contract and
+establish compatibility coverage before replacing a CLI adapter.
+
+### Codex turn modes
+
+`providers::CodexTurnMode` selects how a Codex turn runs. `Exec` (the default)
+keeps the one-way `codex exec --json` behavior. `AppServer`, selected with
+`Codex::app_server()` or `Codex::default().with_turn_mode(CodexTurnMode::AppServer)`,
+drives `codex app-server` over JSON-RPC and adds:
+
+- live approvals for `item/commandExecution/requestApproval`,
+  `item/fileChange/requestApproval` and `item/permissions/requestApproval`,
+  answered through `InteractionHandler::approve`. `ApprovalDecision::Allow`,
+  `ApprovalDecision::AllowForSession` and `ApprovalDecision::Deny` map to the
+  native `accept`, `acceptForSession` and `decline` decisions;
+- `item/tool/requestUserInput` questions. A blocking question
+  (`isBlocking: true`) becomes `TurnEvent::QuestionRequested` and waits for
+  `InteractionHandler::answer`. A non-blocking question becomes
+  `TurnEvent::AsyncQuestionRequested`, is answered immediately on the wire with
+  a note that no answer exists yet, and never stalls the turn; deliver the
+  user's eventual answer as a follow-up prompt;
+- incremental text and reasoning deltas, thread token usage, and a cooperative
+  `turn/interrupt` when the turn's `CancellationToken` fires.
+
+The app-server mode requires a transport whose capabilities include
+`interactive_stdin`. Model, sandbox, approval policy, service tier and the
+resumed thread identifier travel in `thread/start`/`thread/resume` and
+`turn/start` instead of argv; turn-scoped HTTP MCP servers and the model relay
+still use `--config` overrides.
 
 ## Private-network providers
 
