@@ -4,13 +4,15 @@
 mod claude;
 #[cfg(feature = "codex")]
 mod codex;
+#[cfg(feature = "codex")]
+mod codex_app_server;
 #[cfg(feature = "opencode")]
 mod opencode;
 
 #[cfg(feature = "claude")]
 pub use claude::Claude;
 #[cfg(feature = "codex")]
-pub use codex::Codex;
+pub use codex::{Codex, CodexTurnMode};
 #[cfg(feature = "opencode")]
 pub use opencode::OpenCode;
 

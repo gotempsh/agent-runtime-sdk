@@ -24,6 +24,14 @@ and whether occupancy was estimated from provider components. Cached input still
 occupies context. Keep an unknown limit as `None` and avoid presenting a guessed
 percentage.
 
+Claude and Codex in `app-server` mode report occupancy natively: Codex's
+`thread/tokenUsage/updated` carries the latest model request (`tokenUsage.last`)
+and the model's `modelContextWindow`, labelled with the resolved or requested
+model. A later snapshot replaces the earlier one, so a compaction correctly
+shrinks the reported window. `codex exec --json` reports turn token totals only;
+`AgentRuntime::turn_capabilities(provider).context_window_usage` tells the two
+apart before a product surfaces a context meter.
+
 `AccountUsageUpdated` is deliberately separate from `Usage`. It reports account
 allocation, not tokens consumed by one turn. Every `AccountUsageWindow` carries
 a provider-native stable ID, a provider-neutral `session`/`weekly`/`other`
@@ -93,11 +101,21 @@ from `snapshot` and `logs` before following it.
 | --- | --- | --- |
 | `ApprovalRequested` | A tool needs an explicit decision | `approval_needed` |
 | `PlanApprovalRequested` | The agent proposed a plan and is waiting for an explicit accept/reject decision | `approval_needed` |
-| `QuestionRequested` | The agent needs user input; `QuestionRequest.prompts` is the normalized UI shape | `input_needed` |
+| `QuestionRequested` | The agent needs user input and the turn is waiting; `QuestionRequest.prompts` is the normalized UI shape | `input_needed` |
+| `AsyncQuestionRequested` | The agent asked a question without waiting for it; the turn keeps running | unchanged; show the question as open |
 
 Both approval events resolve through `InteractionHandler::approve`: `Allow`
-accepts the tool or proposed plan, while `Deny { reason }` rejects it and can
-carry revision feedback back to the agent. Persist the request before waiting,
+accepts the tool or proposed plan, `AllowForSession` additionally grants
+comparable operations for the rest of the session on providers that support it
+(Codex app-server's `acceptForSession`; other adapters treat it as `Allow`),
+while `Deny { reason }` rejects it and can carry revision feedback back to the
+agent.
+
+`AsyncQuestionRequested` is never resolved through `InteractionHandler::answer`:
+the runtime already told the provider that no answer exists yet, which is what
+keeps the turn from stalling (Codex app-server's `isBlocking: false`
+`requestUserInput`). Render it as an open question and send the user's eventual
+answer as the prompt of a follow-up turn. Persist the request before waiting,
 and make decision writes idempotent. A successful native `EnterPlanMode` or
 `ExitPlanMode` is followed by `PermissionModeChanged`; do not update the
 effective mode merely because an exit approval was requested. See

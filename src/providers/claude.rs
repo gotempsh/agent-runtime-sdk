@@ -1286,7 +1286,11 @@ impl AgentAdapter for Claude {
             .cloned()
             .unwrap_or_else(|| json!({}));
         let response = match decision {
-            ApprovalDecision::Allow => json!({"behavior": "allow", "updatedInput": original_input}),
+            // Claude Code's control protocol has no session-scoped grant, so
+            // a session approval permits exactly this one operation.
+            ApprovalDecision::Allow | ApprovalDecision::AllowForSession => {
+                json!({"behavior": "allow", "updatedInput": original_input})
+            }
             ApprovalDecision::Deny { reason } => json!({
                 "behavior": "deny",
                 "message": reason.unwrap_or_else(|| "Permission denied".to_string())

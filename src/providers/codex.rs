@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
+use super::codex_app_server;
 use crate::adapter::{inspect_executable, resolve_executable, AdapterState};
 use crate::error::classify_provider_failure;
 use crate::lifecycle::DeliveryState;
@@ -14,7 +15,7 @@ use crate::{
     HarnessModel, HarnessModelCatalog, HarnessReasoningEffort, HarnessServiceTier,
     LaunchContextCapabilities, McpServerConfig, PermissionMode, PermissionSupport, Provider,
     ProviderReadiness, ProviderTerminalFailure, QuestionAnswer, QuestionRequest, Result,
-    RuntimeError, ToolCallStatus, TransportExitStatus, TurnEvent, TurnRequest,
+    RuntimeError, ToolCallStatus, TransportExitStatus, TurnCapabilities, TurnEvent, TurnRequest,
 };
 
 #[derive(serde::Deserialize)]
@@ -86,11 +87,32 @@ fn append_model_relay(
     Ok(())
 }
 
-/// Codex CLI adapter using `codex exec --json`.
+/// Transport used to run one Codex turn.
+///
+/// Both modes produce the same normalized [`TurnEvent`] stream. They differ in
+/// what the harness can ask for while a turn is running.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CodexTurnMode {
+    /// One-shot `codex exec --json`. Output only: the CLI resolves approvals
+    /// itself from the configured policy and cannot ask the user anything.
+    #[default]
+    Exec,
+    /// Bidirectional `codex app-server` JSON-RPC over stdio.
+    ///
+    /// Adds live approvals, `requestUserInput` questions, incremental text and
+    /// reasoning deltas, and a cooperative `turn/interrupt` on cancellation.
+    /// Requires a transport with
+    /// [`interactive_stdin`](crate::TransportCapabilities::interactive_stdin).
+    AppServer,
+}
+
+/// Codex CLI adapter using `codex exec --json` or `codex app-server`.
 #[derive(Debug, Clone, Default)]
 pub struct Codex {
     executable: Option<PathBuf>,
     trusted_http_model_relay_origin: Option<String>,
+    turn_mode: CodexTurnMode,
 }
 
 impl Codex {
@@ -99,7 +121,28 @@ impl Codex {
         Self {
             executable: Some(path.into()),
             trusted_http_model_relay_origin: None,
+            turn_mode: CodexTurnMode::default(),
         }
+    }
+
+    /// Drive turns through `codex app-server` instead of `codex exec --json`.
+    pub fn app_server() -> Self {
+        Self::default().with_turn_mode(CodexTurnMode::AppServer)
+    }
+
+    /// Select the transport used for turns.
+    pub fn with_turn_mode(mut self, mode: CodexTurnMode) -> Self {
+        self.turn_mode = mode;
+        self
+    }
+
+    /// Transport this adapter uses for turns.
+    pub fn turn_mode(&self) -> CodexTurnMode {
+        self.turn_mode
+    }
+
+    fn app_server_mode(&self) -> bool {
+        self.turn_mode == CodexTurnMode::AppServer
     }
 
     /// Explicitly trusts one plaintext HTTP origin for a host-isolated model relay.
@@ -166,6 +209,64 @@ fn catalog_protocol(message: &str) -> RuntimeError {
         provider: Provider::Codex,
         message: message.into(),
     }
+}
+
+/// Resolve the Codex approval policy, collaboration mode, and sandbox mode
+/// for one request, validating every provider-native selection.
+///
+/// `Ok(None)` means the caller asked for unrestricted access without naming a
+/// native control, which `exec` expresses as
+/// `--dangerously-bypass-approvals-and-sandbox` and the app server expresses
+/// as `never` + `danger-full-access`.
+pub(super) fn resolve_controls(request: &TurnRequest) -> Result<Option<(&str, &str, &str)>> {
+    let has_native_options = ["approval_policy", "collaboration_mode", "sandbox_mode"]
+        .iter()
+        .any(|key| request.harness_options.contains_key(*key));
+    if !has_native_options && matches!(request.permission_mode, PermissionMode::FullAccess) {
+        return Ok(None);
+    }
+    let approval = request.harness_options.get("approval_policy").map_or_else(
+        || match &request.permission_mode {
+            PermissionMode::Custom(value) => value.as_str(),
+            _ => "on-request",
+        },
+        String::as_str,
+    );
+    if !["untrusted", "on-request", "never"].contains(&approval) {
+        return Err(RuntimeError::InvalidRequest {
+            field: "harness_options.approval_policy",
+            message: format!("unsupported Codex approval policy `{approval}`"),
+        });
+    }
+    let collaboration = request.harness_options.get("collaboration_mode").map_or(
+        if matches!(request.permission_mode, PermissionMode::Plan) {
+            "plan"
+        } else {
+            "default"
+        },
+        String::as_str,
+    );
+    if !["default", "plan"].contains(&collaboration) {
+        return Err(RuntimeError::InvalidRequest {
+            field: "harness_options.collaboration_mode",
+            message: format!("unsupported Codex collaboration mode `{collaboration}`"),
+        });
+    }
+    let sandbox = request.harness_options.get("sandbox_mode").map_or(
+        if collaboration == "plan" {
+            "read-only"
+        } else {
+            "workspace-write"
+        },
+        String::as_str,
+    );
+    if !["read-only", "workspace-write", "danger-full-access"].contains(&sandbox) {
+        return Err(RuntimeError::InvalidRequest {
+            field: "harness_options.sandbox_mode",
+            message: format!("unsupported Codex sandbox mode `{sandbox}`"),
+        });
+    }
+    Ok(Some((approval, collaboration, sandbox)))
 }
 
 fn codex_config_string(value: &str) -> Result<String> {
@@ -267,30 +368,108 @@ fn codex_tool_event(item: &Value, completed: bool) -> Option<TurnEvent> {
     })
 }
 
-fn append_http_mcp_launch_context(spec: &mut CommandSpec, request: &TurnRequest) -> Result<()> {
+/// Translate turn-scoped MCP servers into `-c mcp_servers.<name>.*` overrides.
+///
+/// Codex parses each `--config` value as TOML, so every string is emitted as a
+/// TOML basic string. Credentials never appear here: stdio servers forward
+/// harness environment variables by name through `env_vars`, and HTTP servers
+/// reference header sources through `env_http_headers`.
+fn append_mcp_launch_context(spec: &mut CommandSpec, request: &TurnRequest) -> Result<()> {
     for (name, server) in &request.launch_context.mcp_servers {
-        let McpServerConfig::Http { url, headers_from } = server else {
-            return Err(RuntimeError::InvalidRequest {
-                field: "launch_context.mcp_servers",
-                message: "Codex supports only turn-scoped HTTP MCP servers".into(),
-            });
-        };
-        spec.args.extend([
-            "--config".into(),
-            format!("mcp_servers.{name}.url={}", codex_config_string(url)?).into(),
-        ]);
-        for (header, source) in headers_from {
-            spec.args.extend([
-                "--config".into(),
-                format!(
-                    "mcp_servers.{name}.env_http_headers.{header}={}",
-                    codex_config_string(source)?
-                )
-                .into(),
-            ]);
+        match server {
+            McpServerConfig::Stdio {
+                command,
+                args,
+                environment_from,
+            } => {
+                let Some(command) = command.to_str() else {
+                    return Err(RuntimeError::InvalidRequest {
+                        field: "launch_context.mcp_servers.command",
+                        message: "stdio commands must be valid UTF-8".into(),
+                    });
+                };
+                spec.args.extend([
+                    "--config".into(),
+                    format!(
+                        "mcp_servers.{name}.command={}",
+                        codex_config_string(command)?
+                    )
+                    .into(),
+                ]);
+                if !args.is_empty() {
+                    let encoded = args
+                        .iter()
+                        .map(|argument| codex_config_string(argument))
+                        .collect::<Result<Vec<_>>>()?
+                        .join(", ");
+                    spec.args.extend([
+                        "--config".into(),
+                        format!("mcp_servers.{name}.args=[{encoded}]").into(),
+                    ]);
+                }
+                if !environment_from.is_empty() {
+                    let mut sources = Vec::with_capacity(environment_from.len());
+                    for (target, source) in environment_from {
+                        // Codex forwards variables to an MCP child by name; it
+                        // cannot rename them. Renaming silently would hand the
+                        // child a variable it never reads.
+                        if target != source {
+                            return Err(RuntimeError::InvalidRequest {
+                                field: "launch_context.mcp_servers.environment_from",
+                                message: format!(
+                                    "Codex forwards MCP environment variables by name, so `{target}` must be supplied by a source variable of the same name, not `{source}`"
+                                ),
+                            });
+                        }
+                        sources.push(codex_config_string(source)?);
+                    }
+                    spec.args.extend([
+                        "--config".into(),
+                        format!("mcp_servers.{name}.env_vars=[{}]", sources.join(", ")).into(),
+                    ]);
+                }
+            }
+            McpServerConfig::Http { url, headers_from } => {
+                spec.args.extend([
+                    "--config".into(),
+                    format!("mcp_servers.{name}.url={}", codex_config_string(url)?).into(),
+                ]);
+                for (header, source) in headers_from {
+                    spec.args.extend([
+                        "--config".into(),
+                        format!(
+                            "mcp_servers.{name}.env_http_headers.{header}={}",
+                            codex_config_string(source)?
+                        )
+                        .into(),
+                    ]);
+                }
+            }
         }
     }
     Ok(())
+}
+
+/// Execution-host paths of the image attachments referenced by a turn.
+///
+/// Codex reads the file itself, so the SDK never opens or uploads it: the
+/// path is only meaningful inside the selected execution transport, exactly
+/// like [`TurnRequest::working_directory`].
+pub(super) fn image_attachment_paths(request: &TurnRequest) -> Result<Vec<&str>> {
+    request
+        .attachments
+        .iter()
+        .filter(|attachment| crate::retained::is_image(attachment))
+        .map(|attachment| {
+            attachment
+                .path
+                .to_str()
+                .ok_or(RuntimeError::InvalidRequest {
+                    field: "attachments.path",
+                    message: "image attachment paths must be valid UTF-8".into(),
+                })
+        })
+        .collect()
 }
 
 fn response_result(lines: &[String], id: u64) -> Result<Value> {
@@ -404,7 +583,7 @@ fn codex_window(id: &str, value: &Value) -> Option<AccountUsageWindow> {
     })
 }
 
-fn codex_account_usage(value: &Value) -> Option<AccountUsageSnapshot> {
+pub(super) fn codex_account_usage(value: &Value) -> Option<AccountUsageSnapshot> {
     let container = value
         .get("rateLimits")
         .or_else(|| value.get("rate_limits"))
@@ -470,15 +649,29 @@ impl AgentAdapter for Codex {
             plan: false,
             full_access: true,
             custom: true,
-            live_approvals: false,
-            live_questions: false,
+            // `exec --json` has no channel back into a running turn; the app
+            // server answers both kinds of request over its JSON-RPC stdio.
+            live_approvals: self.app_server_mode(),
+            live_questions: self.app_server_mode(),
         }
     }
 
     fn launch_context_capabilities(&self) -> LaunchContextCapabilities {
         LaunchContextCapabilities {
+            stdio_mcp: true,
             http_mcp: true,
             ..LaunchContextCapabilities::default()
+        }
+    }
+
+    fn turn_capabilities(&self) -> TurnCapabilities {
+        TurnCapabilities {
+            // `codex exec --image` and the app server's `localImage` user
+            // input both read the file on the execution host.
+            native_image_attachments: true,
+            // `thread/tokenUsage/updated` reports the active window and the
+            // model's limit; `exec --json` reports turn totals only.
+            context_window_usage: self.app_server_mode(),
         }
     }
 
@@ -734,65 +927,33 @@ impl AgentAdapter for Codex {
 
     fn command(&self, request: &TurnRequest) -> Result<CommandSpec> {
         let mut spec = CommandSpec::new(self.configured_executable());
+        if self.app_server_mode() {
+            spec.args.push("app-server".into());
+            append_mcp_launch_context(&mut spec, request)?;
+            append_model_relay(
+                &mut spec,
+                request,
+                self.trusted_http_model_relay_origin.as_deref(),
+            )?;
+            // Every other turn parameter travels in `thread/start` and
+            // `turn/start`, which `prepare_turn` builds and `parse_line` sends
+            // once the app server accepts the handshake.
+            spec.initial_stdin = Some(codex_app_server::handshake());
+            spec.interactive_stdin = true;
+            return Ok(spec);
+        }
         spec.args.extend([
             "exec".into(),
             "--json".into(),
             "--skip-git-repo-check".into(),
         ]);
-        append_http_mcp_launch_context(&mut spec, request)?;
+        append_mcp_launch_context(&mut spec, request)?;
         append_model_relay(
             &mut spec,
             request,
             self.trusted_http_model_relay_origin.as_deref(),
         )?;
-        let has_native_options = ["approval_policy", "collaboration_mode", "sandbox_mode"]
-            .iter()
-            .any(|key| request.harness_options.contains_key(*key));
-        if !has_native_options && matches!(request.permission_mode, PermissionMode::FullAccess) {
-            spec.args
-                .push("--dangerously-bypass-approvals-and-sandbox".into());
-        } else {
-            let approval = request.harness_options.get("approval_policy").map_or_else(
-                || match &request.permission_mode {
-                    PermissionMode::Custom(value) => value.as_str(),
-                    _ => "on-request",
-                },
-                String::as_str,
-            );
-            if !["untrusted", "on-request", "never"].contains(&approval) {
-                return Err(RuntimeError::InvalidRequest {
-                    field: "harness_options.approval_policy",
-                    message: format!("unsupported Codex approval policy `{approval}`"),
-                });
-            }
-            let collaboration = request.harness_options.get("collaboration_mode").map_or(
-                if matches!(request.permission_mode, PermissionMode::Plan) {
-                    "plan"
-                } else {
-                    "default"
-                },
-                String::as_str,
-            );
-            if !["default", "plan"].contains(&collaboration) {
-                return Err(RuntimeError::InvalidRequest {
-                    field: "harness_options.collaboration_mode",
-                    message: format!("unsupported Codex collaboration mode `{collaboration}`"),
-                });
-            }
-            let sandbox = request.harness_options.get("sandbox_mode").map_or(
-                if collaboration == "plan" {
-                    "read-only"
-                } else {
-                    "workspace-write"
-                },
-                String::as_str,
-            );
-            if !["read-only", "workspace-write", "danger-full-access"].contains(&sandbox) {
-                return Err(RuntimeError::InvalidRequest {
-                    field: "harness_options.sandbox_mode",
-                    message: format!("unsupported Codex sandbox mode `{sandbox}`"),
-                });
-            }
+        if let Some((approval, collaboration, sandbox)) = resolve_controls(request)? {
             spec.args.extend(["--sandbox".into(), sandbox.into()]);
             let approval =
                 serde_json::to_string(approval).map_err(|error| RuntimeError::Protocol {
@@ -809,6 +970,9 @@ impl AgentAdapter for Codex {
                     "model_reasoning_effort=\"medium\"".into(),
                 ]);
             }
+        } else {
+            spec.args
+                .push("--dangerously-bypass-approvals-and-sandbox".into());
         }
         if let Some(reasoning) = request.reasoning.as_deref() {
             let reasoning =
@@ -832,6 +996,9 @@ impl AgentAdapter for Codex {
             spec.args
                 .extend(["--config".into(), format!("service_tier={tier}").into()]);
         }
+        for path in image_attachment_paths(request)? {
+            spec.args.extend(["--image".into(), path.into()]);
+        }
         if let Some(session_id) = request.session_id.as_deref() {
             spec.args.extend(["resume".into(), session_id.into()]);
         }
@@ -841,7 +1008,23 @@ impl AgentAdapter for Codex {
         Ok(spec)
     }
 
+    fn prepare_turn(&self, request: &TurnRequest, state: &mut AdapterState) -> Result<()> {
+        if self.app_server_mode() {
+            codex_app_server::prepare_turn(request, state)?;
+        }
+        Ok(())
+    }
+
+    fn interrupt_request(&self, state: &AdapterState) -> Option<Vec<u8>> {
+        self.app_server_mode()
+            .then(|| codex_app_server::interrupt(state))
+            .flatten()
+    }
+
     fn parse_line(&self, line: &str, state: &mut AdapterState) -> Result<AdapterOutput> {
+        if self.app_server_mode() {
+            return codex_app_server::parse_line(line, state);
+        }
         let value: Value = serde_json::from_str(line).map_err(|error| RuntimeError::Protocol {
             provider: Provider::Codex,
             message: format!("invalid JSON event: {error}"),
@@ -955,18 +1138,24 @@ impl AgentAdapter for Codex {
     fn approval_response(
         &self,
         _request: &ApprovalRequest,
-        _original: &Value,
-        _decision: ApprovalDecision,
+        original: &Value,
+        decision: ApprovalDecision,
     ) -> Result<Option<Vec<u8>>> {
-        Ok(None)
+        if !self.app_server_mode() {
+            return Ok(None);
+        }
+        codex_app_server::approval_response(original, decision).map(Some)
     }
     fn question_response(
         &self,
         _request: &QuestionRequest,
-        _original: &Value,
-        _answer: Option<QuestionAnswer>,
+        original: &Value,
+        answer: Option<QuestionAnswer>,
     ) -> Result<Option<Vec<u8>>> {
-        Ok(None)
+        if !self.app_server_mode() {
+            return Ok(None);
+        }
+        codex_app_server::question_response(original, answer).map(Some)
     }
 }
 
@@ -1206,6 +1395,150 @@ mod tests {
         }));
         assert!(!arguments.join(" ").contains("super-secret-token"));
         assert!(!format!("{request:?}").contains("super-secret-token"));
+    }
+
+    fn stdio_fleet_server() -> McpServerConfig {
+        McpServerConfig::Stdio {
+            command: "/Users/bob/my tools/temps-fleet".into(),
+            args: vec!["--data-dir".into(), "/var/lib/fleet".into(), "mcp".into()],
+            environment_from: std::collections::BTreeMap::from([(
+                "TEMPS_FLEET_MCP_PARENT_TOKEN".into(),
+                "TEMPS_FLEET_MCP_PARENT_TOKEN".into(),
+            )]),
+        }
+    }
+
+    fn arguments_for(request: &TurnRequest, adapter: &Codex) -> Vec<String> {
+        adapter
+            .command(request)
+            .unwrap()
+            .args
+            .iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn applies_turn_scoped_stdio_mcp_in_both_turn_modes() {
+        let mut request = TurnRequest::new(Provider::Codex, ".", "inspect");
+        request.environment.insert(
+            "TEMPS_FLEET_MCP_PARENT_TOKEN".into(),
+            crate::SecretString::new("super-secret-token"),
+        );
+        request
+            .launch_context
+            .mcp_servers
+            .insert("temps_fleet".into(), stdio_fleet_server());
+
+        for adapter in [Codex::default(), Codex::app_server()] {
+            let arguments = arguments_for(&request, &adapter);
+            assert!(
+                arguments.iter().any(|argument| argument
+                    == r#"mcp_servers.temps_fleet.command="/Users/bob/my tools/temps-fleet""#),
+                "{arguments:?}"
+            );
+            assert!(arguments.iter().any(|argument| argument
+                == r#"mcp_servers.temps_fleet.args=["--data-dir", "/var/lib/fleet", "mcp"]"#));
+            assert!(arguments.iter().any(|argument| argument
+                == r#"mcp_servers.temps_fleet.env_vars=["TEMPS_FLEET_MCP_PARENT_TOKEN"]"#));
+            assert!(!arguments.join(" ").contains("super-secret-token"));
+        }
+    }
+
+    #[test]
+    fn stdio_mcp_configuration_values_are_escaped_as_toml_strings() {
+        let mut request = TurnRequest::new(Provider::Codex, ".", "inspect");
+        request.launch_context.mcp_servers.insert(
+            "quoted".into(),
+            McpServerConfig::Stdio {
+                command: r#"C:\tools\say "hi""#.into(),
+                args: vec!["a\tb".into()],
+                environment_from: std::collections::BTreeMap::new(),
+            },
+        );
+
+        let arguments = arguments_for(&request, &Codex::app_server());
+
+        assert!(arguments
+            .iter()
+            .any(|argument| argument == r#"mcp_servers.quoted.command="C:\\tools\\say \"hi\"""#));
+        assert!(arguments
+            .iter()
+            .any(|argument| argument == r#"mcp_servers.quoted.args=["a\tb"]"#));
+    }
+
+    #[test]
+    fn a_renamed_stdio_mcp_environment_reference_is_rejected() {
+        let mut request = TurnRequest::new(Provider::Codex, ".", "inspect");
+        request
+            .environment
+            .insert("SOURCE".into(), crate::SecretString::new("value"));
+        request.launch_context.mcp_servers.insert(
+            "temps_fleet".into(),
+            McpServerConfig::Stdio {
+                command: "/usr/local/bin/temps-fleet".into(),
+                args: Vec::new(),
+                environment_from: std::collections::BTreeMap::from([(
+                    "TARGET".into(),
+                    "SOURCE".into(),
+                )]),
+            },
+        );
+
+        assert!(matches!(
+            Codex::app_server().command(&request),
+            Err(RuntimeError::InvalidRequest {
+                field: "launch_context.mcp_servers.environment_from",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn image_attachments_travel_as_native_exec_image_arguments() {
+        let mut request = TurnRequest::new(Provider::Codex, ".", "what is this?");
+        request.attachments = vec![
+            crate::retained::TurnAttachment {
+                path: "/tmp/screenshot.png".into(),
+                display_name: Some("Screenshot".into()),
+                media_type: Some("image/png".into()),
+            },
+            crate::retained::TurnAttachment {
+                path: "/tmp/report.pdf".into(),
+                display_name: None,
+                media_type: Some("application/pdf".into()),
+            },
+        ];
+
+        let arguments = arguments_for(&request, &Codex::default());
+
+        assert!(arguments
+            .windows(2)
+            .any(|pair| pair == ["--image", "/tmp/screenshot.png"]));
+        assert!(!arguments
+            .iter()
+            .any(|argument| argument == "/tmp/report.pdf"));
+    }
+
+    #[test]
+    fn the_adapter_advertises_native_image_attachments() {
+        assert!(
+            Codex::default()
+                .turn_capabilities()
+                .native_image_attachments
+        );
+        assert!(
+            Codex::app_server()
+                .turn_capabilities()
+                .native_image_attachments
+        );
+    }
+
+    #[test]
+    fn the_adapter_advertises_both_mcp_transports() {
+        let capabilities = Codex::default().launch_context_capabilities();
+        assert!(capabilities.stdio_mcp);
+        assert!(capabilities.http_mcp);
     }
 
     #[test]

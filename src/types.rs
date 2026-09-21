@@ -49,6 +49,24 @@ pub struct LaunchContextCapabilities {
     pub strict_mcp_config: bool,
 }
 
+/// Optional per-turn provider behaviors implemented by an adapter.
+///
+/// These are deliberately separate from [`LaunchContextCapabilities`]: they
+/// describe what an adapter does with a turn the application already composed,
+/// not which launch-context fields it can enforce.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnCapabilities {
+    /// The adapter delivers image attachments as native provider image inputs.
+    ///
+    /// Applications and the retained runtime stop describing those files in
+    /// prompt text, because the provider receives the image itself.
+    pub native_image_attachments: bool,
+    /// The adapter emits [`ContextWindowUsage`] snapshots while a turn runs,
+    /// so an application can show live context occupancy instead of only the
+    /// terminal token totals.
+    pub context_window_usage: bool,
+}
+
 impl fmt::Debug for LaunchContext {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -313,6 +331,14 @@ pub struct TurnRequest {
     /// Explicit harness environment additions. Values are redacted from `Debug` and surfaced
     /// diagnostics, but remain readable by the harness and its descendants.
     pub environment: BTreeMap<String, SecretString>,
+    /// Files already present on the execution host and referenced by this turn.
+    ///
+    /// Adapters that advertise
+    /// [`TurnCapabilities::native_image_attachments`] deliver image
+    /// attachments through the provider's own image input instead of prompt
+    /// text. Adapters that do not simply ignore this field, because the
+    /// caller already described the files in [`Self::prompt`].
+    pub attachments: Vec<crate::retained::TurnAttachment>,
     /// Cooperative cancellation owned by the caller.
     pub cancellation: CancellationToken,
     /// Optional pluggable outer sandbox.
@@ -344,7 +370,8 @@ impl fmt::Debug for TurnRequest {
             .field(
                 "environment_keys",
                 &self.environment.keys().collect::<Vec<_>>(),
-            );
+            )
+            .field("attachments", &self.attachments);
         debug.field("sandbox", &self.sandbox);
         debug.field(
             "required_sandbox_capabilities",
@@ -378,6 +405,7 @@ impl TurnRequest {
             interaction_timeout: Duration::from_secs(10 * 60),
             tool_process_policy: ToolProcessPolicy::default(),
             environment: BTreeMap::new(),
+            attachments: Vec::new(),
             cancellation: CancellationToken::new(),
             sandbox: None,
             required_sandbox_capabilities: crate::SandboxCapabilities::NONE,
@@ -778,6 +806,16 @@ pub enum TurnEvent {
     PlanApprovalRequested(ApprovalRequest),
     /// The agent asked the user a question.
     QuestionRequested(QuestionRequest),
+    /// The agent asked a question the turn did not wait on.
+    ///
+    /// Some harnesses can ask a question without blocking their own turn
+    /// (Codex app-server sends `item/tool/requestUserInput` with
+    /// `isBlocking: false`). The runtime tells the provider immediately that
+    /// no answer is available yet and keeps the turn running, so this event is
+    /// never resolved through [`InteractionHandler::answer`]. Applications
+    /// should render it as an open question and deliver the user's eventual
+    /// answer as a follow-up prompt in the next turn.
+    AsyncQuestionRequested(QuestionRequest),
     /// Token or cost update.
     Usage(Usage),
     /// Provider-account quota usage changed or was refreshed.
@@ -903,6 +941,12 @@ pub struct QuestionOption {
 pub enum ApprovalDecision {
     /// Permit the operation.
     Allow,
+    /// Permit the operation and comparable ones for the rest of the session.
+    ///
+    /// Providers that expose a session-scoped approval (Codex app-server's
+    /// `acceptForSession`) use it; the remaining adapters treat this exactly
+    /// like [`ApprovalDecision::Allow`] for this one operation.
+    AllowForSession,
     /// Reject the operation with an optional explanation.
     Deny {
         /// Explanation returned to the agent.

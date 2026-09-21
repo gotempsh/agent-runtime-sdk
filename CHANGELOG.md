@@ -19,6 +19,46 @@ Versioning and Keep a Changelog conventions.
 
 ### Added
 
+- Bidirectional Codex support through `codex app-server`. `CodexTurnMode`
+  selects the transport; `Codex::app_server()` drives JSON-RPC over stdio with
+  live approvals (`accept`/`acceptForSession`/`decline`),
+  `item/tool/requestUserInput` questions, incremental text and reasoning
+  deltas, thread token usage, thread resume and fork, and a cooperative
+  `turn/interrupt` on cancellation. `PermissionSupport` reports
+  `live_approvals`/`live_questions` in that mode. The default
+  `codex exec --json` transport is unchanged.
+- Turn-scoped stdio MCP servers for Codex. `McpServerConfig::Stdio` entries are
+  translated into native `-c mcp_servers.<name>.command/args/env_vars`
+  overrides in both the `exec --json` and `app-server` turn modes, and
+  `LaunchContextCapabilities::stdio_mcp` is now advertised for Codex. Codex
+  forwards MCP environment variables by name, so each `environment_from` entry
+  must name a source variable identical to the child variable; anything else is
+  rejected before spawn.
+- Native image attachments for Codex. `TurnRequest::attachments` carries the
+  execution-host file references an adapter can read itself, `TurnCapabilities`
+  (`AgentAdapter::turn_capabilities`, `AgentRuntime::turn_capabilities`) reports
+  `native_image_attachments`, and `RuntimeDriverCapabilities` mirrors the same
+  flag. Codex sends `image/*` attachments as `codex exec --image` arguments or
+  `localImage` `turn/start` inputs, and the retained runtime no longer appends
+  their host paths to the prompt. Providers without native support keep the
+  existing path-text behavior.
+- Context-window fidelity for Codex `app-server` turns. Token-usage
+  notifications are attributed to the active thread, the emitted
+  `ContextWindowUsage` is labelled with the resolved (or requested) model, and
+  `TurnCapabilities::context_window_usage` plus the existing
+  `RuntimeDriverCapabilities::context_window_usage` now report Codex
+  app-server support so applications can gate a context meter.
+- `TurnEvent::AsyncQuestionRequested` for a question the turn did not wait on
+  (Codex `isBlocking: false`). The runtime answers the provider immediately so
+  the turn keeps running; hosts show the question as open and deliver the
+  answer as a follow-up prompt.
+- `ApprovalDecision::AllowForSession` for providers with a session-scoped
+  grant. Adapters without one treat it as `Allow`.
+- `AgentAdapter::prepare_turn` (seed per-turn parser state from the validated
+  request), `AgentAdapter::interrupt_request` (encode a cooperative interrupt
+  the runtime writes before terminating a cancelled turn), and
+  `AdapterOutput::writes` (provider frames the runtime writes to stdin without
+  waiting for an application decision). All three are additive with defaults.
 - Object-safe private-network provider, session, access, and registry contracts
   with validated provider IDs, explicit cancellation/teardown requirements,
   provider-neutral sandbox requirements, and built-in `TailscaleProvider` and

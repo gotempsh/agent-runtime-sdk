@@ -16,8 +16,8 @@ change. The compatibility driver applies per-turn model, reasoning, permission,
 harness, launch-context, environment, and timeout changes live. Provider,
 working-directory, and sandbox changes require acquiring a new runtime.
 
-The driver also reports `configurable_auto_compaction`, `manual_compaction`, and
-`context_window_usage`. Gate product controls on these capabilities. Automatic
+The driver also reports `configurable_auto_compaction`, `manual_compaction`,
+`context_window_usage`, and `native_image_attachments`. Gate product controls on these capabilities. Automatic
 policy can be set on `RuntimeSpec::auto_compaction` and overridden by
 `TurnInput::auto_compaction`.
 

@@ -40,6 +40,7 @@ const AUTHENTICATION_REASON_MAX_CHARS: usize = 4_096;
 const MAX_SANDBOX_RECOVERY_RETRIES: u8 = 8;
 const MAX_ALLOWED_TOOLS: usize = 256;
 const MAX_TOOL_NAME_BYTES: usize = 256;
+const MAX_ATTACHMENTS: usize = 64;
 const MAX_MCP_SERVERS: usize = 64;
 const MAX_MCP_SERVER_NAME_BYTES: usize = 128;
 const MAX_MCP_ARGUMENTS: usize = 256;
@@ -48,6 +49,78 @@ const MAX_ENVIRONMENT_NAME_BYTES: usize = 256;
 const MAX_ENVIRONMENT_VALUE_BYTES: usize = 64 * 1024;
 const MAX_ENVIRONMENT_TOTAL_BYTES: usize = 256 * 1024;
 const SANDBOX_RETRY_PROMPT: &str = "The sandbox profile was updated with the approved access. Retry only the previously blocked operation, then continue the task.";
+/// How long a cancelled provider may keep running after acknowledging an
+/// adapter-encoded interrupt, before the process tree is terminated anyway.
+const INTERRUPT_GRACE: Duration = Duration::from_secs(5);
+
+/// Write newline-terminated provider frames to an interactive stdin.
+async fn write_provider_frames(
+    provider: Provider,
+    stdin: Option<&mut crate::TransportWriter>,
+    frames: &[Vec<u8>],
+    stream: &'static str,
+) -> Result<()> {
+    if frames.is_empty() {
+        return Ok(());
+    }
+    let writer = stdin.ok_or_else(|| RuntimeError::Protocol {
+        provider,
+        message: format!("adapter produced a {stream} without interactive stdin"),
+    })?;
+    for frame in frames {
+        for bytes in [frame.as_slice(), b"\n".as_slice()] {
+            writer
+                .write_all(bytes)
+                .await
+                .map_err(|source| RuntimeError::ProcessIo {
+                    provider,
+                    stream,
+                    source,
+                })?;
+        }
+    }
+    writer
+        .flush()
+        .await
+        .map_err(|source| RuntimeError::ProcessIo {
+            provider,
+            stream,
+            source,
+        })
+}
+
+/// Stop a running provider, preferring its own cooperative interrupt.
+///
+/// An adapter that encodes an interrupt gets a bounded moment to unwind its
+/// tool processes and persist session state; the turn is cancelled either way.
+async fn cancel_running_process(
+    provider: Provider,
+    adapter: &dyn AgentAdapter,
+    state: &AdapterState,
+    stdin: &mut Option<crate::TransportWriter>,
+    process: &mut crate::TransportProcess,
+) -> RuntimeError {
+    if stdin.is_some() {
+        if let Some(frame) = adapter.interrupt_request(state) {
+            let delivered = write_provider_frames(
+                provider,
+                stdin.as_mut(),
+                std::slice::from_ref(&frame),
+                "interrupt",
+            )
+            .await
+            .is_ok();
+            // End-of-input lets a stdio protocol server exit on its own once
+            // it has acknowledged the interrupt.
+            stdin.take();
+            if delivered {
+                let _ = tokio::time::timeout(INTERRUPT_GRACE, process.wait()).await;
+            }
+        }
+    }
+    let _ = process.terminate().await;
+    RuntimeError::Cancelled { provider }
+}
 
 const SKILL_DISCOVERY_SCRIPT: &str = r#"
 provider=$1
@@ -608,6 +681,31 @@ fn validate_launch_context(
                     )?;
                 }
             }
+        }
+    }
+    Ok(())
+}
+
+/// Reject attachment references an adapter could not place in argv or a
+/// provider request without corrupting it.
+fn validate_attachments(request: &TurnRequest) -> Result<()> {
+    if request.attachments.len() > MAX_ATTACHMENTS {
+        return Err(RuntimeError::InvalidRequest {
+            field: "attachments",
+            message: format!("a turn may reference at most {MAX_ATTACHMENTS} attachments"),
+        });
+    }
+    for attachment in &request.attachments {
+        let valid = attachment
+            .path
+            .to_str()
+            .is_some_and(|path| !path.is_empty() && !path.contains(['\0', '\n', '\r']));
+        if !valid {
+            return Err(RuntimeError::InvalidRequest {
+                field: "attachments.path",
+                message: "attachment paths must be non-empty UTF-8 without NUL or newlines"
+                    .to_string(),
+            });
         }
     }
     Ok(())
@@ -1781,6 +1879,15 @@ impl AgentRuntime {
         Ok(adapter.launch_context_capabilities())
     }
 
+    /// Inspect optional per-turn provider behaviors without starting a turn.
+    pub fn turn_capabilities(&self, provider: Provider) -> Result<crate::TurnCapabilities> {
+        let adapter = self
+            .adapters
+            .get(&provider)
+            .ok_or(RuntimeError::AdapterUnavailable { provider })?;
+        Ok(adapter.turn_capabilities())
+    }
+
     /// Run one turn, streaming normalized events with backpressure.
     pub async fn run(
         &self,
@@ -2110,6 +2217,7 @@ impl AgentRuntime {
             | crate::AutoCompactionPolicy::Automatic
             | crate::AutoCompactionPolicy::TokenThreshold { .. } => {}
         }
+        validate_attachments(request)?;
         validate_explicit_environment(&request.environment, "environment")?;
         let capabilities = self
             .adapters
@@ -2158,6 +2266,13 @@ impl AgentRuntime {
     ) -> Result<TurnResult> {
         let provider = request.provider;
         let mut spec = adapter.command(request)?;
+        let mut state = AdapterState::default();
+        // A resumed provider process commonly repeats its native session ID in
+        // the startup handshake. Seed the parser with the ID the caller is
+        // already attached to so adapters do not project that handshake as a
+        // second `SessionStarted` lifecycle event.
+        state.result.session_id.clone_from(&request.session_id);
+        adapter.prepare_turn(request, &mut state)?;
         for (name, value) in &request.environment {
             spec.environment.insert(name.into(), value.expose().into());
         }
@@ -2266,18 +2381,19 @@ impl AgentRuntime {
             })?;
         let stderr_task = tokio::spawn(crate::process::bounded_stderr(stderr, STDERR_TAIL_BYTES));
         let mut lines = BufReader::new(stdout).lines();
-        let mut state = AdapterState::default();
-        // A resumed provider process commonly repeats its native session ID in
-        // the startup handshake. Seed the parser with the ID the caller is
-        // already attached to so adapters do not project that handshake as a
-        // second `SessionStarted` lifecycle event.
-        state.result.session_id.clone_from(&request.session_id);
         loop {
             let line = tokio::select! {
                 _ = request.cancellation.cancelled() => {
-                    let _ = process.terminate().await;
+                    let error = cancel_running_process(
+                        provider,
+                        adapter.as_ref(),
+                        &state,
+                        &mut stdin,
+                        &mut process,
+                    )
+                    .await;
                     stderr_task.abort();
-                    return Err(RuntimeError::Cancelled { provider });
+                    return Err(error);
                 }
                 line = lines.next_line() => line.map_err(|source| RuntimeError::ProcessIo {
                     provider,
@@ -2298,6 +2414,8 @@ impl AgentRuntime {
             for event in output.events {
                 events.emit(event).await?;
             }
+            write_provider_frames(provider, stdin.as_mut(), &output.writes, "provider write")
+                .await?;
             if let Some(interaction) = output.interaction {
                 let response = match interaction {
                     InteractionRequest::Approval {
@@ -2306,9 +2424,16 @@ impl AgentRuntime {
                     } => {
                         let decision = tokio::select! {
                             _ = request.cancellation.cancelled() => {
-                                let _ = process.terminate().await;
+                                let error = cancel_running_process(
+                                    provider,
+                                    adapter.as_ref(),
+                                    &state,
+                                    &mut stdin,
+                                    &mut process,
+                                )
+                                .await;
                                 stderr_task.abort();
-                                return Err(RuntimeError::Cancelled { provider });
+                                return Err(error);
                             }
                             decision = tokio::time::timeout(
                                 request.interaction_timeout,
@@ -2327,9 +2452,16 @@ impl AgentRuntime {
                     } => {
                         let answer = tokio::select! {
                             _ = request.cancellation.cancelled() => {
-                                let _ = process.terminate().await;
+                                let error = cancel_running_process(
+                                    provider,
+                                    adapter.as_ref(),
+                                    &state,
+                                    &mut stdin,
+                                    &mut process,
+                                )
+                                .await;
                                 stderr_task.abort();
-                                return Err(RuntimeError::Cancelled { provider });
+                                return Err(error);
                             }
                             answer = tokio::time::timeout(
                                 request.interaction_timeout,
@@ -2339,28 +2471,14 @@ impl AgentRuntime {
                         adapter.question_response(&question, &original, answer)?
                     }
                 };
-                if let Some(mut response) = response {
-                    response.push(b'\n');
-                    let writer = stdin.as_mut().ok_or_else(|| RuntimeError::Protocol {
+                if let Some(response) = response {
+                    write_provider_frames(
                         provider,
-                        message: "adapter requested an interaction without interactive stdin"
-                            .to_string(),
-                    })?;
-                    writer.write_all(&response).await.map_err(|source| {
-                        RuntimeError::ProcessIo {
-                            provider,
-                            stream: "interaction response",
-                            source,
-                        }
-                    })?;
-                    writer
-                        .flush()
-                        .await
-                        .map_err(|source| RuntimeError::ProcessIo {
-                            provider,
-                            stream: "interaction flush",
-                            source,
-                        })?;
+                        stdin.as_mut(),
+                        std::slice::from_ref(&response),
+                        "interaction response",
+                    )
+                    .await?;
                 }
             }
             if output.terminal {
@@ -3623,6 +3741,7 @@ mod tests {
                         request: approval,
                         original: value,
                     }),
+                    writes: Vec::new(),
                     terminal: false,
                 })
             }
