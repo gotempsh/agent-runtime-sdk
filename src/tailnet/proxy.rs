@@ -206,9 +206,7 @@ async fn serve_connection(
     let via_tailnet = matches!(route, Route::Tailnet(_));
     let upstream = match &route {
         Route::Tailnet(target) => connect_via_socks5(socks.addr, target, port).await,
-        Route::Direct(addrs) if addrs.is_empty() => {
-            TcpStream::connect((host.as_str(), port)).await
-        }
+        Route::Direct(addrs) if addrs.is_empty() => TcpStream::connect((host.as_str(), port)).await,
         Route::Direct(addrs) => TcpStream::connect(addrs.as_slice()).await,
     };
     let mut upstream = match upstream {
@@ -468,7 +466,10 @@ mod tests {
             Route::Tailnet("100.126.62.28".into())
         );
         // Ordinary public destinations keep their resolved addresses.
-        assert_eq!(route_for_resolved(vec![public]), Route::Direct(vec![public]));
+        assert_eq!(
+            route_for_resolved(vec![public]),
+            Route::Direct(vec![public])
+        );
         assert_eq!(route_for_resolved(Vec::new()), Route::Direct(Vec::new()));
     }
 
