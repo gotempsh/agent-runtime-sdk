@@ -227,8 +227,9 @@ impl TransportProcessControl for Control {
             std::future::pending::<()>().await;
         }
         Ok(TransportExitStatus {
-            success: true,
-            code: Some(0),
+            // Real servers stopped by the runtime exit by signal/nonzero.
+            success: false,
+            code: None,
         })
     }
 

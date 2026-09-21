@@ -107,3 +107,11 @@ For agent-launched descendants, see
 [Keep tool processes running](keep-tool-processes-running.md). For durable
 projection rules, see
 [Persist command and tool execution](persist-command-execution.md).
+
+### Provider server shutdown
+
+For attached providers such as `opencode serve`, the runtime stops the server
+after a terminal protocol event. A signal or nonzero exit caused by that
+intentional shutdown does not turn a completed turn into a failure. Provider
+errors and an unexpected stream closure still fail the turn; cancellation
+continues to abort the session before terminating its process.
