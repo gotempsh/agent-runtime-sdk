@@ -77,6 +77,12 @@ pub(super) const FRAME_READY: &str = "@ready";
 pub(super) const FRAME_RESPONSE: &str = "@response";
 pub(super) const FRAME_EVENT: &str = "@event";
 pub(super) const FRAME_ERROR: &str = "@error";
+/// Emitted once the event stream is accepted and before any payload.
+///
+/// The prompt must not be sent until this arrives: the reference driver
+/// subscribes first precisely so nothing emitted in a turn's first moments is
+/// missed, and only the bridge can know when the stream is actually open.
+pub(super) const FRAME_SUBSCRIBED: &str = "@subscribed";
 
 /// Start the bridge for a turn and hand the runtime its protocol streams.
 ///
@@ -124,7 +130,11 @@ async fn run_bridge(port: u16, bridge_side: DuplexStream) {
             continue;
         }
         let Ok(command) = serde_json::from_str::<BridgeCommand>(&line) else {
-            emit_error(&outgoing, "the OpenCode bridge received an unreadable command").await;
+            emit_error(
+                &outgoing,
+                "the OpenCode bridge received an unreadable command",
+            )
+            .await;
             break;
         };
         if command.method == "SUBSCRIBE" {
@@ -187,13 +197,17 @@ async fn perform(
     let mut stream = TcpStream::connect(address(port)).await?;
     stream.set_nodelay(true).ok();
     let encoded = body.map(ToString::to_string).unwrap_or_default();
-    let mut head = format!(
-        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAccept: application/json\r\nConnection: close\r\n"
+    let content_type = if body.is_some() {
+        "Content-Type: application/json\r\n"
+    } else {
+        ""
+    };
+    let head = format!(
+        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\
+         Accept: application/json\r\nConnection: close\r\n{content_type}\
+         Content-Length: {}\r\n\r\n",
+        encoded.len()
     );
-    if body.is_some() {
-        head.push_str("Content-Type: application/json\r\n");
-    }
-    head.push_str(&format!("Content-Length: {}\r\n\r\n", encoded.len()));
     stream.write_all(head.as_bytes()).await?;
     if !encoded.is_empty() {
         stream.write_all(encoded.as_bytes()).await?;
@@ -251,7 +265,7 @@ async fn stream_events(
         let _ = inner.flush().await;
     }
     let framing = match read_head(&mut reader).await {
-        Ok((status, framing)) if status == 200 => framing,
+        Ok((200, framing)) => framing,
         Ok((status, _)) => {
             emit_error(
                 &outgoing,
@@ -269,6 +283,13 @@ async fn stream_events(
             return;
         }
     };
+
+    if emit(&outgoing, &json!({"type": FRAME_SUBSCRIBED}))
+        .await
+        .is_err()
+    {
+        return;
+    }
 
     let mut body = BodyReader::new(&mut reader, framing);
     let mut payload = String::new();
@@ -443,35 +464,30 @@ where
         if self.finished {
             return Ok(None);
         }
-        match self.framing {
-            Framing::Chunked => self.read_chunked_line().await,
-            _ => {
-                let mut line = String::new();
-                if self.reader.read_line(&mut line).await? == 0 {
-                    self.finished = true;
-                    return Ok(None);
-                }
-                if let Framing::Length(_) = self.framing {
-                    self.remaining = self.remaining.saturating_sub(line.len());
-                    if self.remaining == 0 {
-                        self.finished = true;
-                    }
-                }
-                Ok(Some(line))
+        if self.framing == Framing::Chunked {
+            return self.read_chunked_line().await;
+        }
+        let mut line = String::new();
+        if self.reader.read_line(&mut line).await? == 0 {
+            self.finished = true;
+            return Ok(None);
+        }
+        if let Framing::Length(_) = self.framing {
+            self.remaining = self.remaining.saturating_sub(line.len());
+            if self.remaining == 0 {
+                self.finished = true;
             }
         }
+        Ok(Some(line))
     }
 
     /// Assemble one line from however many chunks it spans.
     async fn read_chunked_line(&mut self) -> std::io::Result<Option<String>> {
         let mut line = Vec::new();
         loop {
-            if self.remaining == 0 {
-                if !self.next_chunk_header().await? {
-                    self.finished = true;
-                    return Ok((!line.is_empty())
-                        .then(|| String::from_utf8_lossy(&line).into_owned()));
-                }
+            if self.remaining == 0 && !self.next_chunk_header().await? {
+                self.finished = true;
+                return Ok((!line.is_empty()).then(|| String::from_utf8_lossy(&line).into_owned()));
             }
             let mut byte = [0_u8; 1];
             self.reader.read_exact(&mut byte).await?;
@@ -642,7 +658,8 @@ mod tests {
         let mut writer = streams.writer;
         let mut lines = BufReader::new(streams.reader).lines();
 
-        let ready: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        let ready: Value =
+            serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
         assert_eq!(ready["type"], json!(FRAME_READY));
 
         writer
@@ -661,7 +678,15 @@ mod tests {
             .await
             .unwrap();
         writer.flush().await.unwrap();
-        let event: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        let subscribed: Value =
+            serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(
+            subscribed["type"],
+            json!(FRAME_SUBSCRIBED),
+            "the stream must be confirmed open before the prompt is sent"
+        );
+        let event: Value =
+            serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
         assert_eq!(event["type"], json!(FRAME_EVENT));
         assert_eq!(event["event"]["type"], json!("session.idle"));
     }
@@ -711,7 +736,11 @@ mod tests {
             .unwrap();
         writer.flush().await.unwrap();
 
-        let frame: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        let subscribed: Value =
+            serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(subscribed["type"], json!(FRAME_SUBSCRIBED));
+        let frame: Value =
+            serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
         assert_eq!(frame["type"], json!(FRAME_ERROR));
     }
 }

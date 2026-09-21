@@ -14,10 +14,43 @@ use crate::{
     RuntimeError, ToolCallStatus, TurnEvent, TurnRequest,
 };
 
-/// OpenCode CLI adapter using `opencode run --format json`.
+/// Transport used to run one OpenCode turn.
+///
+/// Both modes produce the same normalized [`TurnEvent`] stream. They differ in
+/// whether the turn's permission policy is something the application controls.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum OpenCodeTurnMode {
+    /// One-shot `opencode run --format json`.
+    ///
+    /// Output only, and with no permission enforcement an application can
+    /// rely on: the CLI accepts `--auto` (approve everything) and
+    /// `--agent plan`, so every other policy comes from whatever `opencode`
+    /// configuration happens to exist on the machine. A caller cannot request
+    /// "ask before running a shell command" here, nor learn that a tool call
+    /// was refused.
+    #[default]
+    Run,
+    /// `opencode serve`, driven over HTTP and Server-Sent Events.
+    ///
+    /// The permission policy is supplied per turn through
+    /// `OPENCODE_CONFIG_CONTENT`, which the server reads instead of the
+    /// ambient configuration, so the policy an application asked for is the
+    /// one the harness actually runs under. Anything the policy marks `ask`
+    /// arrives as a live approval.
+    ///
+    /// The server is reached on the SDK host's loopback interface, so this
+    /// mode needs a transport that runs the provider on that host. Using it
+    /// with a remote transport would require the port to be forwarded back,
+    /// which the SDK does not arrange.
+    Serve,
+}
+
+/// OpenCode CLI adapter using `opencode run --format json` or `opencode serve`.
 #[derive(Debug, Clone, Default)]
 pub struct OpenCode {
     executable: Option<PathBuf>,
+    turn_mode: OpenCodeTurnMode,
 }
 
 impl OpenCode {
@@ -25,7 +58,52 @@ impl OpenCode {
     pub fn with_executable(path: impl Into<PathBuf>) -> Self {
         Self {
             executable: Some(path.into()),
+            turn_mode: OpenCodeTurnMode::default(),
         }
+    }
+
+    /// Drive turns through `opencode serve` instead of `opencode run`.
+    ///
+    /// This is the mode to use when the application — rather than whatever
+    /// configuration exists on the machine — must decide what the agent is
+    /// allowed to do.
+    pub fn serve() -> Self {
+        Self::default().with_turn_mode(OpenCodeTurnMode::Serve)
+    }
+
+    /// Select the transport used for turns.
+    pub fn with_turn_mode(mut self, mode: OpenCodeTurnMode) -> Self {
+        self.turn_mode = mode;
+        self
+    }
+
+    /// Transport this adapter uses for turns.
+    pub fn turn_mode(&self) -> OpenCodeTurnMode {
+        self.turn_mode
+    }
+
+    fn serve_mode(&self) -> bool {
+        self.turn_mode == OpenCodeTurnMode::Serve
+    }
+
+    /// Build the `opencode serve` invocation for one turn.
+    fn serve_command(&self, request: &TurnRequest, port: u16) -> Result<CommandSpec> {
+        let mut spec = CommandSpec::new(self.configured_executable());
+        spec.args.extend([
+            "serve".into(),
+            "--hostname".into(),
+            "127.0.0.1".into(),
+            "--port".into(),
+            port.to_string().into(),
+        ]);
+        // The policy travels in the environment rather than argv because it is
+        // this turn's entire enforcement boundary, and `clear_environment`
+        // means nothing reaches the child that was not put here deliberately.
+        spec.environment.insert(
+            "OPENCODE_CONFIG_CONTENT".into(),
+            super::opencode_serve::permission_config(request)?.into(),
+        );
+        Ok(spec)
     }
 
     fn resolved(&self) -> Option<PathBuf> {
@@ -52,12 +130,38 @@ impl AgentAdapter for OpenCode {
     fn permission_support(&self) -> PermissionSupport {
         PermissionSupport {
             default: true,
-            accept_edits: false,
-            plan: false,
+            // `opencode run` has no flag that approves only edits; the served
+            // policy expresses it as `edit: allow, bash: ask`.
+            accept_edits: self.serve_mode(),
+            // `--agent plan` selects a planning agent but does not guarantee
+            // the absence of side effects. The served policy denies both
+            // permission categories outright, which does.
+            plan: self.serve_mode(),
             full_access: true,
             custom: true,
-            live_approvals: false,
+            // `opencode run` resolves permissions itself from whatever
+            // configuration it finds and has no channel back into a running
+            // turn; the served transport answers `permission.asked` over HTTP.
+            live_approvals: self.serve_mode(),
+            // OpenCode has no question channel in either mode.
             live_questions: false,
+        }
+    }
+
+    fn launch_context_capabilities(&self) -> crate::LaunchContextCapabilities {
+        if !self.serve_mode() {
+            return crate::LaunchContextCapabilities::default();
+        }
+        crate::LaunchContextCapabilities {
+            // Neither is a native field: OpenCode has no system-prompt or
+            // tool-restriction input on its prompt body, so both are carried
+            // as a prompt prefix. An *empty* allowlist is different — it is
+            // enforced by a wildcard deny rule in the served policy.
+            system_prompt_append: true,
+            allowed_tools: true,
+            stdio_mcp: true,
+            http_mcp: true,
+            ..crate::LaunchContextCapabilities::default()
         }
     }
 
@@ -170,6 +274,47 @@ impl AgentAdapter for OpenCode {
         inspect_executable(Provider::OpenCode, self.resolved()).await
     }
 
+    fn prepare_turn(&self, request: &TurnRequest, state: &mut AdapterState) -> Result<()> {
+        if !self.serve_mode() {
+            return Ok(());
+        }
+        // Bind a throwaway listener so the OS picks a free port, then drop it
+        // so the server can bind the same one. `opencode serve --port 0` does
+        // not do this: it falls back to its fixed default port instead.
+        let port = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .and_then(|listener| listener.local_addr())
+            .map(|address| address.port())
+            .map_err(|error| RuntimeError::Protocol {
+                provider: Provider::OpenCode,
+                message: format!("could not reserve a loopback port for OpenCode: {error}"),
+            })?;
+        super::opencode_serve::prepare_turn(request, state, port);
+        Ok(())
+    }
+
+    fn command_for_turn(&self, request: &TurnRequest, state: &AdapterState) -> Result<CommandSpec> {
+        match super::opencode_serve::turn_port(state) {
+            Some(port) if self.serve_mode() => self.serve_command(request, port),
+            _ => self.command(request),
+        }
+    }
+
+    async fn attach(
+        &self,
+        _request: &TurnRequest,
+        state: &AdapterState,
+    ) -> Result<Option<crate::ProtocolStreams>> {
+        Ok(super::opencode_serve::turn_port(state)
+            .filter(|_| self.serve_mode())
+            .map(super::opencode_http::connect))
+    }
+
+    fn interrupt_request(&self, state: &AdapterState) -> Option<Vec<u8>> {
+        self.serve_mode()
+            .then(|| super::opencode_serve::interrupt(state))
+            .flatten()
+    }
+
     fn command(&self, request: &TurnRequest) -> Result<CommandSpec> {
         let mut spec = CommandSpec::new(self.configured_executable());
         spec.args.push("run".into());
@@ -229,6 +374,9 @@ impl AgentAdapter for OpenCode {
     }
 
     fn parse_line(&self, line: &str, state: &mut AdapterState) -> Result<AdapterOutput> {
+        if self.serve_mode() {
+            return super::opencode_serve::parse_line(line, state);
+        }
         let value: Value = serde_json::from_str(line).map_err(|error| RuntimeError::Protocol {
             provider: Provider::OpenCode,
             message: format!("invalid JSON event: {error}"),
@@ -387,18 +535,25 @@ impl AgentAdapter for OpenCode {
     fn approval_response(
         &self,
         _request: &ApprovalRequest,
-        _original: &Value,
-        _decision: ApprovalDecision,
+        original: &Value,
+        decision: ApprovalDecision,
     ) -> Result<Option<Vec<u8>>> {
-        Ok(None)
+        if !self.serve_mode() {
+            return Ok(None);
+        }
+        Ok(Some(super::opencode_serve::approval_response(
+            original, decision,
+        )?))
     }
     fn question_response(
         &self,
-        _request: &QuestionRequest,
-        _original: &Value,
-        _answer: Option<QuestionAnswer>,
+        request: &QuestionRequest,
+        original: &Value,
+        answer: Option<QuestionAnswer>,
     ) -> Result<Option<Vec<u8>>> {
-        Ok(None)
+        Ok(super::opencode_serve::question_response(
+            request, original, answer,
+        ))
     }
 }
 
