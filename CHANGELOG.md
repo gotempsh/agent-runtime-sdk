@@ -19,6 +19,40 @@ Versioning and Keep a Changelog conventions.
 
 ### Added
 
+- Bidirectional OpenCode support through `opencode serve`. `OpenCodeTurnMode`
+  selects the transport; `OpenCode::serve()` starts the server on a reserved
+  loopback port and drives it over HTTP and Server-Sent Events, adding live
+  approvals (`once`/`always`/`reject`), incremental text and reasoning deltas,
+  tool lifecycle events, and a cooperative `session/abort` on cancellation.
+  `PermissionSupport` reports `live_approvals` in that mode. The default
+  `opencode run --format json` transport is unchanged and still reports
+  `live_approvals: false`.
+- Enforced per-turn permissions for OpenCode. `Serve` mode supplies the policy
+  through `OPENCODE_CONFIG_CONTENT`, which the server reads instead of the
+  ambient configuration, so the requested policy is the one the harness runs
+  under. `PermissionMode` maps onto OpenCode's `edit`/`bash` axes as
+  `Default`/`Custom` = ask/ask, `AcceptEdits` = allow/ask, `FullAccess` =
+  allow/allow and `Plan` = deny/deny. An empty
+  `LaunchContext::allowed_tools` becomes a `{"*": "deny"}` wildcard. A plan
+  turn and an empty allowlist additionally refuse any permission that reaches
+  the adapter without consulting the application. `Run` mode had no
+  enforcement an application could rely on: it accepts only `--auto` and
+  `--agent plan`, leaving every other policy to the machine's own
+  configuration.
+- Turn-scoped stdio and HTTP MCP servers for OpenCode in `Serve` mode,
+  translated into native `local` and `remote` `mcp` entries with credentials
+  referenced as `{env:NAME}` rather than serialized.
+  `LaunchContextCapabilities` now advertises `stdio_mcp`, `http_mcp`,
+  `system_prompt_append` and `allowed_tools` for that mode; the latter two are
+  carried as a prompt prefix, which is the only channel OpenCode offers.
+- `AgentAdapter::attach`, returning optional `ProtocolStreams`, lets an adapter
+  carry a turn on streams of its own instead of the child's stdout and stdin,
+  for a provider whose protocol is not on its own stdio. The frame contract is
+  unchanged, so `parse_line` stays one synchronous state machine and
+  cancellation, interrupts, interaction timeouts and line bounding are shared
+  by both kinds of provider. `AgentAdapter::command_for_turn` exposes the state
+  `prepare_turn` seeded, which now runs before the command is built.
+
 - Bidirectional Codex support through `codex app-server`. `CodexTurnMode`
   selects the transport; `Codex::app_server()` drives JSON-RPC over stdio with
   live approvals (`accept`/`acceptForSession`/`decline`),
@@ -131,6 +165,11 @@ Versioning and Keep a Changelog conventions.
 - Turn cancellation now interrupts pending approval and question handlers and
   terminates the supervised provider instead of waiting for the interaction
   timeout.
+- A turn carried on adapter-supplied protocol streams now terminates its child
+  as the normal shutdown instead of waiting for an exit that never comes:
+  `opencode serve` is a server and does not stop because a turn ended. The turn
+  loop also stops reading at a terminal frame in that mode, so a carrier that
+  never closes its reader cannot hang a turn.
 
 ## [0.1.0] - 2026-08-31
 
