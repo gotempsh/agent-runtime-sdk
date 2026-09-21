@@ -38,6 +38,8 @@ APIs, own credentials, or silently fall back to an unsandboxed process.
 
 - Typed requests, streaming events, terminal results, and errors
 - Claude Code, Codex, and OpenCode adapters behind independent Cargo features
+- Live approvals with enforced per-turn permission policy: Codex through
+  `codex app-server`, OpenCode through `opencode serve`
 - Bounded concurrent turns and bounded provider output
 - Deadlines, cooperative cancellation, and process-tree cleanup
 - Long-running tool processes preserved after natural turn completion by
@@ -167,8 +169,9 @@ For context meters and automatic/manual compaction in a durable host, read
   transport and bounded host-extension helpers use fixed POSIX shell scripts;
   untrusted values remain positional arguments and managed paths are derived
   from validated names.
-- Prompts are not logged. Claude and Codex prompts use stdin. OpenCode's current
-  headless CLI accepts the message as an argument, so it may be visible to local
+- Prompts are not logged. Claude and Codex prompts use stdin, and OpenCode's
+  `Serve` turn mode posts the prompt in an HTTP body. OpenCode's headless
+  `Run` mode accepts the message as an argument, so it may be visible to local
   process inspection; see the capability matrix.
 - The runtime keeps no database and emits no telemetry. The embedding
   application owns both.

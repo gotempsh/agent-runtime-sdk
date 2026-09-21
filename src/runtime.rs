@@ -52,6 +52,10 @@ const SANDBOX_RETRY_PROMPT: &str = "The sandbox profile was updated with the app
 /// How long a cancelled provider may keep running after acknowledging an
 /// adapter-encoded interrupt, before the process tree is terminated anyway.
 const INTERRUPT_GRACE: Duration = Duration::from_secs(5);
+/// How long to wait for a terminated provider to be reaped when the turn ran
+/// over adapter-supplied protocol streams. The process is already being
+/// stopped; this only bounds how long the turn waits to observe it.
+const ATTACHED_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
 /// Write newline-terminated provider frames to an interactive stdin.
 async fn write_provider_frames(
@@ -2265,14 +2269,18 @@ impl AgentRuntime {
         interactions: &dyn InteractionHandler,
     ) -> Result<TurnResult> {
         let provider = request.provider;
-        let mut spec = adapter.command(request)?;
         let mut state = AdapterState::default();
         // A resumed provider process commonly repeats its native session ID in
         // the startup handshake. Seed the parser with the ID the caller is
         // already attached to so adapters do not project that handshake as a
         // second `SessionStarted` lifecycle event.
         state.result.session_id.clone_from(&request.session_id);
+        // Seeded before the command is built so an adapter that must agree
+        // with itself about a per-turn value — the loopback port an
+        // `opencode serve` child is told to bind, which `attach` later
+        // connects to — decides it once, here.
         adapter.prepare_turn(request, &mut state)?;
+        let mut spec = adapter.command_for_turn(request, &state)?;
         for (name, value) in &request.environment {
             spec.environment.insert(name.into(), value.expose().into());
         }
@@ -2380,7 +2388,27 @@ impl AgentRuntime {
                 source: std::io::Error::new(std::io::ErrorKind::BrokenPipe, "stderr was not piped"),
             })?;
         let stderr_task = tokio::spawn(crate::process::bounded_stderr(stderr, STDERR_TAIL_BYTES));
-        let mut lines = BufReader::new(stdout).lines();
+        // A provider whose protocol is not carried by its own stdio replaces
+        // both halves here. The child stays spawned, supervised and
+        // stderr-drained exactly as before; only the frame carrier differs,
+        // so everything below this point — cancellation, interrupts,
+        // interaction timeouts, line bounding — is shared by both kinds of
+        // provider instead of growing a second turn loop.
+        let mut attached = false;
+        let reader: crate::TransportReader = match adapter.attach(request, &state).await {
+            Ok(Some(streams)) => {
+                attached = true;
+                stdin = Some(streams.writer);
+                streams.reader
+            }
+            Ok(None) => stdout,
+            Err(error) => {
+                let _ = process.terminate().await;
+                stderr_task.abort();
+                return Err(error);
+            }
+        };
+        let mut lines = BufReader::new(reader).lines();
         loop {
             let line = tokio::select! {
                 _ = request.cancellation.cancelled() => {
@@ -2483,21 +2511,54 @@ impl AgentRuntime {
             }
             if output.terminal {
                 stdin.take();
+                if attached {
+                    // A stdio provider is read to end-of-output because
+                    // closing its stdin is what makes it exit, and trailing
+                    // lines can still arrive. An adapter-supplied carrier has
+                    // no such contract: the protocol is over, and waiting for
+                    // the adapter to close its own reader would hand a third
+                    // party the ability to hang the turn.
+                    break;
+                }
             }
         }
         drop(stdin);
-        let status = process
-            .wait()
-            .await
-            .map_err(|source| RuntimeError::Transport { provider, source })?;
+        let status = if attached {
+            // A provider driven over adapter-supplied streams has no reason to
+            // exit when the protocol ends: `opencode serve` is a server, and
+            // nothing closes it because a turn finished. Waiting for a natural
+            // exit would hang until the turn deadline, so stopping it *is* the
+            // normal shutdown here. A turn that failed has already recorded
+            // why, so the exit status this synthesizes is never what decides
+            // the outcome.
+            process
+                .terminate()
+                .await
+                .map_err(|source| RuntimeError::Transport { provider, source })?;
+            match tokio::time::timeout(ATTACHED_SHUTDOWN_GRACE, process.wait()).await {
+                Ok(status) => {
+                    status.map_err(|source| RuntimeError::Transport { provider, source })?
+                }
+                Err(_) => TransportExitStatus {
+                    success: true,
+                    code: None,
+                },
+            }
+        } else {
+            process
+                .wait()
+                .await
+                .map_err(|source| RuntimeError::Transport { provider, source })?
+        };
         match request.tool_process_policy {
             crate::ToolProcessPolicy::PreserveOnCompletion => process.disarm(),
-            crate::ToolProcessPolicy::TerminateOnCompletion => {
+            crate::ToolProcessPolicy::TerminateOnCompletion if !attached => {
                 process
                     .terminate()
                     .await
                     .map_err(|source| RuntimeError::Transport { provider, source })?;
             }
+            crate::ToolProcessPolicy::TerminateOnCompletion => {}
         }
         let stderr = stderr_task
             .await

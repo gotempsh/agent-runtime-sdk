@@ -8,13 +8,17 @@ mod codex;
 mod codex_app_server;
 #[cfg(feature = "opencode")]
 mod opencode;
+#[cfg(feature = "opencode")]
+mod opencode_http;
+#[cfg(feature = "opencode")]
+mod opencode_serve;
 
 #[cfg(feature = "claude")]
 pub use claude::Claude;
 #[cfg(feature = "codex")]
 pub use codex::{Codex, CodexTurnMode};
 #[cfg(feature = "opencode")]
-pub use opencode::OpenCode;
+pub use opencode::{OpenCode, OpenCodeTurnMode};
 
 #[cfg(any(feature = "claude", feature = "codex"))]
 use serde_json::Value;

@@ -9,7 +9,7 @@ pin and test the CLI versions used in production.
 | --- | --- | --- |
 | `claude` | yes | `providers::Claude` stream-JSON adapter |
 | `codex` | yes | `providers::Codex` `exec --json` and `app-server` adapter |
-| `opencode` | yes | `providers::OpenCode` JSON adapter |
+| `opencode` | yes | `providers::OpenCode` `run --format json` and `serve` adapter |
 | `nono` | yes | profile management and per-turn Nono execution |
 | `tailnet` | yes | per-agent userspace Tailscale daemons and split proxy |
 | `ssh` | yes | OpenSSH execution transport |
@@ -32,24 +32,24 @@ features.
 | Context-window occupancy | yes, estimated from native usage components and direct after compaction | no | no |
 | Configurable automatic compaction | yes | no | no |
 | Provider-native manual compaction | yes, retained runtime with an existing session | no | no |
-| Session identifier | yes | yes | when reported |
+| Session identifier | yes | yes | yes in `Serve` mode; when reported in `Run` |
 | Resume by session identifier | yes | yes | yes |
-| `Default` | yes | yes, static workspace sandbox | yes, asks auto-reject in headless mode |
-| `AcceptEdits` | yes | yes, static workspace sandbox | no; rejected rather than broadening access |
-| `Plan` | yes | yes, read-only sandbox | yes, built-in `plan` agent |
-| `FullAccess` | yes | yes | yes, `--auto`; explicit configured denies remain |
+| `Default` | yes | yes, static workspace sandbox | `Serve`: `edit: ask`, `bash: ask`; `Run`: asks auto-reject in headless mode |
+| `AcceptEdits` | yes | yes, static workspace sandbox | `Serve`: `edit: allow`, `bash: ask`; `Run`: rejected rather than broadening access |
+| `Plan` | yes | yes, read-only sandbox | `Serve`: both categories denied; `Run`: built-in `plan` agent |
+| `FullAccess` | yes | yes | `Serve`: `edit: allow`, `bash: allow`; `Run`: `--auto`, explicit configured denies remain |
 | Custom mode | yes | yes, native approval policy | yes, configured agent |
-| Live approvals | yes | app-server mode only (`exec` is configured non-interactively) | no (`run` is non-interactive) |
-| Live user questions | yes | app-server mode only, blocking and async | no |
-| Cooperative interrupt on cancellation | no | app-server mode only (`turn/interrupt`) | no |
-| Structured launch context | system prompt, exact tools, stdio/HTTP MCP, strict MCP | additive stdio/HTTP MCP | rejected |
+| Live approvals | yes | app-server mode only (`exec` is configured non-interactively) | `Serve` mode only (`run` is non-interactive) |
+| Live user questions | yes | app-server mode only, blocking and async | no; OpenCode has no question channel |
+| Cooperative interrupt on cancellation | no | app-server mode only (`turn/interrupt`) | `Serve` mode only (`session/abort`) |
+| Structured launch context | system prompt, exact tools, stdio/HTTP MCP, strict MCP | additive stdio/HTTP MCP | `Serve`: system prompt and tools as a prompt prefix, stdio/HTTP MCP; `Run`: rejected |
 | Native image attachments | no; described as prompt paths | yes (`--image`, `localImage` input) | no; described as prompt paths |
 | Prompt kept out of argv | yes | yes | no; current `run` CLI uses message args |
-| Current backend | CLI stream JSON | `codex exec --json` (default) or `codex app-server` | `opencode run --format json` |
+| Current backend | CLI stream JSON | `codex exec --json` (default) or `codex app-server` | `opencode run --format json` (default) or `opencode serve` |
 
-The public adapter trait is the extension point for OpenCode server or
-SDK-backed adapters. Such adapters should preserve the normalized contract and
-establish compatibility coverage before replacing a CLI adapter.
+The public adapter trait is the extension point for further provider
+backends. Such adapters should preserve the normalized contract and establish
+compatibility coverage before replacing a CLI adapter.
 
 ### Codex turn modes
 
@@ -77,6 +77,69 @@ The app-server mode requires a transport whose capabilities include
 resumed thread identifier travel in `thread/start`/`thread/resume` and
 `turn/start` instead of argv; turn-scoped stdio and HTTP MCP servers and the
 model relay still use `--config` overrides.
+
+### OpenCode turn modes
+
+`providers::OpenCodeTurnMode` selects how an OpenCode turn runs. `Run` (the
+default) keeps the one-way `opencode run --format json` behavior.
+
+`Run` mode has no permission enforcement an application can rely on. The only
+flags the CLI accepts are `--auto`, which approves everything, and
+`--agent plan`; every other policy comes from whatever `opencode`
+configuration exists on the machine. A caller cannot request "ask before
+running a shell command", and a silently auto-refused tool call is
+indistinguishable from a turn that simply produced no text.
+
+`Serve`, selected with `OpenCode::serve()` or
+`OpenCode::default().with_turn_mode(OpenCodeTurnMode::Serve)`, starts
+`opencode serve` on a reserved loopback port and drives it over HTTP and
+Server-Sent Events. It adds:
+
+- a per-turn permission policy supplied through `OPENCODE_CONFIG_CONTENT`,
+  which the server reads *instead of* the ambient configuration, so the
+  requested policy is the one the harness runs under;
+- live approvals for `permission.asked`, answered through
+  `InteractionHandler::approve` and posted to
+  `/session/{id}/permissions/{id}`. `ApprovalDecision::Allow`,
+  `ApprovalDecision::AllowForSession` and `ApprovalDecision::Deny` map to the
+  native `once`, `always` and `reject` responses;
+- turn-scoped stdio and HTTP MCP servers, translated into OpenCode's `local`
+  and `remote` `mcp` entries. Credentials are referenced as `{env:NAME}` and
+  never serialized into the configuration;
+- incremental text and reasoning deltas, tool lifecycle events, and a
+  cooperative `session/abort` when the turn's `CancellationToken` fires.
+
+`PermissionMode` maps onto OpenCode's two permission axes:
+
+| `PermissionMode` | `edit` | `bash` |
+| --- | --- | --- |
+| `Default`, `Custom` | `ask` | `ask` |
+| `AcceptEdits` | `allow` | `ask` |
+| `FullAccess` | `allow` | `allow` |
+| `Plan` | `deny` | `deny` |
+
+`Plan` denies both categories rather than selecting the planning agent.
+OpenCode's read-only tools are gated by neither category, so a plan turn can
+still inspect the workspace but can never have a side effect.
+
+An empty `LaunchContext::allowed_tools` list becomes a `{"*": "deny"}`
+wildcard rule, because an explicitly empty tool set has to be an enforcement
+boundary rather than a suggestion in the prompt. A *non-empty* list, and
+`LaunchContext::system_prompt_append`, are carried as a prompt prefix:
+OpenCode has no system-prompt or tool-restriction field on its prompt body.
+
+A plan turn and an empty tool allowlist also refuse any permission that
+reaches the adapter without consulting the application. Both are already
+denied by the policy the server started with, so arriving there means the
+policy did not hold — and the turn promised the user that no such choice
+would exist.
+
+`Serve` mode reaches the server on the SDK host's loopback interface, so it
+requires a transport that runs the provider on that host. Session resume is
+validated with `session.get` rather than by listing and filtering, which
+cannot fail closed on a workspace reached through a symlink; a session with a
+parent is a subagent session and is rejected immediately rather than left to
+hang. Reading transcripts from OpenCode's local database is not implemented.
 
 ## Private-network providers
 
