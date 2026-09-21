@@ -2265,14 +2265,18 @@ impl AgentRuntime {
         interactions: &dyn InteractionHandler,
     ) -> Result<TurnResult> {
         let provider = request.provider;
-        let mut spec = adapter.command(request)?;
         let mut state = AdapterState::default();
         // A resumed provider process commonly repeats its native session ID in
         // the startup handshake. Seed the parser with the ID the caller is
         // already attached to so adapters do not project that handshake as a
         // second `SessionStarted` lifecycle event.
         state.result.session_id.clone_from(&request.session_id);
+        // Seeded before the command is built so an adapter that must agree
+        // with itself about a per-turn value — the loopback port an
+        // `opencode serve` child is told to bind, which `attach` later
+        // connects to — decides it once, here.
         adapter.prepare_turn(request, &mut state)?;
+        let mut spec = adapter.command_for_turn(request, &state)?;
         for (name, value) in &request.environment {
             spec.environment.insert(name.into(), value.expose().into());
         }
@@ -2380,7 +2384,25 @@ impl AgentRuntime {
                 source: std::io::Error::new(std::io::ErrorKind::BrokenPipe, "stderr was not piped"),
             })?;
         let stderr_task = tokio::spawn(crate::process::bounded_stderr(stderr, STDERR_TAIL_BYTES));
-        let mut lines = BufReader::new(stdout).lines();
+        // A provider whose protocol is not carried by its own stdio replaces
+        // both halves here. The child stays spawned, supervised and
+        // stderr-drained exactly as before; only the frame carrier differs,
+        // so everything below this point — cancellation, interrupts,
+        // interaction timeouts, line bounding — is shared by both kinds of
+        // provider instead of growing a second turn loop.
+        let reader: crate::TransportReader = match adapter.attach(request, &state).await {
+            Ok(Some(streams)) => {
+                stdin = Some(streams.writer);
+                streams.reader
+            }
+            Ok(None) => stdout,
+            Err(error) => {
+                let _ = process.terminate().await;
+                stderr_task.abort();
+                return Err(error);
+            }
+        };
+        let mut lines = BufReader::new(reader).lines();
         loop {
             let line = tokio::select! {
                 _ = request.cancellation.cancelled() => {

@@ -215,6 +215,39 @@ pub struct AdapterOutput {
     pub terminal: bool,
 }
 
+/// Protocol carrier an adapter supplies in place of the provider's own stdio.
+///
+/// Most provider CLIs speak their protocol over stdout and stdin, so the
+/// runtime reads frames from the child and writes [`AdapterOutput::writes`]
+/// back to it. A provider whose protocol is *not* carried by its own stdio —
+/// `opencode serve`, which exposes HTTP and Server-Sent Events on a loopback
+/// port — returns these streams from [`AgentAdapter::attach`] instead.
+///
+/// The frame contract is deliberately unchanged: the runtime still reads
+/// newline-delimited frames from [`Self::reader`] and still writes
+/// newline-terminated frames to [`Self::writer`]. [`AgentAdapter::parse_line`]
+/// therefore stays one synchronous, fully testable state machine no matter
+/// what actually moves the bytes, and cancellation, interrupts, interaction
+/// timeouts and line bounding keep working without a second code path.
+///
+/// The child process is still spawned, supervised and torn down by the
+/// runtime. An adapter that returns streams here must keep the turn's
+/// liveness tied to that child: the runtime fails the turn when the process
+/// exits before a terminal frame arrives, so a server that dies mid-turn
+/// surfaces immediately instead of hanging until the turn deadline.
+pub struct ProtocolStreams {
+    /// Newline-delimited frames parsed by [`AgentAdapter::parse_line`].
+    pub reader: crate::TransportReader,
+    /// Sink for [`AdapterOutput::writes`] and encoded interaction responses.
+    pub writer: crate::TransportWriter,
+}
+
+impl fmt::Debug for ProtocolStreams {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_struct("ProtocolStreams").finish()
+    }
+}
+
 /// Adapter between a provider-native CLI protocol and normalized events.
 #[async_trait]
 pub trait AgentAdapter: Send + Sync {
@@ -327,15 +360,50 @@ pub trait AgentAdapter: Send + Sync {
     /// Build the provider process for one validated request.
     fn command(&self, request: &TurnRequest) -> Result<CommandSpec>;
 
+    /// Build the provider process using state seeded by [`Self::prepare_turn`].
+    ///
+    /// The default ignores the state and defers to [`Self::command`], which is
+    /// what a provider that encodes its whole turn in argv and stdin needs.
+    /// An adapter that must agree with itself about a value chosen per turn —
+    /// the loopback port `opencode serve` is told to bind and that
+    /// [`Self::attach`] then connects to — overrides this instead, so the
+    /// value is decided once in `prepare_turn` and read back here.
+    fn command_for_turn(&self, request: &TurnRequest, state: &AdapterState) -> Result<CommandSpec> {
+        let _ = state;
+        self.command(request)
+    }
+
     /// Seed per-turn parser state from the validated request.
     ///
-    /// The runtime calls this once, after [`Self::command`] and before the
-    /// first output line. Adapters whose protocol issues requests of its own
-    /// (rather than encoding the whole turn in argv and stdin) use it to
-    /// retain the turn parameters that [`Self::parse_line`] later needs.
+    /// The runtime calls this once, before [`Self::command_for_turn`] and
+    /// before the first output line. Adapters whose protocol issues requests
+    /// of its own (rather than encoding the whole turn in argv and stdin) use
+    /// it to retain the turn parameters that [`Self::parse_line`] later needs.
     fn prepare_turn(&self, request: &TurnRequest, state: &mut AdapterState) -> Result<()> {
         let _ = (request, state);
         Ok(())
+    }
+
+    /// Supply a protocol carrier to use instead of the child's stdout and stdin.
+    ///
+    /// Called once, after the provider process is spawned and before the first
+    /// frame is read. Returning `None` — the default — keeps the ordinary
+    /// stdio contract. Returning [`ProtocolStreams`] tells the runtime to read
+    /// frames from, and write frames to, those streams instead; the child is
+    /// still spawned, supervised, stderr-drained and terminated by the runtime
+    /// exactly as before.
+    ///
+    /// This is how a provider whose protocol lives somewhere other than its
+    /// own stdio joins the normal turn loop rather than growing a parallel
+    /// one. The implementation typically spawns a task that translates the
+    /// provider's native transport into newline-delimited frames.
+    async fn attach(
+        &self,
+        request: &TurnRequest,
+        state: &AdapterState,
+    ) -> Result<Option<ProtocolStreams>> {
+        let _ = (request, state);
+        Ok(None)
     }
 
     /// Translate one stdout line and update accumulated state.

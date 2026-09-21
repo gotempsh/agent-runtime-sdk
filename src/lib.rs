@@ -50,7 +50,7 @@ pub mod tailnet;
 
 pub use adapter::{
     AccountUsageProbeSpec, AdapterOutput, AdapterState, AgentAdapter, AuthenticationProbeSpec,
-    CatalogProbeSpec, CommandSpec, InteractionRequest, ProviderTerminalFailure,
+    CatalogProbeSpec, CommandSpec, InteractionRequest, ProtocolStreams, ProviderTerminalFailure,
 };
 pub use chat::{
     Chat, ChatApproval, ChatAttachment, ChatCommit, ChatEvent, ChatEventData, ChatMessage,
