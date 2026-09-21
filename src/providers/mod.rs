@@ -8,6 +8,8 @@ mod codex;
 mod codex_app_server;
 #[cfg(feature = "opencode")]
 mod opencode;
+#[cfg(feature = "opencode")]
+mod opencode_http;
 
 #[cfg(feature = "claude")]
 pub use claude::Claude;
