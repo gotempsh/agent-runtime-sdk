@@ -27,6 +27,13 @@ Versioning and Keep a Changelog conventions.
   `turn/interrupt` on cancellation. `PermissionSupport` reports
   `live_approvals`/`live_questions` in that mode. The default
   `codex exec --json` transport is unchanged.
+- Turn-scoped stdio MCP servers for Codex. `McpServerConfig::Stdio` entries are
+  translated into native `-c mcp_servers.<name>.command/args/env_vars`
+  overrides in both the `exec --json` and `app-server` turn modes, and
+  `LaunchContextCapabilities::stdio_mcp` is now advertised for Codex. Codex
+  forwards MCP environment variables by name, so each `environment_from` entry
+  must name a source variable identical to the child variable; anything else is
+  rejected before spawn.
 - `TurnEvent::AsyncQuestionRequested` for a question the turn did not wait on
   (Codex `isBlocking: false`). The runtime answers the provider immediately so
   the turn keeps running; hosts show the question as open and deliver the

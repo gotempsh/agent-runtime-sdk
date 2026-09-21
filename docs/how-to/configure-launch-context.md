@@ -6,8 +6,8 @@ The SDK does not define higher-level concepts such as personas. Resolve those in
 the host application and pass only their provider-neutral execution policy.
 
 Support is provider- and field-specific. Claude Code implements every current
-field. Codex implements additive turn-scoped HTTP MCP servers, including header
-values referenced from the turn environment. Inspect
+field. Codex implements additive turn-scoped stdio and HTTP MCP servers, including
+header and environment values referenced from the turn environment. Inspect
 `AgentRuntime::launch_context_capabilities` or the `launch_context` field in
 `HarnessReadiness` before presenting controls. An unsupported field is rejected
 precisely instead of being silently ignored.
@@ -96,11 +96,15 @@ uses only the servers supplied by the host application. Leave it false for an
 additive application capability that should coexist with user-configured MCP
 servers.
 
-Codex accepts HTTP MCP definitions when `strict_mcp_config` is false. The SDK
-passes the endpoint and environment-variable names through native `--config`
-overrides; secret values remain in the provider environment. Codex does not yet
-advertise system-prompt additions, exact tool restrictions, stdio MCP, or strict
-MCP isolation. Requests using those fields fail before spawn.
+Codex accepts stdio and HTTP MCP definitions when `strict_mcp_config` is false.
+The SDK passes commands, arguments, endpoints, and environment-variable names
+through native `-c mcp_servers.<name>.*` overrides; secret values remain in the
+provider environment. Codex forwards stdio MCP variables by name through
+`mcp_servers.<name>.env_vars` and cannot rename them, so every
+`environment_from` entry must name a source variable identical to the child
+variable. Codex does not yet advertise system-prompt additions, exact tool
+restrictions, or strict MCP isolation. Requests using those fields fail before
+spawn.
 
 ## Remote execution
 

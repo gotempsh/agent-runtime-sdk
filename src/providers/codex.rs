@@ -368,27 +368,83 @@ fn codex_tool_event(item: &Value, completed: bool) -> Option<TurnEvent> {
     })
 }
 
-fn append_http_mcp_launch_context(spec: &mut CommandSpec, request: &TurnRequest) -> Result<()> {
+/// Translate turn-scoped MCP servers into `-c mcp_servers.<name>.*` overrides.
+///
+/// Codex parses each `--config` value as TOML, so every string is emitted as a
+/// TOML basic string. Credentials never appear here: stdio servers forward
+/// harness environment variables by name through `env_vars`, and HTTP servers
+/// reference header sources through `env_http_headers`.
+fn append_mcp_launch_context(spec: &mut CommandSpec, request: &TurnRequest) -> Result<()> {
     for (name, server) in &request.launch_context.mcp_servers {
-        let McpServerConfig::Http { url, headers_from } = server else {
-            return Err(RuntimeError::InvalidRequest {
-                field: "launch_context.mcp_servers",
-                message: "Codex supports only turn-scoped HTTP MCP servers".into(),
-            });
-        };
-        spec.args.extend([
-            "--config".into(),
-            format!("mcp_servers.{name}.url={}", codex_config_string(url)?).into(),
-        ]);
-        for (header, source) in headers_from {
-            spec.args.extend([
-                "--config".into(),
-                format!(
-                    "mcp_servers.{name}.env_http_headers.{header}={}",
-                    codex_config_string(source)?
-                )
-                .into(),
-            ]);
+        match server {
+            McpServerConfig::Stdio {
+                command,
+                args,
+                environment_from,
+            } => {
+                let Some(command) = command.to_str() else {
+                    return Err(RuntimeError::InvalidRequest {
+                        field: "launch_context.mcp_servers.command",
+                        message: "stdio commands must be valid UTF-8".into(),
+                    });
+                };
+                spec.args.extend([
+                    "--config".into(),
+                    format!(
+                        "mcp_servers.{name}.command={}",
+                        codex_config_string(command)?
+                    )
+                    .into(),
+                ]);
+                if !args.is_empty() {
+                    let encoded = args
+                        .iter()
+                        .map(|argument| codex_config_string(argument))
+                        .collect::<Result<Vec<_>>>()?
+                        .join(", ");
+                    spec.args.extend([
+                        "--config".into(),
+                        format!("mcp_servers.{name}.args=[{encoded}]").into(),
+                    ]);
+                }
+                if !environment_from.is_empty() {
+                    let mut sources = Vec::with_capacity(environment_from.len());
+                    for (target, source) in environment_from {
+                        // Codex forwards variables to an MCP child by name; it
+                        // cannot rename them. Renaming silently would hand the
+                        // child a variable it never reads.
+                        if target != source {
+                            return Err(RuntimeError::InvalidRequest {
+                                field: "launch_context.mcp_servers.environment_from",
+                                message: format!(
+                                    "Codex forwards MCP environment variables by name, so `{target}` must be supplied by a source variable of the same name, not `{source}`"
+                                ),
+                            });
+                        }
+                        sources.push(codex_config_string(source)?);
+                    }
+                    spec.args.extend([
+                        "--config".into(),
+                        format!("mcp_servers.{name}.env_vars=[{}]", sources.join(", ")).into(),
+                    ]);
+                }
+            }
+            McpServerConfig::Http { url, headers_from } => {
+                spec.args.extend([
+                    "--config".into(),
+                    format!("mcp_servers.{name}.url={}", codex_config_string(url)?).into(),
+                ]);
+                for (header, source) in headers_from {
+                    spec.args.extend([
+                        "--config".into(),
+                        format!(
+                            "mcp_servers.{name}.env_http_headers.{header}={}",
+                            codex_config_string(source)?
+                        )
+                        .into(),
+                    ]);
+                }
+            }
         }
     }
     Ok(())
@@ -580,6 +636,7 @@ impl AgentAdapter for Codex {
 
     fn launch_context_capabilities(&self) -> LaunchContextCapabilities {
         LaunchContextCapabilities {
+            stdio_mcp: true,
             http_mcp: true,
             ..LaunchContextCapabilities::default()
         }
@@ -839,7 +896,7 @@ impl AgentAdapter for Codex {
         let mut spec = CommandSpec::new(self.configured_executable());
         if self.app_server_mode() {
             spec.args.push("app-server".into());
-            append_http_mcp_launch_context(&mut spec, request)?;
+            append_mcp_launch_context(&mut spec, request)?;
             append_model_relay(
                 &mut spec,
                 request,
@@ -857,7 +914,7 @@ impl AgentAdapter for Codex {
             "--json".into(),
             "--skip-git-repo-check".into(),
         ]);
-        append_http_mcp_launch_context(&mut spec, request)?;
+        append_mcp_launch_context(&mut spec, request)?;
         append_model_relay(
             &mut spec,
             request,
@@ -1302,6 +1359,110 @@ mod tests {
         }));
         assert!(!arguments.join(" ").contains("super-secret-token"));
         assert!(!format!("{request:?}").contains("super-secret-token"));
+    }
+
+    fn stdio_fleet_server() -> McpServerConfig {
+        McpServerConfig::Stdio {
+            command: "/Users/bob/my tools/temps-fleet".into(),
+            args: vec!["--data-dir".into(), "/var/lib/fleet".into(), "mcp".into()],
+            environment_from: std::collections::BTreeMap::from([(
+                "TEMPS_FLEET_MCP_PARENT_TOKEN".into(),
+                "TEMPS_FLEET_MCP_PARENT_TOKEN".into(),
+            )]),
+        }
+    }
+
+    fn arguments_for(request: &TurnRequest, adapter: &Codex) -> Vec<String> {
+        adapter
+            .command(request)
+            .unwrap()
+            .args
+            .iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn applies_turn_scoped_stdio_mcp_in_both_turn_modes() {
+        let mut request = TurnRequest::new(Provider::Codex, ".", "inspect");
+        request.environment.insert(
+            "TEMPS_FLEET_MCP_PARENT_TOKEN".into(),
+            crate::SecretString::new("super-secret-token"),
+        );
+        request
+            .launch_context
+            .mcp_servers
+            .insert("temps_fleet".into(), stdio_fleet_server());
+
+        for adapter in [Codex::default(), Codex::app_server()] {
+            let arguments = arguments_for(&request, &adapter);
+            assert!(
+                arguments.iter().any(|argument| argument
+                    == r#"mcp_servers.temps_fleet.command="/Users/bob/my tools/temps-fleet""#),
+                "{arguments:?}"
+            );
+            assert!(arguments.iter().any(|argument| argument
+                == r#"mcp_servers.temps_fleet.args=["--data-dir", "/var/lib/fleet", "mcp"]"#));
+            assert!(arguments.iter().any(|argument| argument
+                == r#"mcp_servers.temps_fleet.env_vars=["TEMPS_FLEET_MCP_PARENT_TOKEN"]"#));
+            assert!(!arguments.join(" ").contains("super-secret-token"));
+        }
+    }
+
+    #[test]
+    fn stdio_mcp_configuration_values_are_escaped_as_toml_strings() {
+        let mut request = TurnRequest::new(Provider::Codex, ".", "inspect");
+        request.launch_context.mcp_servers.insert(
+            "quoted".into(),
+            McpServerConfig::Stdio {
+                command: r#"C:\tools\say "hi""#.into(),
+                args: vec!["a\tb".into()],
+                environment_from: std::collections::BTreeMap::new(),
+            },
+        );
+
+        let arguments = arguments_for(&request, &Codex::app_server());
+
+        assert!(arguments
+            .iter()
+            .any(|argument| argument == r#"mcp_servers.quoted.command="C:\\tools\\say \"hi\"""#));
+        assert!(arguments
+            .iter()
+            .any(|argument| argument == r#"mcp_servers.quoted.args=["a\tb"]"#));
+    }
+
+    #[test]
+    fn a_renamed_stdio_mcp_environment_reference_is_rejected() {
+        let mut request = TurnRequest::new(Provider::Codex, ".", "inspect");
+        request
+            .environment
+            .insert("SOURCE".into(), crate::SecretString::new("value"));
+        request.launch_context.mcp_servers.insert(
+            "temps_fleet".into(),
+            McpServerConfig::Stdio {
+                command: "/usr/local/bin/temps-fleet".into(),
+                args: Vec::new(),
+                environment_from: std::collections::BTreeMap::from([(
+                    "TARGET".into(),
+                    "SOURCE".into(),
+                )]),
+            },
+        );
+
+        assert!(matches!(
+            Codex::app_server().command(&request),
+            Err(RuntimeError::InvalidRequest {
+                field: "launch_context.mcp_servers.environment_from",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn the_adapter_advertises_both_mcp_transports() {
+        let capabilities = Codex::default().launch_context_capabilities();
+        assert!(capabilities.stdio_mcp);
+        assert!(capabilities.http_mcp);
     }
 
     #[test]

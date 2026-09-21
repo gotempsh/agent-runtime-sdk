@@ -74,8 +74,8 @@ drives `codex app-server` over JSON-RPC and adds:
 The app-server mode requires a transport whose capabilities include
 `interactive_stdin`. Model, sandbox, approval policy, service tier and the
 resumed thread identifier travel in `thread/start`/`thread/resume` and
-`turn/start` instead of argv; turn-scoped HTTP MCP servers and the model relay
-still use `--config` overrides.
+`turn/start` instead of argv; turn-scoped stdio and HTTP MCP servers and the
+model relay still use `--config` overrides.
 
 ## Private-network providers
 
@@ -182,7 +182,10 @@ all tools. MCP credentials are referenced by environment-variable name and must
 be supplied separately through the redacted request environment. Support is
 field-level and exposed through `LaunchContextCapabilities`; unsupported fields
 are rejected before spawn. Claude supports every current field, while Codex
-supports additive HTTP MCP definitions. See
+supports additive stdio and HTTP MCP definitions. Codex forwards stdio MCP
+credentials through `mcp_servers.<name>.env_vars`, which selects harness
+variables by name, so each `environment_from` entry must map a variable to a
+source variable of the same name. See
 [Configure launch context](../how-to/configure-launch-context.md).
 
 ### Agent Relay
