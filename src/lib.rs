@@ -102,5 +102,5 @@ pub use types::{
     InteractionHandler, LaunchContext, LaunchContextCapabilities, McpServerConfig, NoopEventSink,
     PermissionMode, PermissionSupport, Provider, ProviderReadiness, QuestionAnswer, QuestionOption,
     QuestionPrompt, QuestionRequest, RunStatus, SecretString, ToolCallStatus, ToolProcessPolicy,
-    TurnEvent, TurnProvenance, TurnRequest, TurnResult, Usage,
+    TurnCapabilities, TurnEvent, TurnProvenance, TurnRequest, TurnResult, Usage,
 };

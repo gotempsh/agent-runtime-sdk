@@ -34,6 +34,14 @@ Versioning and Keep a Changelog conventions.
   forwards MCP environment variables by name, so each `environment_from` entry
   must name a source variable identical to the child variable; anything else is
   rejected before spawn.
+- Native image attachments for Codex. `TurnRequest::attachments` carries the
+  execution-host file references an adapter can read itself, `TurnCapabilities`
+  (`AgentAdapter::turn_capabilities`, `AgentRuntime::turn_capabilities`) reports
+  `native_image_attachments`, and `RuntimeDriverCapabilities` mirrors the same
+  flag. Codex sends `image/*` attachments as `codex exec --image` arguments or
+  `localImage` `turn/start` inputs, and the retained runtime no longer appends
+  their host paths to the prompt. Providers without native support keep the
+  existing path-text behavior.
 - `TurnEvent::AsyncQuestionRequested` for a question the turn did not wait on
   (Codex `isBlocking: false`). The runtime answers the provider immediately so
   the turn keeps running; hosts show the question as open and deliver the

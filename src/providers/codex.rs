@@ -15,7 +15,7 @@ use crate::{
     HarnessModel, HarnessModelCatalog, HarnessReasoningEffort, HarnessServiceTier,
     LaunchContextCapabilities, McpServerConfig, PermissionMode, PermissionSupport, Provider,
     ProviderReadiness, ProviderTerminalFailure, QuestionAnswer, QuestionRequest, Result,
-    RuntimeError, ToolCallStatus, TransportExitStatus, TurnEvent, TurnRequest,
+    RuntimeError, ToolCallStatus, TransportExitStatus, TurnCapabilities, TurnEvent, TurnRequest,
 };
 
 #[derive(serde::Deserialize)]
@@ -450,6 +450,28 @@ fn append_mcp_launch_context(spec: &mut CommandSpec, request: &TurnRequest) -> R
     Ok(())
 }
 
+/// Execution-host paths of the image attachments referenced by a turn.
+///
+/// Codex reads the file itself, so the SDK never opens or uploads it: the
+/// path is only meaningful inside the selected execution transport, exactly
+/// like [`TurnRequest::working_directory`].
+pub(super) fn image_attachment_paths(request: &TurnRequest) -> Result<Vec<&str>> {
+    request
+        .attachments
+        .iter()
+        .filter(|attachment| crate::retained::is_image(attachment))
+        .map(|attachment| {
+            attachment
+                .path
+                .to_str()
+                .ok_or(RuntimeError::InvalidRequest {
+                    field: "attachments.path",
+                    message: "image attachment paths must be valid UTF-8".into(),
+                })
+        })
+        .collect()
+}
+
 fn response_result(lines: &[String], id: u64) -> Result<Value> {
     lines
         .iter()
@@ -639,6 +661,14 @@ impl AgentAdapter for Codex {
             stdio_mcp: true,
             http_mcp: true,
             ..LaunchContextCapabilities::default()
+        }
+    }
+
+    fn turn_capabilities(&self) -> TurnCapabilities {
+        TurnCapabilities {
+            // `codex exec --image` and the app server's `localImage` user
+            // input both read the file on the execution host.
+            native_image_attachments: true,
         }
     }
 
@@ -962,6 +992,9 @@ impl AgentAdapter for Codex {
             })?;
             spec.args
                 .extend(["--config".into(), format!("service_tier={tier}").into()]);
+        }
+        for path in image_attachment_paths(request)? {
+            spec.args.extend(["--image".into(), path.into()]);
         }
         if let Some(session_id) = request.session_id.as_deref() {
             spec.args.extend(["resume".into(), session_id.into()]);
@@ -1456,6 +1489,46 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn image_attachments_travel_as_native_exec_image_arguments() {
+        let mut request = TurnRequest::new(Provider::Codex, ".", "what is this?");
+        request.attachments = vec![
+            crate::retained::TurnAttachment {
+                path: "/tmp/screenshot.png".into(),
+                display_name: Some("Screenshot".into()),
+                media_type: Some("image/png".into()),
+            },
+            crate::retained::TurnAttachment {
+                path: "/tmp/report.pdf".into(),
+                display_name: None,
+                media_type: Some("application/pdf".into()),
+            },
+        ];
+
+        let arguments = arguments_for(&request, &Codex::default());
+
+        assert!(arguments
+            .windows(2)
+            .any(|pair| pair == ["--image", "/tmp/screenshot.png"]));
+        assert!(!arguments
+            .iter()
+            .any(|argument| argument == "/tmp/report.pdf"));
+    }
+
+    #[test]
+    fn the_adapter_advertises_native_image_attachments() {
+        assert!(
+            Codex::default()
+                .turn_capabilities()
+                .native_image_attachments
+        );
+        assert!(
+            Codex::app_server()
+                .turn_capabilities()
+                .native_image_attachments
+        );
     }
 
     #[test]

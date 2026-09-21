@@ -152,8 +152,14 @@ pub(super) fn prepare_turn(request: &TurnRequest, state: &mut AdapterState) -> R
         thread_params["threadId"] = json!(resumed);
     }
 
+    // Image attachments become native `localImage` user inputs; every other
+    // attachment was already described in the rendered prompt text.
+    let mut input = vec![json!({"type": "text", "text": request.prompt})];
+    for path in super::codex::image_attachment_paths(request)? {
+        input.push(json!({"type": "localImage", "path": path}));
+    }
     let mut turn_params = json!({
-        "input": [{"type": "text", "text": request.prompt}],
+        "input": input,
         "summary": "detailed",
     });
     if let Some(reasoning) = request.reasoning.as_deref() {
@@ -1052,6 +1058,34 @@ mod tests {
         assert_eq!(
             turn.turn_params["input"][0],
             json!({"type": "text", "text": "inspect"})
+        );
+    }
+
+    #[test]
+    fn an_image_attachment_becomes_a_native_local_image_user_input() {
+        let mut request = TurnRequest::new(Provider::Codex, ".", "what is this?");
+        request.attachments = vec![
+            crate::retained::TurnAttachment {
+                path: "/tmp/screenshot.png".into(),
+                display_name: None,
+                media_type: Some("image/png".into()),
+            },
+            crate::retained::TurnAttachment {
+                path: "/tmp/report.pdf".into(),
+                display_name: None,
+                media_type: Some("application/pdf".into()),
+            },
+        ];
+        let mut state = AdapterState::default();
+        prepare_turn(&request, &mut state).unwrap();
+
+        let turn = load(&state);
+        assert_eq!(
+            turn.turn_params["input"],
+            json!([
+                {"type": "text", "text": "what is this?"},
+                {"type": "localImage", "path": "/tmp/screenshot.png"}
+            ])
         );
     }
 

@@ -40,6 +40,7 @@ const AUTHENTICATION_REASON_MAX_CHARS: usize = 4_096;
 const MAX_SANDBOX_RECOVERY_RETRIES: u8 = 8;
 const MAX_ALLOWED_TOOLS: usize = 256;
 const MAX_TOOL_NAME_BYTES: usize = 256;
+const MAX_ATTACHMENTS: usize = 64;
 const MAX_MCP_SERVERS: usize = 64;
 const MAX_MCP_SERVER_NAME_BYTES: usize = 128;
 const MAX_MCP_ARGUMENTS: usize = 256;
@@ -680,6 +681,31 @@ fn validate_launch_context(
                     )?;
                 }
             }
+        }
+    }
+    Ok(())
+}
+
+/// Reject attachment references an adapter could not place in argv or a
+/// provider request without corrupting it.
+fn validate_attachments(request: &TurnRequest) -> Result<()> {
+    if request.attachments.len() > MAX_ATTACHMENTS {
+        return Err(RuntimeError::InvalidRequest {
+            field: "attachments",
+            message: format!("a turn may reference at most {MAX_ATTACHMENTS} attachments"),
+        });
+    }
+    for attachment in &request.attachments {
+        let valid = attachment
+            .path
+            .to_str()
+            .is_some_and(|path| !path.is_empty() && !path.contains(['\0', '\n', '\r']));
+        if !valid {
+            return Err(RuntimeError::InvalidRequest {
+                field: "attachments.path",
+                message: "attachment paths must be non-empty UTF-8 without NUL or newlines"
+                    .to_string(),
+            });
         }
     }
     Ok(())
@@ -1853,6 +1879,15 @@ impl AgentRuntime {
         Ok(adapter.launch_context_capabilities())
     }
 
+    /// Inspect optional per-turn provider behaviors without starting a turn.
+    pub fn turn_capabilities(&self, provider: Provider) -> Result<crate::TurnCapabilities> {
+        let adapter = self
+            .adapters
+            .get(&provider)
+            .ok_or(RuntimeError::AdapterUnavailable { provider })?;
+        Ok(adapter.turn_capabilities())
+    }
+
     /// Run one turn, streaming normalized events with backpressure.
     pub async fn run(
         &self,
@@ -2182,6 +2217,7 @@ impl AgentRuntime {
             | crate::AutoCompactionPolicy::Automatic
             | crate::AutoCompactionPolicy::TokenThreshold { .. } => {}
         }
+        validate_attachments(request)?;
         validate_explicit_environment(&request.environment, "environment")?;
         let capabilities = self
             .adapters

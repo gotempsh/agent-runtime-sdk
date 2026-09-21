@@ -11,7 +11,7 @@ use crate::{
     AccountUsageReport, AccountUsageSnapshot, ApprovalDecision, ApprovalRequest,
     HarnessAuthentication, HarnessControlGroup, HarnessModelCatalog, LaunchContextCapabilities,
     PermissionSupport, Provider, ProviderReadiness, QuestionAnswer, QuestionRequest, Result,
-    TransportExitStatus, TurnEvent, TurnRequest, TurnResult,
+    TransportExitStatus, TurnCapabilities, TurnEvent, TurnRequest, TurnResult,
 };
 
 /// Fully separated process invocation produced by an adapter.
@@ -240,6 +240,15 @@ pub trait AgentAdapter: Send + Sync {
     /// spawning a provider process.
     fn launch_context_capabilities(&self) -> LaunchContextCapabilities {
         LaunchContextCapabilities::default()
+    }
+
+    /// Optional per-turn behaviors this adapter implements.
+    ///
+    /// The default denies every capability, so an application can tell a
+    /// provider that consumes [`TurnRequest::attachments`] natively apart from
+    /// one that needs the files described in the prompt instead.
+    fn turn_capabilities(&self) -> TurnCapabilities {
+        TurnCapabilities::default()
     }
 
     /// Provider-native runtime controls supported by this adapter and CLI.

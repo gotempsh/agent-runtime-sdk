@@ -7,6 +7,7 @@
 
 #![cfg(feature = "codex")]
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -14,13 +15,15 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use temps_agent_runtime::providers::{Codex, CodexTurnMode};
+use temps_agent_runtime::retained::TurnAttachment;
 use temps_agent_runtime::{
     AgentRuntime, ApprovalDecision, ApprovalRequest, EventSink, ExecutionTransport,
-    InteractionHandler, PermissionMode, Provider, ProviderReadiness, QuestionAnswer,
-    QuestionRequest, Result, RuntimeError, SandboxCapabilities, TransportCapabilities,
-    TransportError, TransportErrorKind, TransportExitStatus, TransportProcess,
-    TransportProcessControl, TransportProcessHandle, TransportReader, TransportReadinessRequest,
-    TransportResult, TransportSpawnRequest, TransportWriter, TurnEvent, TurnRequest,
+    InteractionHandler, McpServerConfig, PermissionMode, Provider, ProviderReadiness,
+    QuestionAnswer, QuestionRequest, Result, RuntimeError, SandboxCapabilities, SecretString,
+    TransportCapabilities, TransportError, TransportErrorKind, TransportExitStatus,
+    TransportProcess, TransportProcessControl, TransportProcessHandle, TransportReader,
+    TransportReadinessRequest, TransportResult, TransportSpawnRequest, TransportWriter, TurnEvent,
+    TurnRequest,
 };
 use tokio::io::{duplex, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio_util::sync::CancellationToken;
@@ -43,6 +46,8 @@ struct AppServer {
     script: Script,
     /// Every frame the SDK wrote to the app server, in order.
     frames: Arc<Mutex<Vec<Value>>>,
+    /// Arguments the SDK asked the transport to spawn `codex` with.
+    arguments: Arc<Mutex<Vec<String>>>,
 }
 
 impl AppServer {
@@ -50,7 +55,12 @@ impl AppServer {
         Self {
             script,
             frames: Arc::new(Mutex::new(Vec::new())),
+            arguments: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    fn arguments(&self) -> Vec<String> {
+        self.arguments.lock().unwrap().clone()
     }
 
     fn frames(&self) -> Vec<Value> {
@@ -121,6 +131,12 @@ impl ExecutionTransport for AppServer {
             "the app-server turn mode must not launch `codex exec`"
         );
         assert!(request.command.interactive_stdin);
+        *self.arguments.lock().unwrap() = request
+            .command
+            .args
+            .iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect();
         let (sdk_stdin, server_input) = duplex(64 * 1024);
         let (sdk_stdout, server_output) = duplex(64 * 1024);
         let (sdk_stderr, server_stderr) = duplex(1024);
@@ -417,6 +433,57 @@ async fn an_approval_is_accepted_through_the_interaction_handler() {
         .events()
         .iter()
         .any(|event| matches!(event, TurnEvent::ApprovalRequested(_))));
+}
+
+#[tokio::test]
+async fn a_turn_carries_stdio_mcp_overrides_and_native_image_inputs() {
+    let transport = AppServer::new(Script::Approval);
+    let responder = Responder::new(ApprovalDecision::Allow, None);
+    let runtime = runtime(transport.clone());
+    let mut request = request();
+    request.launch_context.mcp_servers.insert(
+        "temps_fleet".to_string(),
+        McpServerConfig::Stdio {
+            command: "/usr/local/bin/temps-fleet".into(),
+            args: vec!["mcp-server".to_string()],
+            environment_from: BTreeMap::from([(
+                "TEMPS_FLEET_MCP_PARENT_TOKEN".to_string(),
+                "TEMPS_FLEET_MCP_PARENT_TOKEN".to_string(),
+            )]),
+        },
+    );
+    request.environment.insert(
+        "TEMPS_FLEET_MCP_PARENT_TOKEN".to_string(),
+        SecretString::new("fleet-token"),
+    );
+    request.attachments = vec![TurnAttachment {
+        path: "/tmp/screenshot.png".into(),
+        display_name: Some("Screenshot".to_string()),
+        media_type: Some("image/png".to_string()),
+    }];
+
+    runtime
+        .run(request, &Collector::default(), Some(&responder))
+        .await
+        .unwrap();
+
+    let arguments = transport.arguments();
+    assert!(arguments
+        .iter()
+        .any(|argument| argument
+            == r#"mcp_servers.temps_fleet.command="/usr/local/bin/temps-fleet""#));
+    assert!(arguments
+        .iter()
+        .any(|argument| argument == r#"mcp_servers.temps_fleet.args=["mcp-server"]"#));
+    assert!(arguments.iter().any(|argument| argument
+        == r#"mcp_servers.temps_fleet.env_vars=["TEMPS_FLEET_MCP_PARENT_TOKEN"]"#));
+    assert!(!arguments.join(" ").contains("fleet-token"));
+
+    let started = params_of(&transport.frames(), "turn/start").expect("the turn started");
+    assert_eq!(
+        started["input"][1],
+        json!({"type": "localImage", "path": "/tmp/screenshot.png"})
+    );
 }
 
 #[tokio::test]

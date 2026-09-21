@@ -345,6 +345,10 @@ pub struct RuntimeDriverCapabilities {
     /// The driver emits active context-window occupancy snapshots when available.
     #[serde(default)]
     pub context_window_usage: bool,
+    /// The driver delivers image attachments as native provider image inputs
+    /// instead of describing their host paths in the prompt.
+    #[serde(default)]
+    pub native_image_attachments: bool,
 }
 
 /// Runtime setting whose update impact is being inspected.
@@ -464,6 +468,9 @@ impl RuntimeTurnExecutor for AgentRuntime {
             configurable_auto_compaction: provider == Provider::Claude,
             manual_compaction: provider == Provider::Claude,
             context_window_usage: provider == Provider::Claude,
+            native_image_attachments: self
+                .turn_capabilities(provider)
+                .is_ok_and(|capabilities| capabilities.native_image_attachments),
         }
     }
 
@@ -1221,10 +1228,14 @@ impl RuntimeEntry {
     ) -> TurnRequest {
         let mut environment = self.spec.environment.clone();
         environment.extend(input.environment.clone());
+        let native_images = self
+            .executor
+            .capabilities(self.spec.provider)
+            .native_image_attachments;
         TurnRequest {
             provider: self.spec.provider,
             working_directory: self.spec.working_directory.clone(),
-            prompt: render_prompt(input),
+            prompt: render_prompt(input, native_images),
             provenance: input.provenance.clone(),
             model: input.model.clone().or_else(|| self.spec.model.clone()),
             reasoning: input
@@ -1254,6 +1265,7 @@ impl RuntimeEntry {
                 .tool_process_policy
                 .unwrap_or(self.spec.tool_process_policy),
             environment,
+            attachments: input.attachments.clone(),
             cancellation,
             sandbox: self.spec.sandbox.clone(),
             required_sandbox_capabilities: self.spec.required_sandbox_capabilities,
@@ -1394,14 +1406,24 @@ impl RuntimeHandleBackend for RuntimeEntry {
     }
 }
 
-fn render_prompt(input: &TurnInput) -> String {
-    if input.attachments.is_empty() {
+/// Describe attachments the selected provider cannot read natively.
+///
+/// A provider that accepts native image inputs receives those files through
+/// [`TurnRequest::attachments`] instead, so repeating their host paths here
+/// would only spend context on a path the model does not need.
+fn render_prompt(input: &TurnInput, native_images: bool) -> String {
+    let described = input
+        .attachments
+        .iter()
+        .filter(|attachment| !(native_images && is_image(attachment)))
+        .collect::<Vec<_>>();
+    if described.is_empty() {
         return input.prompt.clone();
     }
-    let mut prompt = String::with_capacity(input.prompt.len() + input.attachments.len() * 80);
+    let mut prompt = String::with_capacity(input.prompt.len() + described.len() * 80);
     prompt.push_str(&input.prompt);
     prompt.push_str("\n\nFiles attached to this request and available on the execution host:\n");
-    for attachment in &input.attachments {
+    for attachment in described {
         prompt.push_str("- path: ");
         prompt.push_str(attachment.path.to_string_lossy().as_ref());
         if let Some(display_name) = &attachment.display_name {
@@ -1415,6 +1437,17 @@ fn render_prompt(input: &TurnInput) -> String {
         prompt.push('\n');
     }
     prompt
+}
+
+/// Whether an attachment declares an image media type.
+///
+/// Only an explicit `image/*` media type counts: guessing from a file
+/// extension would hand a provider a file it cannot decode.
+pub(crate) fn is_image(attachment: &TurnAttachment) -> bool {
+    attachment
+        .media_type
+        .as_deref()
+        .is_some_and(|media_type| media_type.starts_with("image/"))
 }
 
 struct ChannelEventSink {
@@ -1878,6 +1911,7 @@ mod tests {
                 configurable_auto_compaction: true,
                 manual_compaction: true,
                 context_window_usage: true,
+                native_image_attachments: true,
             }
         }
 
@@ -2217,6 +2251,43 @@ mod tests {
         assert!(requests[0].prompt.contains("uploads/report.pdf"));
         assert!(requests[0].prompt.contains("Quarterly report"));
         assert!(requests[0].prompt.contains("application/pdf"));
+        assert_eq!(requests[0].attachments.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_image_attachment_reaches_a_native_provider_without_prompt_path_text() {
+        let executor = Arc::new(RecordingExecutor::new());
+        let client = InProcessRuntimeClient::from_executor(executor.clone());
+        let handle = client
+            .acquire(runtime_spec("runtime-image-attachments"))
+            .await
+            .expect("acquire runtime");
+        let mut input = turn_input("turn-image", "What is in this screenshot?");
+        input.attachments.push(TurnAttachment {
+            path: PathBuf::from("uploads/screenshot.png"),
+            display_name: Some("Screenshot".to_owned()),
+            media_type: Some("image/png".to_owned()),
+        });
+        input.attachments.push(TurnAttachment {
+            path: PathBuf::from("uploads/report.pdf"),
+            display_name: None,
+            media_type: Some("application/pdf".to_owned()),
+        });
+        handle
+            .start_turn(input)
+            .await
+            .expect("start image turn")
+            .wait()
+            .await
+            .expect("image result");
+
+        let requests = executor
+            .requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(!requests[0].prompt.contains("screenshot.png"));
+        assert!(requests[0].prompt.contains("report.pdf"));
+        assert_eq!(requests[0].attachments.len(), 2);
     }
 
     #[tokio::test]

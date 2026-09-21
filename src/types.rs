@@ -49,6 +49,20 @@ pub struct LaunchContextCapabilities {
     pub strict_mcp_config: bool,
 }
 
+/// Optional per-turn provider behaviors implemented by an adapter.
+///
+/// These are deliberately separate from [`LaunchContextCapabilities`]: they
+/// describe what an adapter does with a turn the application already composed,
+/// not which launch-context fields it can enforce.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnCapabilities {
+    /// The adapter delivers image attachments as native provider image inputs.
+    ///
+    /// Applications and the retained runtime stop describing those files in
+    /// prompt text, because the provider receives the image itself.
+    pub native_image_attachments: bool,
+}
+
 impl fmt::Debug for LaunchContext {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -313,6 +327,14 @@ pub struct TurnRequest {
     /// Explicit harness environment additions. Values are redacted from `Debug` and surfaced
     /// diagnostics, but remain readable by the harness and its descendants.
     pub environment: BTreeMap<String, SecretString>,
+    /// Files already present on the execution host and referenced by this turn.
+    ///
+    /// Adapters that advertise
+    /// [`TurnCapabilities::native_image_attachments`] deliver image
+    /// attachments through the provider's own image input instead of prompt
+    /// text. Adapters that do not simply ignore this field, because the
+    /// caller already described the files in [`Self::prompt`].
+    pub attachments: Vec<crate::retained::TurnAttachment>,
     /// Cooperative cancellation owned by the caller.
     pub cancellation: CancellationToken,
     /// Optional pluggable outer sandbox.
@@ -344,7 +366,8 @@ impl fmt::Debug for TurnRequest {
             .field(
                 "environment_keys",
                 &self.environment.keys().collect::<Vec<_>>(),
-            );
+            )
+            .field("attachments", &self.attachments);
         debug.field("sandbox", &self.sandbox);
         debug.field(
             "required_sandbox_capabilities",
@@ -378,6 +401,7 @@ impl TurnRequest {
             interaction_timeout: Duration::from_secs(10 * 60),
             tool_process_policy: ToolProcessPolicy::default(),
             environment: BTreeMap::new(),
+            attachments: Vec::new(),
             cancellation: CancellationToken::new(),
             sandbox: None,
             required_sandbox_capabilities: crate::SandboxCapabilities::NONE,

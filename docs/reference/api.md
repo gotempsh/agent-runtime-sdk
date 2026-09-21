@@ -42,7 +42,8 @@ features.
 | Live approvals | yes | app-server mode only (`exec` is configured non-interactively) | no (`run` is non-interactive) |
 | Live user questions | yes | app-server mode only, blocking and async | no |
 | Cooperative interrupt on cancellation | no | app-server mode only (`turn/interrupt`) | no |
-| Structured launch context | system prompt, exact tools, stdio/HTTP MCP, strict MCP | additive HTTP MCP | rejected |
+| Structured launch context | system prompt, exact tools, stdio/HTTP MCP, strict MCP | additive stdio/HTTP MCP | rejected |
+| Native image attachments | no; described as prompt paths | yes (`--image`, `localImage` input) | no; described as prompt paths |
 | Prompt kept out of argv | yes | yes | no; current `run` CLI uses message args |
 | Current backend | CLI stream JSON | `codex exec --json` (default) or `codex app-server` | `opencode run --format json` |
 
@@ -135,6 +136,12 @@ values. The same context type is accepted by `fetch_account_usage_with`.
 support without starting a turn.
 `launch_context_capabilities(provider)` reports field-level support for system
 instructions, tool restrictions, stdio/HTTP MCP, and strict MCP isolation.
+`turn_capabilities(provider)` reports optional per-turn behaviors, currently
+`native_image_attachments`: whether the adapter delivers `TurnRequest`
+attachments with an `image/*` media type as native provider image inputs
+instead of leaving them described as host paths in the prompt. The retained
+runtime mirrors the same flag on `RuntimeDriverCapabilities` and stops
+appending those paths to the prompt when the driver reads them natively.
 `fetch_account_usage(provider)` performs a bounded, fetch-on-demand quota query
 inside the configured execution transport. It returns an `AccountUsageReport`
 with `available`, `unavailable`, or `unsupported` status; unavailable reports
