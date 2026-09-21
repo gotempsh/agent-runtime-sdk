@@ -290,6 +290,13 @@ pub(super) fn prepare_turn(request: &TurnRequest, state: &mut AdapterState, port
     if !prompt.is_empty() {
         parts.push(json!({"type": "text", "text": prompt}));
     }
+    // Best-effort, and deliberately additive. The reference driver sends a
+    // `file` part built from a URL it already has; the SDK only has an
+    // execution-host path, and that `file://` spelling has not been confirmed
+    // against a live server. So this adapter does *not* advertise
+    // `TurnCapabilities::native_image_attachments`: the caller still describes
+    // the files in the prompt, and a part OpenCode ignores costs nothing,
+    // whereas dropping the attachment silently would lose it.
     for attachment in &request.attachments {
         parts.push(json!({
             "type": "file",
