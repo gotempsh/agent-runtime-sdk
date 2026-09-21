@@ -7,6 +7,11 @@ Versioning and Keep a Changelog conventions.
 
 ### Changed
 
+- Preserve Windows system and profile environment variables when launching providers,
+  without inheriting unrelated credentials. Hide provider and cleanup console windows.
+  Add native process fixtures for arguments, stdin, failures, cancellation, and
+  Windows Claude/Codex/OpenCode `.cmd` wrappers.
+
 - Corrected the minimum supported Rust version to 1.88 to match locked
   dependencies, with an all-targets/all-features compiler check in CI.
 - Crate archive paths are root-anchored so nested third-party README/license
