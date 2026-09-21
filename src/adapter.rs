@@ -203,6 +203,14 @@ pub struct AdapterOutput {
     pub events: Vec<TurnEvent>,
     /// Optional blocking interaction.
     pub interaction: Option<InteractionRequest>,
+    /// Provider-native frames the runtime writes to stdin immediately, without
+    /// waiting for an application decision. Each is terminated with a newline.
+    ///
+    /// Bidirectional protocols need this to advance their own handshake: a
+    /// JSON-RPC client answering a server request it resolves itself, or
+    /// issuing the next call once the previous response arrived. An adapter
+    /// that uses this field must set [`CommandSpec::interactive_stdin`].
+    pub writes: Vec<Vec<u8>>,
     /// True after a provider terminal frame. The runtime then closes stdin.
     pub terminal: bool,
 }
@@ -310,8 +318,32 @@ pub trait AgentAdapter: Send + Sync {
     /// Build the provider process for one validated request.
     fn command(&self, request: &TurnRequest) -> Result<CommandSpec>;
 
+    /// Seed per-turn parser state from the validated request.
+    ///
+    /// The runtime calls this once, after [`Self::command`] and before the
+    /// first output line. Adapters whose protocol issues requests of its own
+    /// (rather than encoding the whole turn in argv and stdin) use it to
+    /// retain the turn parameters that [`Self::parse_line`] later needs.
+    fn prepare_turn(&self, request: &TurnRequest, state: &mut AdapterState) -> Result<()> {
+        let _ = (request, state);
+        Ok(())
+    }
+
     /// Translate one stdout line and update accumulated state.
     fn parse_line(&self, line: &str, state: &mut AdapterState) -> Result<AdapterOutput>;
+
+    /// Encode a provider-native cooperative interrupt for the running turn.
+    ///
+    /// Returning `Some` makes the runtime write the frame on cancellation and
+    /// give the provider a bounded moment to stop on its own before the
+    /// process tree is terminated. The turn still fails with
+    /// [`crate::RuntimeError::Cancelled`]; this only lets the harness unwind
+    /// its own tool processes and persist session state first. Requires
+    /// [`CommandSpec::interactive_stdin`].
+    fn interrupt_request(&self, state: &AdapterState) -> Option<Vec<u8>> {
+        let _ = state;
+        None
+    }
 
     /// Encode a provider-native approval response.
     fn approval_response(

@@ -778,6 +778,16 @@ pub enum TurnEvent {
     PlanApprovalRequested(ApprovalRequest),
     /// The agent asked the user a question.
     QuestionRequested(QuestionRequest),
+    /// The agent asked a question the turn did not wait on.
+    ///
+    /// Some harnesses can ask a question without blocking their own turn
+    /// (Codex app-server sends `item/tool/requestUserInput` with
+    /// `isBlocking: false`). The runtime tells the provider immediately that
+    /// no answer is available yet and keeps the turn running, so this event is
+    /// never resolved through [`InteractionHandler::answer`]. Applications
+    /// should render it as an open question and deliver the user's eventual
+    /// answer as a follow-up prompt in the next turn.
+    AsyncQuestionRequested(QuestionRequest),
     /// Token or cost update.
     Usage(Usage),
     /// Provider-account quota usage changed or was refreshed.
@@ -903,6 +913,12 @@ pub struct QuestionOption {
 pub enum ApprovalDecision {
     /// Permit the operation.
     Allow,
+    /// Permit the operation and comparable ones for the rest of the session.
+    ///
+    /// Providers that expose a session-scoped approval (Codex app-server's
+    /// `acceptForSession`) use it; the remaining adapters treat this exactly
+    /// like [`ApprovalDecision::Allow`] for this one operation.
+    AllowForSession,
     /// Reject the operation with an optional explanation.
     Deny {
         /// Explanation returned to the agent.
