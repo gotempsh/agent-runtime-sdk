@@ -658,6 +658,7 @@ impl AgentAdapter for Codex {
 
     fn launch_context_capabilities(&self) -> LaunchContextCapabilities {
         LaunchContextCapabilities {
+            system_prompt_append: self.app_server_mode(),
             stdio_mcp: true,
             http_mcp: true,
             ..LaunchContextCapabilities::default()

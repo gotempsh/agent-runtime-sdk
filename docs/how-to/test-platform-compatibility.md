@@ -53,3 +53,7 @@ Real CLI checks now also cover extensionless npm command names on Windows,
 resolved against the child PATH before spawning. OpenCode serve readiness uses
 `/global/health` and requires a healthy JSON response; `/app` is a web UI route
 in current versions and is not an API readiness check. Each probe is bounded.
+
+Fleet launch-context checks include additional developer instructions on new
+and resumed Codex app-server threads; this preserves Fleet model identity
+instructions without rejecting the first turn before it reaches the provider.

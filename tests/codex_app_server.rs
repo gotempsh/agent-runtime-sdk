@@ -694,3 +694,19 @@ async fn a_resumed_thread_reuses_its_identifier_without_restarting_the_session()
         "a resumed thread is not a new session"
     );
 }
+
+#[tokio::test]
+async fn developer_instructions_reach_new_and_resumed_threads() {
+    for resumed in [false, true] {
+        let transport = AppServer::new(Script::Approval);
+        let runtime = runtime(transport.clone());
+        let responder = Responder::new(ApprovalDecision::Allow, None);
+        let mut request = request();
+        let instructions = "Fleet identity\nKeep \"quoted\" instructions intact.";
+        request.launch_context.system_prompt_append = Some(instructions.into());
+        if resumed { request.session_id = Some("thread-fixture".into()); }
+        runtime.run(request, &Collector::default(), Some(&responder)).await.unwrap();
+        let method = if resumed { "thread/resume" } else { "thread/start" };
+        assert_eq!(transport.method_frame(method).unwrap()["params"]["developerInstructions"], instructions);
+    }
+}

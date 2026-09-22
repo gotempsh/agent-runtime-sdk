@@ -145,6 +145,9 @@ pub(super) fn prepare_turn(request: &TurnRequest, state: &mut AdapterState) -> R
         "sandbox": sandbox,
         "approvalPolicy": approval,
     });
+    if let Some(instructions) = request.launch_context.system_prompt_append.as_deref() {
+        thread_params["developerInstructions"] = json!(instructions);
+    }
     if let Some(model) = request.model.as_deref() {
         thread_params["model"] = json!(model);
     }
