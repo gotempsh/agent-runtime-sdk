@@ -65,8 +65,37 @@ fn allowed_environment_key(name: &OsStr, windows: bool) -> bool {
     }
 }
 
+#[cfg(windows)]
+fn windows_program(spec: &CommandSpec) -> std::path::PathBuf {
+    // CreateProcess only searches .exe for a bare name. npm installs .cmd
+    // launchers; resolve those against the effective child PATH before letting
+    // Rust handle batch-file argument escaping.
+    if spec.program.components().count() != 1 || spec.program.extension().is_some() {
+        return spec.program.clone();
+    }
+    let path = spec.environment.iter()
+        .find(|(key, _)| key.to_string_lossy().eq_ignore_ascii_case("PATH"))
+        .map(|(_, value)| value.clone())
+        .or_else(|| std::env::var_os("PATH"));
+    if let Some(path) = path {
+        for directory in std::env::split_paths(&path) {
+            for extension in ["exe", "cmd", "bat", "com"] {
+                let candidate = directory.join(&spec.program).with_extension(extension);
+                if candidate.is_file() {
+                    return candidate;
+                }
+            }
+        }
+    }
+    spec.program.clone()
+}
+
 pub(crate) fn spawn(spec: &CommandSpec, cwd: &std::path::Path) -> std::io::Result<Child> {
-    let mut command = Command::new(&spec.program);
+    #[cfg(windows)]
+    let program = windows_program(spec);
+    #[cfg(not(windows))]
+    let program = spec.program.clone();
+    let mut command = Command::new(program);
     command.args(&spec.args).current_dir(cwd);
     if spec.clear_environment {
         let preserved =
@@ -266,6 +295,14 @@ mod tests {
         ];
         let mut spec = CommandSpec::new(program);
         spec.args = args.iter().map(std::ffi::OsString::from).collect();
+        // Exercise bare-name discovery with a per-command PATH, without
+        // mutating the test process environment or borrowing installed CLIs.
+        #[cfg(windows)]
+        if program.components().count() == 1 {
+            let inherited = std::env::var_os("PATH").unwrap_or_default();
+            let paths = std::iter::once(cwd.to_path_buf()).chain(std::env::split_paths(&inherited));
+            spec.environment.insert("Path".into(), std::env::join_paths(paths).unwrap());
+        }
         spec.environment
             .insert("SDK_LAUNCH_TEST".into(), "explicit".into());
         let mut child = spawn(&spec, cwd).expect("launch provider fixture");
@@ -317,6 +354,7 @@ mod tests {
             )
             .expect("write cmd shim");
             assert_launch(&shim, root.path()).await;
+            assert_launch(std::path::Path::new(name), root.path()).await;
         }
 
         let mut spec = CommandSpec::new(&binary);

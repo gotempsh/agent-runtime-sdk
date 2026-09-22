@@ -48,3 +48,8 @@ A successful cross-compilation or fixture run does not certify these journeys.
   sandbox to make a platform test pass.
 - Windows OS-service installation is an application responsibility, outside
   this library's provider launch contract.
+
+Real CLI checks now also cover extensionless npm command names on Windows,
+resolved against the child PATH before spawning. OpenCode serve readiness uses
+`/global/health` and requires a healthy JSON response; `/app` is a web UI route
+in current versions and is not an API readiness check. Each probe is bounded.

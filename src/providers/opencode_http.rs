@@ -179,8 +179,8 @@ async fn run_bridge(port: u16, incoming: DuplexStream, outgoing: DuplexStream) {
 /// Poll a cheap, always-safe endpoint until the server answers.
 async fn wait_until_ready(port: u16) -> std::result::Result<(), String> {
     for attempt in 0..READINESS_ATTEMPTS {
-        match perform(port, "GET", "/app", None).await {
-            Ok((status, _)) if status < 500 => return Ok(()),
+        match tokio::time::timeout(Duration::from_secs(1), perform(port, "GET", "/global/health", None)).await {
+            Ok(Ok((200, body))) if body.get("healthy").and_then(Value::as_bool) == Some(true) => return Ok(()),
             // Connection refused while the server is still binding its port is
             // expected for the first attempts.
             _ => {}
@@ -650,8 +650,10 @@ mod tests {
                           1\r\n\n\r\n"
                     } else if request.starts_with("POST") {
                         b"HTTP/1.1 200 OK\r\nContent-Length: 14\r\n\r\n{\"ok\":\"yes\"}\r\n"
+                    } else if request.starts_with("GET /global/health ") {
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 16\r\n\r\n{\"healthy\":true}"
                     } else {
-                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}"
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 2\r\n\r\n{}"
                     };
                     let _ = socket.write_all(response).await;
                     let _ = socket.flush().await;
@@ -725,7 +727,7 @@ mod tests {
                     return;
                 }
                 let _ = socket
-                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}")
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 16\r\n\r\n{\"healthy\":true}")
                     .await;
             }
         });

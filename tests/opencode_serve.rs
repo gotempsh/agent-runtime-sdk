@@ -1,7 +1,7 @@
 //! Served-OpenCode coverage against a scripted `opencode serve`.
 //!
 //! The fixture is a real HTTP server bound to the very port the adapter
-//! reserved for the turn, speaking the real protocol: `/app` for readiness,
+//! reserved for the turn, speaking the real protocol: `/global/health` for readiness,
 //! `/session` to open one, `/event` as a chunked Server-Sent Events stream,
 //! `/session/{id}/message` to prompt, and
 //! `/session/{id}/permissions/{id}` to answer a permission. Nothing here
@@ -287,7 +287,11 @@ async fn handle(mut socket: TcpStream, script: Script, requests: Arc<Mutex<Vec<R
         stream_events(socket, script, requests).await;
         return;
     }
-    let payload = if path.starts_with("/session?") || path == "/session" {
+    let payload = if path == "/global/health" {
+        json!({"healthy": true}).to_string()
+    } else if path == "/app" {
+        "<!doctype html><html>OpenCode UI</html>".to_string()
+    } else if path.starts_with("/session?") || path == "/session" {
         json!({"id": "session-fixture", "title": "Fixture session"}).to_string()
     } else {
         json!({}).to_string()
