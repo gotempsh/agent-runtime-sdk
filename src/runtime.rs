@@ -2881,6 +2881,20 @@ impl AgentRuntime {
             }
         } else if provider == Provider::OpenCode {
             if let Some(candidate) = existing.clone() {
+                // Handshake parsing can record a terminal failure. Keep it in
+                // disposable state until every pre-prompt step succeeds so a
+                // replacement never inherits failure from the stale server.
+                let mut preflight_state = AdapterState::default();
+                preflight_state
+                    .result
+                    .session_id
+                    .clone_from(&request.session_id);
+                adapter.prepare_retained_turn(
+                    request,
+                    &mut preflight_state,
+                    candidate.process_hint,
+                )?;
+                adapter.mark_retained_turn(&mut preflight_state);
                 events
                     .emit(TurnEvent::ProviderProcessStatus {
                         status: crate::ProviderProcessStatus::Checking,
@@ -2930,7 +2944,7 @@ impl AgentRuntime {
                         if kind.as_deref() == Some("@subscribed") {
                             break Ok::<_, RuntimeError>((writer, reader, line, pending_events));
                         }
-                        let output = adapter.parse_line(&line, &mut state)?;
+                        let output = adapter.parse_line(&line, &mut preflight_state)?;
                         if output.terminal || output.interaction.is_some() {
                             return Err(RuntimeError::Protocol {
                                 provider,
@@ -2949,6 +2963,7 @@ impl AgentRuntime {
                 })
                 .await;
                 if let Ok(Ok((writer, reader, line, pending_events))) = health {
+                    state = preflight_state;
                     prepared_protocol_streams = Some((writer, reader));
                     prefetched_line = Some(line);
                     preflight_events = pending_events;

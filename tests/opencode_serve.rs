@@ -47,6 +47,8 @@ enum Script {
     SessionHang,
     /// Hang the second session lookup; the replacement process answers it.
     SessionHangOnce,
+    /// Close the second session lookup; the replacement process answers it.
+    SessionCloseOnce,
 }
 
 /// One request the SDK made, recorded for assertions.
@@ -340,11 +342,11 @@ async fn handle(
     if script == Script::SessionHang && (path.starts_with("/session?") || path == "/session") {
         std::future::pending::<()>().await;
     }
-    if script == Script::SessionHangOnce
-        && (path.starts_with("/session?")
-            || path == "/session"
-            || path.split('?').next() == Some("/session/session-fixture"))
-        && requests
+    let is_session_lookup = path.starts_with("/session?")
+        || path == "/session"
+        || path.split('?').next() == Some("/session/session-fixture");
+    let session_lookup_count = || {
+        requests
             .lock()
             .unwrap()
             .iter()
@@ -352,9 +354,12 @@ async fn handle(
                 request.path.starts_with("/session") && !request.path.contains("/message")
             })
             .count()
-            == 2
-    {
+    };
+    if script == Script::SessionHangOnce && is_session_lookup && session_lookup_count() == 2 {
         std::future::pending::<()>().await;
+    }
+    if script == Script::SessionCloseOnce && is_session_lookup && session_lookup_count() == 2 {
+        return;
     }
     let payload = if path == "/global/health" {
         json!({"healthy": true}).to_string()
@@ -431,7 +436,10 @@ async fn stream_events(mut socket: TcpStream, script: Script, requests: Arc<Mute
         return;
     }
 
-    if matches!(script, Script::Complete | Script::SessionHangOnce)
+    if matches!(
+        script,
+        Script::Complete | Script::SessionHangOnce | Script::SessionCloseOnce
+    )
         && !send(&mut socket, &json!({"type":"message.part.updated","properties":{"sessionID":"session-fixture","part":{"id":"part-1","messageID":"message-1","type":"text","text":"fixture reply"}}})).await { return; }
 
     if script == Script::Permission {
@@ -925,6 +933,39 @@ async fn retained_replaces_when_session_setup_hangs_before_prompt() {
             .wait()
             .await
             .unwrap();
+    }
+    assert_eq!(server.spawns.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        server
+            .requests()
+            .iter()
+            .filter(|request| request.path.contains("/message"))
+            .count(),
+        2
+    );
+    client
+        .dispose(&RuntimeId::new("retained-opencode").unwrap())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn retained_replaces_after_preprompt_bridge_error_without_stale_failure() {
+    use temps_agent_runtime::{
+        lifecycle::{InvocationId, RuntimeId},
+        retained::{RuntimeClient, TurnInput},
+    };
+    let server = Server::new(Script::SessionCloseOnce);
+    let (client, handle) = retained_fixture(&server, Duration::from_secs(30)).await;
+    for id in ["first", "second"] {
+        let result = handle
+            .start_turn(TurnInput::new(InvocationId::new(id).unwrap(), id))
+            .await
+            .unwrap()
+            .wait()
+            .await
+            .unwrap();
+        assert_eq!(result.text, "fixture reply");
     }
     assert_eq!(server.spawns.load(Ordering::SeqCst), 2);
     assert_eq!(
