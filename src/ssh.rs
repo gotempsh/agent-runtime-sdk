@@ -2,7 +2,9 @@
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
+#[cfg(unix)]
 use std::fs::OpenOptions;
+#[cfg(unix)]
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -27,6 +29,7 @@ use crate::{
 const STDERR_CAPTURE_BYTES: usize = 32 * 1024;
 const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(8);
 static NEXT_PROCESS_ID: AtomicU64 = AtomicU64::new(1);
+#[cfg(unix)]
 static NEXT_ASKPASS_ID: AtomicU64 = AtomicU64::new(1);
 const ASKPASS_PASSWORD_ENV: &str = "TEMPS_AGENT_RUNTIME_SSH_PASSWORD";
 const LOGIN_ENVIRONMENT_MARKER: &[u8] = b"\0TEMPS_AGENT_RUNTIME_LOGIN_ENV\0";

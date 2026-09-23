@@ -47,3 +47,8 @@ Keep pull requests focused and describe:
 
 By contributing, you agree that your contributions are licensed under the
 project's MIT OR Apache-2.0 terms.
+
+## Platform compatibility
+
+See [Linux and Windows runtime testing](docs/how-to/test-platform-compatibility.md)
+for native launch fixtures and the separate authenticated-provider acceptance checks.
