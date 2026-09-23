@@ -146,6 +146,8 @@ and questions are left unanswered. Production applications should implement
 `InteractionHandler` and connect it to their durable approval workflow.
 
 For a complete walkthrough, read the [quickstart](docs/tutorials/quickstart.md).
+For long Codex threads, read [Resume large Codex conversations](docs/how-to/resume-large-codex-conversations.md).
+
 For sandbox setup, read [Manage Nono sandboxes](docs/how-to/nono.md) or
 [Implement a sandbox backend](docs/how-to/custom-sandbox.md). For durable
 profile updates and retry, read
