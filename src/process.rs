@@ -294,6 +294,10 @@ mod tests {
             r#"{"mcpServers":{"test":{"url":"http://127.0.0.1:1234/mcp"}}}"#,
             "project with spaces",
             "héllo",
+            "a&b|c<d>e^f",
+            "%PATH% !SDK_LAUNCH_TEST!",
+            "a\"b & echo injected",
+            "trailing slash\\",
         ];
         let mut spec = CommandSpec::new(program);
         spec.args = args.iter().map(std::ffi::OsString::from).collect();
@@ -358,6 +362,15 @@ mod tests {
             .expect("write cmd shim");
             assert_launch(&shim, root.path()).await;
             assert_launch(std::path::Path::new(name), root.path()).await;
+            // Batch files cannot represent literal newlines safely. Rust must
+            // reject them before starting the shell instead of interpreting
+            // the remainder as another command.
+            for argument in ["line\nnext", "line\rnext"] {
+                let mut invalid = CommandSpec::new(&shim);
+                invalid.args.push(argument.into());
+                let error = spawn(&invalid, root.path()).expect_err("reject batch newline");
+                assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+            }
         }
 
         let mut spec = CommandSpec::new(&binary);

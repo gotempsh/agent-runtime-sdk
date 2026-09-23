@@ -1136,36 +1136,26 @@ impl AgentRuntime {
                 working_directory,
             })
             .await?;
-        if let Some(initial) = initial_stdin {
-            let Some(mut stdin) = process.take_stdin() else {
-                let _ = process.terminate().await;
-                return Err(extension_transport_error(
-                    self.transport.name(),
-                    operation,
-                    "the extension command did not expose stdin",
-                    false,
-                ));
-            };
-            stdin.write_all(&initial).await.map_err(|error| {
-                extension_transport_error(
-                    self.transport.name(),
-                    operation,
-                    format!("could not write extension content: {error}"),
-                    true,
-                )
-            })?;
-            stdin.flush().await.map_err(|error| {
-                extension_transport_error(
-                    self.transport.name(),
-                    operation,
-                    format!("could not flush extension content: {error}"),
-                    true,
-                )
-            })?;
-            drop(stdin);
-        } else {
-            drop(process.take_stdin());
-        }
+        // A rejecting command may close stdin before reading the content.
+        // Keep its exit status and stderr authoritative rather than returning
+        // a timing-dependent broken-pipe error and hiding the rejection.
+        let stdin = process.take_stdin();
+        let write_input = async move {
+            if let Some(initial) = initial_stdin {
+                let Some(mut stdin) = stdin else {
+                    return Err("the extension command did not expose stdin".to_string());
+                };
+                stdin
+                    .write_all(&initial)
+                    .await
+                    .map_err(|error| format!("could not write extension content: {error}"))?;
+                stdin
+                    .flush()
+                    .await
+                    .map_err(|error| format!("could not flush extension content: {error}"))?;
+            }
+            Ok::<_, String>(())
+        };
         let Some(stdout) = process.take_stdout() else {
             let _ = process.terminate().await;
             return Err(extension_transport_error(
@@ -1179,16 +1169,24 @@ impl AgentRuntime {
             .take_stderr()
             .map(|stderr| tokio::spawn(crate::process::bounded_stderr(stderr, STDERR_TAIL_BYTES)));
         let run = async {
-            let mut output = Vec::new();
-            stdout
-                .take((max_bytes + 1) as u64)
-                .read_to_end(&mut output)
-                .await
-                .map_err(|error| error.to_string())?;
-            if output.len() > max_bytes {
-                return Err(format!("command output exceeded {max_bytes} bytes"));
-            }
+            let read_output = async {
+                let mut output = Vec::new();
+                stdout
+                    .take((max_bytes + 1) as u64)
+                    .read_to_end(&mut output)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                if output.len() > max_bytes {
+                    return Err(format!("command output exceeded {max_bytes} bytes"));
+                }
+                Ok::<_, String>(output)
+            };
+            let (output, input_result) = tokio::join!(read_output, write_input);
+            let output = output?;
             let status = process.wait().await.map_err(|error| error.message)?;
+            if status.success {
+                input_result?;
+            }
             Ok::<_, String>((output, status))
         };
         let result = tokio::time::timeout(timeout, run).await;
@@ -3264,8 +3262,27 @@ mod tests {
             .expect_err("a project-controlled symlink must not redirect skill writes");
 
         assert_eq!(error.kind, TransportErrorKind::ProcessControlFailed);
-        assert!(error.message.contains("symlink component"));
+        assert!(error.message.contains("symlink component"), "{error:?}");
         assert!(!outside.path().join("skills/review/SKILL.md").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn extension_rejection_preserves_stderr_when_stdin_is_not_consumed() {
+        let workspace = tempfile::tempdir().unwrap();
+        let runtime = AgentRuntime::builder().build().unwrap();
+        let mut command = CommandSpec::new("/bin/sh");
+        command.args = vec![
+            "-c".into(),
+            "printf 'specific rejection' >&2; exit 78".into(),
+        ];
+        command.initial_stdin = Some(vec![b'x'; 1024 * 1024]);
+        let error = runtime
+            .execute_extension_command(command, workspace.path().into(), "test_rejection")
+            .await
+            .expect_err("the command rejects input");
+        assert!(error.message.contains("specific rejection"), "{error:?}");
+        assert!(!error.retryable);
     }
 
     #[test]
