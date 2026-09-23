@@ -2539,12 +2539,16 @@ impl AgentRuntime {
                 .map_err(|source| RuntimeError::Transport { provider, source })?;
             match tokio::time::timeout(ATTACHED_SHUTDOWN_GRACE, process.wait()).await {
                 Ok(status) => {
-                    let status = status.map_err(|source| RuntimeError::Transport { provider, source })?;
+                    let status =
+                        status.map_err(|source| RuntimeError::Transport { provider, source })?;
                     // An intentional server shutdown can exit by signal (Unix)
                     // or a nonzero termination code (Windows). Only a terminal
                     // protocol event makes that expected; EOF alone is not success.
                     if protocol_completed {
-                        TransportExitStatus { success: true, code: None }
+                        TransportExitStatus {
+                            success: true,
+                            code: None,
+                        }
                     } else {
                         status
                     }

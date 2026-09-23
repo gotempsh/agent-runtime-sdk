@@ -179,8 +179,15 @@ async fn run_bridge(port: u16, incoming: DuplexStream, outgoing: DuplexStream) {
 /// Poll a cheap, always-safe endpoint until the server answers.
 async fn wait_until_ready(port: u16) -> std::result::Result<(), String> {
     for attempt in 0..READINESS_ATTEMPTS {
-        match tokio::time::timeout(Duration::from_secs(1), perform(port, "GET", "/global/health", None)).await {
-            Ok(Ok((200, body))) if body.get("healthy").and_then(Value::as_bool) == Some(true) => return Ok(()),
+        match tokio::time::timeout(
+            Duration::from_secs(1),
+            perform(port, "GET", "/global/health", None),
+        )
+        .await
+        {
+            Ok(Ok((200, body))) if body.get("healthy").and_then(Value::as_bool) == Some(true) => {
+                return Ok(())
+            }
             // Connection refused while the server is still binding its port is
             // expected for the first attempts.
             _ => {}

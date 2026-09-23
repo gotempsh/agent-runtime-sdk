@@ -73,7 +73,9 @@ fn windows_program(spec: &CommandSpec) -> std::path::PathBuf {
     if spec.program.components().count() != 1 || spec.program.extension().is_some() {
         return spec.program.clone();
     }
-    let path = spec.environment.iter()
+    let path = spec
+        .environment
+        .iter()
         .find(|(key, _)| key.to_string_lossy().eq_ignore_ascii_case("PATH"))
         .map(|(_, value)| value.clone())
         .or_else(|| std::env::var_os("PATH"));
@@ -301,7 +303,8 @@ mod tests {
         if program.components().count() == 1 {
             let inherited = std::env::var_os("PATH").unwrap_or_default();
             let paths = std::iter::once(cwd.to_path_buf()).chain(std::env::split_paths(&inherited));
-            spec.environment.insert("Path".into(), std::env::join_paths(paths).unwrap());
+            spec.environment
+                .insert("Path".into(), std::env::join_paths(paths).unwrap());
         }
         spec.environment
             .insert("SDK_LAUNCH_TEST".into(), "explicit".into());
