@@ -13,8 +13,9 @@ impl StartupObserver for Timings {
     fn observe(&self, timing: StartupTiming) {
         // For production exporters, use a bounded channel's try_send here.
         // Keep this callback quick: it runs on the execution task.
-        eprintln!("{} {:?} {:?} {:?}", timing.observation_id,
-                  timing.provider, timing.stage, timing.elapsed);
+        eprintln!("{} {:?} {:?} elapsed={:?} event_delivery={:?}",
+                  timing.observation_id, timing.provider, timing.stage,
+                  timing.elapsed, timing.event_delivery_elapsed);
     }
 }
 
@@ -25,7 +26,7 @@ let runtime = AgentRuntime::builder()
 ```
 
 Samples contain only a process-local observation ID, provider, stage and monotonic
-elapsed duration. No prompt, path, provider session ID, account, environment value
+elapsed duration plus cumulative event-delivery wait. No prompt, path, provider session ID, account, environment value
 or error diagnostic is included. IDs distinguish concurrent runs, but do not
 survive a host restart and are not durable invocation identifiers. Treat observers
 as trusted: timing metadata can still reveal provider choice and activity. Do not
@@ -39,7 +40,23 @@ to locate waits:
 - The last preparation boundary to `ProcessSpawned`: transport process launch.
 - `ProcessSpawned` to `InitialInputWritten`: initial stdin flush, when present.
 - `StreamsAttached` to `FirstOutput`: waiting for the first provider output line.
-- `FirstOutput` to `FirstText`: protocol initialization and provider/model work.
+- `FirstOutput` to `FirstText`: time until the runtime parses its first nonempty
+  assistant text. This includes waits while delivering earlier events to the
+  application's consumer, not just protocol initialization and provider/model work.
+
+Each sample includes `event_delivery_elapsed`: cumulative time spent awaiting
+`EventSink::emit` before that boundary, including sink persistence, queue waits
+and scheduler delay during delivery. Subtract the change in this field from the
+change in `elapsed` between two samples to separate direct delivery waits. A
+consumer that spends five seconds persisting a session event can otherwise make
+already-buffered text appear five seconds late. Interrupted delivery is counted
+when its future is dropped, including on timeout.
+
+The remainder is still not pure model latency: parsing, provider protocol,
+observer and scheduler overhead remain. Backpressure may also indirectly delay
+the provider itself. The SDK deliberately keeps its existing bounded read and
+event-delivery loop; it does not add an unbounded background reader to manufacture
+an arrival timestamp.
 
 `FirstOutput` may be a handshake, warning or error. `InitialInputWritten` means
 bytes were flushed, not that a prompt was accepted. `StreamsAttached` is not
@@ -48,12 +65,21 @@ these boundaries. Only the first nonempty normalized text delta triggers
 `FirstText`, and a tool-only or failed turn may never reach it. These observations
 do not claim to separate MCP readiness from model latency yet.
 
-Exactly one terminal observation closes a polled run: `Succeeded`, `Failed`,
+A healthy observer receives one terminal observation for each polled run: `Succeeded`, `Failed`,
 `Cancelled`, `TimedOut`, or `Abandoned` when its future is dropped. Observation
 callbacks are synchronous and must not block. Use bounded export with dropped
 samples under overload; observer panics are contained under unwinding builds
-(the standard panic hook can still report them). As with other Rust panics,
-`panic=abort` terminates the process.
+(the standard panic hook can still report them). A panicking observer is disabled
+for that runtime and its clones, including later turns; callbacks already in
+flight may finish. A callback is never invoked during stack unwinding, so an
+abandoned run may have no terminal observation when its caller panics.
+
+Panic-payload cleanup runs inside a second containment boundary. If cleanup also
+panics, its secondary payload is intentionally retained rather than dropped again:
+this avoids recursively unwinding the host. Further calls are disabled, limiting
+this exceptional leak to callbacks already in flight at failure. With a disabled
+observer, telemetry can be incomplete while provider execution continues. As with
+other Rust panics, `panic=abort` terminates the process.
 
 For `run_with_sandbox_recovery`, each provider attempt receives a separate
 observation ID after sandbox policy resolution and concurrency admission. Its

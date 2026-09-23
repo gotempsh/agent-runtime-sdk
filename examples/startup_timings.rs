@@ -12,11 +12,12 @@ struct PrintTimings;
 impl StartupObserver for PrintTimings {
     fn observe(&self, sample: StartupTiming) {
         println!(
-            "run={} provider={:?} stage={:?} elapsed_ms={}",
+            "run={} provider={:?} stage={:?} elapsed_ms={} event_delivery_ms={}",
             sample.observation_id,
             sample.provider,
             sample.stage,
             sample.elapsed.as_millis(),
+            sample.event_delivery_elapsed.as_millis(),
         );
     }
 }

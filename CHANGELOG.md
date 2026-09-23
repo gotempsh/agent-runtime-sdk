@@ -24,6 +24,9 @@ Versioning and Keep a Changelog conventions.
 
 ### Added
 
+- Contain observer panic-payload cleanup failures and disable failed observers
+  across runtime clones. Report event-delivery wait separately from observed
+  first-text latency, preserving bounded backpressure.
 - Opt-in payload-free startup timing observers for validation, concurrency admission,
   sandbox preparation, process spawn, first output/text and terminal outcomes.
   Existing process lifetime and wire events are unchanged.

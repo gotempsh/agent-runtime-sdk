@@ -8,7 +8,7 @@ use tokio::sync::Semaphore;
 
 use crate::adapter::{AdapterState, AgentAdapter, CommandSpec, InteractionRequest};
 use crate::error::classify_provider_failure;
-use crate::startup::{StartupObserver, StartupStage, StartupTrace};
+use crate::startup::{StartupObserver, StartupObserverState, StartupStage, StartupTrace};
 use crate::{
     AccountUsageReport, DenyAll, EventSink, ExecutionTransport, HarnessAuthentication,
     HarnessCatalogError, HarnessCatalogErrorKind, HarnessCatalogStatus, HarnessControlGroup,
@@ -330,7 +330,7 @@ pub struct AgentRuntimeBuilder {
     concurrency_limit: usize,
     max_prompt_bytes: usize,
     max_event_line_bytes: usize,
-    startup_observer: Option<Arc<dyn StartupObserver>>,
+    startup_observer: Option<Arc<StartupObserverState>>,
 }
 
 impl AgentRuntimeBuilder {
@@ -396,7 +396,7 @@ impl AgentRuntimeBuilder {
     /// do not add provider events, change the remote protocol, or start extra
     /// processes. A resumed session still starts a fresh process in this driver.
     pub fn startup_observer(mut self, observer: Arc<dyn StartupObserver>) -> Self {
-        self.startup_observer = Some(observer);
+        self.startup_observer = Some(Arc::new(StartupObserverState::new(observer)));
         self
     }
 
@@ -737,7 +737,7 @@ pub struct AgentRuntime {
     permits: Arc<Semaphore>,
     max_prompt_bytes: usize,
     max_event_line_bytes: usize,
-    startup_observer: Option<Arc<dyn StartupObserver>>,
+    startup_observer: Option<Arc<StartupObserverState>>,
 }
 
 impl AgentRuntime {
@@ -2500,7 +2500,10 @@ impl AgentRuntime {
                     first_text = false;
                     trace.record(StartupStage::FirstText);
                 }
-                events.emit(event).await?;
+                {
+                    let _delivery = trace.event_delivery();
+                    events.emit(event).await?;
+                }
             }
             write_provider_frames(provider, stdin.as_mut(), &output.writes, "provider write")
                 .await?;
@@ -2704,6 +2707,7 @@ impl AgentRuntime {
             });
         }
         if state.result.text.is_empty() {
+            let _delivery = trace.event_delivery();
             events
                 .emit(TurnEvent::Warning {
                     message: format!("{provider} completed without a text response"),
@@ -4193,6 +4197,103 @@ mod tests {
             ] {
                 assert!(!diagnostic.contains(private));
             }
+        }
+
+        #[tokio::test]
+        async fn startup_timings_separate_event_delivery_from_first_text_latency() {
+            #[derive(Default)]
+            struct SlowEvents {
+                waited: Mutex<Duration>,
+            }
+            #[async_trait]
+            impl EventSink for SlowEvents {
+                async fn emit(&self, event: TurnEvent) -> Result<()> {
+                    if matches!(event, TurnEvent::SessionStarted { .. }) {
+                        let start = std::time::Instant::now();
+                        tokio::time::sleep(Duration::from_millis(40)).await;
+                        *self.waited.lock().unwrap() = start.elapsed();
+                    }
+                    Ok(())
+                }
+            }
+            let samples = Arc::new(TimingCollector::default());
+            let runtime = observed_runtime(
+                r#"printf '%s\n' '{"session":"test"}' '{"text":"done"}' '{"terminal":true}'"#,
+                samples.clone(),
+            );
+            let directory = tempfile::tempdir().unwrap();
+            let events = SlowEvents::default();
+            let result = runtime
+                .run(
+                    TurnRequest::new(Provider::Claude, directory.path(), "test"),
+                    &events,
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(result.text, "done");
+            let recorded = samples.samples.lock().unwrap();
+            let output = recorded
+                .iter()
+                .find(|s| s.stage == StartupStage::FirstOutput)
+                .unwrap();
+            let text = recorded
+                .iter()
+                .find(|s| s.stage == StartupStage::FirstText)
+                .unwrap();
+            let actual_wait = *events.waited.lock().unwrap();
+            assert!(actual_wait >= Duration::from_millis(40));
+            assert!(text.elapsed.checked_sub(output.elapsed).unwrap() >= actual_wait);
+            assert!(
+                text.event_delivery_elapsed
+                    .checked_sub(output.event_delivery_elapsed)
+                    .unwrap()
+                    >= actual_wait,
+                "first-text latency must separately report time spent delivering earlier events"
+            );
+            assert!(text.event_delivery_elapsed <= text.elapsed);
+        }
+
+        #[tokio::test]
+        async fn startup_timings_include_terminal_warning_delivery() {
+            #[derive(Default)]
+            struct SlowWarning {
+                waited: Mutex<Duration>,
+            }
+            #[async_trait]
+            impl EventSink for SlowWarning {
+                async fn emit(&self, event: TurnEvent) -> Result<()> {
+                    if matches!(event, TurnEvent::Warning { .. }) {
+                        let start = std::time::Instant::now();
+                        tokio::time::sleep(Duration::from_millis(40)).await;
+                        *self.waited.lock().unwrap() = start.elapsed();
+                    }
+                    Ok(())
+                }
+            }
+            let samples = Arc::new(TimingCollector::default());
+            let runtime = observed_runtime(r#"printf '%s\n' '{"terminal":true}'"#, samples.clone());
+            let directory = tempfile::tempdir().unwrap();
+            let events = SlowWarning::default();
+            let result = runtime
+                .run(
+                    TurnRequest::new(Provider::Claude, directory.path(), "test"),
+                    &events,
+                    None,
+                )
+                .await
+                .unwrap();
+            assert!(result.text.is_empty());
+            let recorded = samples.samples.lock().unwrap();
+            let terminal = recorded.last().unwrap();
+            assert_eq!(terminal.stage, StartupStage::Succeeded);
+            let actual_wait = *events.waited.lock().unwrap();
+            assert!(actual_wait >= Duration::from_millis(40));
+            assert!(
+                terminal.event_delivery_elapsed >= actual_wait,
+                "terminal warning delivery must be included in cumulative sink wait"
+            );
+            assert!(terminal.event_delivery_elapsed <= terminal.elapsed);
         }
 
         #[tokio::test]
