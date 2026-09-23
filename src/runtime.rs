@@ -1,10 +1,11 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::Semaphore;
+use tokio::sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore};
 
 use crate::adapter::{AdapterState, AgentAdapter, CommandSpec, InteractionRequest};
 use crate::error::classify_provider_failure;
@@ -57,6 +58,192 @@ const INTERRUPT_GRACE: Duration = Duration::from_secs(5);
 /// over adapter-supplied protocol streams. The process is already being
 /// stopped; this only bounds how long the turn waits to observe it.
 const ATTACHED_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
+/// Limits for opt-in Codex app-server process reuse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CodexProcessRetention {
+    /// Maximum native Codex processes retained by one [`AgentRuntime`].
+    pub max_processes: usize,
+    /// How long an idle process may remain alive after a completed turn.
+    pub idle_timeout: Duration,
+}
+
+impl CodexProcessRetention {
+    fn validate(self) -> Result<()> {
+        if self.max_processes == 0 {
+            return Err(RuntimeError::InvalidRequest {
+                field: "codex_process_retention.max_processes",
+                message: "must be greater than zero".to_string(),
+            });
+        }
+        if self.idle_timeout.is_zero() {
+            return Err(RuntimeError::InvalidRequest {
+                field: "codex_process_retention.idle_timeout",
+                message: "must be greater than zero".to_string(),
+            });
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct CodexProcessSupervisor {
+    inner: Arc<CodexProcessSupervisorInner>,
+}
+
+struct CodexProcessSupervisorInner {
+    config: CodexProcessRetention,
+    permits: Arc<Semaphore>,
+    processes: AsyncMutex<HashMap<crate::lifecycle::RuntimeId, Arc<RetainedCodexProcess>>>,
+}
+
+impl CodexProcessSupervisor {
+    fn new(config: CodexProcessRetention) -> Self {
+        Self {
+            inner: Arc::new(CodexProcessSupervisorInner {
+                config,
+                permits: Arc::new(Semaphore::new(config.max_processes)),
+                processes: AsyncMutex::new(HashMap::new()),
+            }),
+        }
+    }
+
+    async fn dispose(&self, runtime_id: &crate::lifecycle::RuntimeId) -> Result<()> {
+        let process = self.inner.processes.lock().await.remove(runtime_id);
+        if let Some(process) = process {
+            process.terminate().await?;
+        }
+        Ok(())
+    }
+
+    async fn remove_if_same(
+        &self,
+        runtime_id: &crate::lifecycle::RuntimeId,
+        expected: &Arc<RetainedCodexProcess>,
+    ) {
+        let mut processes = self.inner.processes.lock().await;
+        if processes
+            .get(runtime_id)
+            .is_some_and(|current| Arc::ptr_eq(current, expected))
+        {
+            processes.remove(runtime_id);
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct RetainedCodexFingerprint {
+    command: CommandSpec,
+    working_directory: PathBuf,
+    model: Option<String>,
+    reasoning: Option<String>,
+    permission_mode: crate::PermissionMode,
+    harness_options: BTreeMap<String, String>,
+    launch_context: crate::LaunchContext,
+    auto_compaction: crate::AutoCompactionPolicy,
+    required_sandbox_capabilities: crate::SandboxCapabilities,
+}
+
+struct RetainedCodexProcess {
+    fingerprint: RetainedCodexFingerprint,
+    io: AsyncMutex<Option<RetainedCodexIo>>,
+    generation: AtomicU64,
+    usable: AtomicBool,
+    _permit: OwnedSemaphorePermit,
+}
+
+struct RetainedCodexIo {
+    process: crate::TransportProcess,
+    stdin: crate::TransportWriter,
+    reader: BufReader<crate::TransportReader>,
+    stderr_task: tokio::task::JoinHandle<std::io::Result<String>>,
+}
+
+async fn read_bounded_retained_line(
+    reader: &mut BufReader<crate::TransportReader>,
+    limit: usize,
+) -> std::io::Result<Option<String>> {
+    let mut bytes = Vec::new();
+    loop {
+        let available = tokio::io::AsyncBufReadExt::fill_buf(reader).await?;
+        if available.is_empty() {
+            if bytes.is_empty() {
+                return Ok(None);
+            }
+            break;
+        }
+        let take = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(available.len(), |position| position + 1);
+        if bytes.len().saturating_add(take) > limit.saturating_add(1) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "provider event line exceeded configured limit",
+            ));
+        }
+        let ended = available.get(take.saturating_sub(1)) == Some(&b'\n');
+        bytes.extend_from_slice(&available[..take]);
+        tokio::io::AsyncBufReadExt::consume(reader, take);
+        if ended {
+            bytes.pop();
+            if bytes.last() == Some(&b'\r') {
+                bytes.pop();
+            }
+            break;
+        }
+    }
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()))
+}
+
+impl RetainedCodexProcess {
+    async fn terminate(&self) -> Result<()> {
+        self.usable.store(false, Ordering::Release);
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        if let Some(mut io) = self.io.lock().await.take() {
+            io.stderr_task.abort();
+            io.process
+                .terminate()
+                .await
+                .map_err(|source| RuntimeError::Transport {
+                    provider: Provider::Codex,
+                    source,
+                })?;
+        }
+        Ok(())
+    }
+}
+
+struct RetainedTurnCleanup {
+    armed: bool,
+    supervisor: CodexProcessSupervisor,
+    runtime_id: crate::lifecycle::RuntimeId,
+    process: Arc<RetainedCodexProcess>,
+}
+
+impl RetainedTurnCleanup {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for RetainedTurnCleanup {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.process.usable.store(false, Ordering::Release);
+        let supervisor = self.supervisor.clone();
+        let runtime_id = self.runtime_id.clone();
+        let process = Arc::clone(&self.process);
+        tokio::spawn(async move {
+            supervisor.remove_if_same(&runtime_id, &process).await;
+            let _ = process.terminate().await;
+        });
+    }
+}
 
 /// Write newline-terminated provider frames to an interactive stdin.
 async fn write_provider_frames(
@@ -331,6 +518,7 @@ pub struct AgentRuntimeBuilder {
     max_prompt_bytes: usize,
     max_event_line_bytes: usize,
     startup_observer: Option<Arc<StartupObserverState>>,
+    codex_process_retention: Option<CodexProcessRetention>,
 }
 
 impl AgentRuntimeBuilder {
@@ -344,6 +532,7 @@ impl AgentRuntimeBuilder {
             max_prompt_bytes: DEFAULT_MAX_PROMPT_BYTES,
             max_event_line_bytes: DEFAULT_MAX_EVENT_LINE_BYTES,
             startup_observer: None,
+            codex_process_retention: None,
         };
         #[cfg(feature = "claude")]
         builder.register(crate::providers::Claude::default());
@@ -400,6 +589,16 @@ impl AgentRuntimeBuilder {
         self
     }
 
+    /// Keep opted-in Codex app-server processes across retained-runtime turns.
+    ///
+    /// Ordinary [`AgentRuntime::run`] calls preserve their existing
+    /// one-process-per-turn behavior. This setting is used only by the
+    /// in-process retained-runtime client.
+    pub fn codex_process_retention(mut self, config: CodexProcessRetention) -> Self {
+        self.codex_process_retention = Some(config);
+        self
+    }
+
     /// Validate limits and construct the runtime.
     pub fn build(self) -> Result<AgentRuntime> {
         if self.concurrency_limit == 0 {
@@ -414,6 +613,9 @@ impl AgentRuntimeBuilder {
                 message: "prompt and event-line limits must be greater than zero".to_string(),
             });
         }
+        if let Some(config) = self.codex_process_retention {
+            config.validate()?;
+        }
         Ok(AgentRuntime {
             adapters: self.adapters,
             transport: self.transport,
@@ -421,6 +623,9 @@ impl AgentRuntimeBuilder {
             max_prompt_bytes: self.max_prompt_bytes,
             max_event_line_bytes: self.max_event_line_bytes,
             startup_observer: self.startup_observer,
+            codex_process_retention: self
+                .codex_process_retention
+                .map(CodexProcessSupervisor::new),
         })
     }
 }
@@ -738,6 +943,7 @@ pub struct AgentRuntime {
     max_prompt_bytes: usize,
     max_event_line_bytes: usize,
     startup_observer: Option<Arc<StartupObserverState>>,
+    codex_process_retention: Option<CodexProcessSupervisor>,
 }
 
 impl AgentRuntime {
@@ -1918,8 +2124,57 @@ impl AgentRuntime {
         result
     }
 
+    pub(crate) fn codex_process_retention_enabled(&self, provider: Provider) -> bool {
+        provider == Provider::Codex
+            && self.codex_process_retention.is_some()
+            && self
+                .adapters
+                .get(&provider)
+                .is_some_and(|adapter| adapter.supports_retained_process())
+    }
+
+    pub(crate) async fn run_retained(
+        &self,
+        runtime_id: &crate::lifecycle::RuntimeId,
+        request: TurnRequest,
+        events: &dyn EventSink,
+        interactions: Option<&dyn InteractionHandler>,
+    ) -> Result<TurnResult> {
+        if !self.codex_process_retention_enabled(request.provider) {
+            return self.run(request, events, interactions).await;
+        }
+        let mut trace = StartupTrace::new(request.provider, self.startup_observer.clone());
+        let result = self
+            .run_inner_with_retention(Some(runtime_id), request, events, interactions, &trace)
+            .await;
+        trace.finish(&result);
+        result
+    }
+
+    pub(crate) async fn dispose_retained_process(
+        &self,
+        runtime_id: &crate::lifecycle::RuntimeId,
+    ) -> Result<()> {
+        if let Some(supervisor) = &self.codex_process_retention {
+            supervisor.dispose(runtime_id).await?;
+        }
+        Ok(())
+    }
+
     async fn run_inner(
         &self,
+        request: TurnRequest,
+        events: &dyn EventSink,
+        interactions: Option<&dyn InteractionHandler>,
+        trace: &StartupTrace,
+    ) -> Result<TurnResult> {
+        self.run_inner_with_retention(None, request, events, interactions, trace)
+            .await
+    }
+
+    async fn run_inner_with_retention(
+        &self,
+        retained_runtime_id: Option<&crate::lifecycle::RuntimeId>,
         request: TurnRequest,
         events: &dyn EventSink,
         interactions: Option<&dyn InteractionHandler>,
@@ -1984,25 +2239,45 @@ impl AgentRuntime {
         };
         trace.record(StartupStage::PermitAcquired);
         let timeout = request.timeout;
-        let result = tokio::time::timeout(
-            timeout,
-            self.run_process(
-                adapter,
-                &request,
-                events,
-                interactions.unwrap_or(&DenyAll),
-                trace,
-            ),
-        )
-        .await;
+        let process = async {
+            if let (Some(runtime_id), Some(supervisor)) =
+                (retained_runtime_id, &self.codex_process_retention)
+            {
+                self.run_retained_codex_process(
+                    supervisor,
+                    runtime_id,
+                    adapter,
+                    &request,
+                    events,
+                    interactions.unwrap_or(&DenyAll),
+                    trace,
+                )
+                .await
+            } else {
+                self.run_process(
+                    adapter,
+                    &request,
+                    events,
+                    interactions.unwrap_or(&DenyAll),
+                    trace,
+                )
+                .await
+            }
+        };
+        let result = tokio::time::timeout(timeout, process).await;
         drop(permit);
-        match result {
-            Ok(result) => result,
-            Err(_) => Err(RuntimeError::Timeout {
+        let Ok(result) = result else {
+            if let (Some(runtime_id), Some(supervisor)) =
+                (retained_runtime_id, &self.codex_process_retention)
+            {
+                supervisor.dispose(runtime_id).await?;
+            }
+            return Err(RuntimeError::Timeout {
                 provider,
                 seconds: timeout.as_secs(),
-            }),
-        }
+            });
+        };
+        result
     }
 
     /// Run a turn with opt-in, bounded recovery for an application-managed
@@ -2299,6 +2574,424 @@ impl AgentRuntime {
                 provider: request.provider,
                 source,
             })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_retained_codex_process(
+        &self,
+        supervisor: &CodexProcessSupervisor,
+        runtime_id: &crate::lifecycle::RuntimeId,
+        adapter: Arc<dyn AgentAdapter>,
+        request: &TurnRequest,
+        events: &dyn EventSink,
+        interactions: &dyn InteractionHandler,
+        trace: &StartupTrace,
+    ) -> Result<TurnResult> {
+        let provider = request.provider;
+        let has_runtime_process = supervisor
+            .inner
+            .processes
+            .lock()
+            .await
+            .contains_key(runtime_id);
+        let reserved_permit = if has_runtime_process {
+            None
+        } else {
+            match supervisor.inner.permits.clone().try_acquire_owned() {
+                Ok(permit) => Some(permit),
+                Err(_) => {
+                    // Decide the cold fallback before adapter or sandbox
+                    // preparation: preparation may own resources and is not
+                    // required to be side-effect-free.
+                    return self
+                        .run_process(adapter, request, events, interactions, trace)
+                        .await;
+                }
+            }
+        };
+        let mut state = AdapterState::default();
+        state.result.session_id.clone_from(&request.session_id);
+        adapter.prepare_turn(request, &mut state)?;
+        adapter.mark_retained_turn(&mut state);
+        let mut spec = adapter.command_for_turn(request, &state)?;
+        for (name, value) in &request.environment {
+            spec.environment.insert(name.into(), value.expose().into());
+        }
+        trace.record(StartupStage::CommandPrepared);
+        if let Some(sandbox) = &request.sandbox {
+            let context = SandboxContext {
+                provider,
+                working_directory: request.working_directory.clone(),
+            };
+            spec = tokio::select! {
+                _ = request.cancellation.cancelled() => return Err(RuntimeError::Cancelled { provider }),
+                prepared = sandbox.prepare(context, spec) => prepared?,
+            };
+            trace.record(StartupStage::SandboxPrepared);
+        }
+        let capabilities = self.transport.capabilities();
+        if !spec.interactive_stdin || !capabilities.interactive_stdin {
+            return Err(RuntimeError::TransportCapabilityUnavailable {
+                provider,
+                transport: self.transport.name().to_string(),
+                capability: "interactive_stdin",
+                message: "retained Codex requires writable provider stdin".to_string(),
+            });
+        }
+        if !capabilities.process_tree_termination {
+            return Err(RuntimeError::TransportCapabilityUnavailable {
+                provider,
+                transport: self.transport.name().to_string(),
+                capability: "process_tree_termination",
+                message: "retained Codex requires complete process-tree termination".to_string(),
+            });
+        }
+        let fingerprint = RetainedCodexFingerprint {
+            command: spec.clone(),
+            working_directory: request.working_directory.clone(),
+            model: request.model.clone(),
+            reasoning: request.reasoning.clone(),
+            permission_mode: request.permission_mode.clone(),
+            harness_options: request.harness_options.clone(),
+            launch_context: request.launch_context.clone(),
+            auto_compaction: request.auto_compaction,
+            required_sandbox_capabilities: request.required_sandbox_capabilities,
+        };
+
+        let previous = {
+            let mut processes = supervisor.inner.processes.lock().await;
+            match processes.get(runtime_id) {
+                Some(process)
+                    if process.fingerprint == fingerprint
+                        && process.usable.load(Ordering::Acquire) =>
+                {
+                    None
+                }
+                Some(_) => processes.remove(runtime_id),
+                None => None,
+            }
+        };
+        if let Some(previous) = previous {
+            previous.terminate().await?;
+        }
+
+        let existing = supervisor
+            .inner
+            .processes
+            .lock()
+            .await
+            .get(runtime_id)
+            .cloned();
+        let retained = if let Some(existing) = existing {
+            existing
+        } else {
+            let permit = if let Some(permit) = reserved_permit {
+                permit
+            } else {
+                supervisor
+                    .inner
+                    .permits
+                    .clone()
+                    .try_acquire_owned()
+                    .map_err(|_| RuntimeError::Transport {
+                        provider,
+                        source: TransportError::new(
+                            TransportErrorKind::SpawnFailed,
+                            self.transport.name(),
+                            "retain_process",
+                            "retained Codex capacity changed while preparing the process",
+                            true,
+                        ),
+                    })?
+            };
+            let program = spec.program.clone();
+            let mut process = self
+                .transport
+                .spawn(TransportSpawnRequest {
+                    command: spec.clone(),
+                    working_directory: request.working_directory.clone(),
+                })
+                .await
+                .map_err(|source| {
+                    if source.kind == TransportErrorKind::ExecutableNotFound {
+                        RuntimeError::ExecutableNotFound {
+                            provider,
+                            executable: program.display().to_string(),
+                        }
+                    } else {
+                        RuntimeError::Transport {
+                            provider,
+                            source: redact_transport_error(source, &request.environment),
+                        }
+                    }
+                })?;
+            trace.record(StartupStage::ProcessSpawned);
+            let mut stdin = process.take_stdin().ok_or_else(|| RuntimeError::Protocol {
+                provider,
+                message: "retained Codex process did not expose stdin".to_string(),
+            })?;
+            if let Some(initial) = &spec.initial_stdin {
+                write_provider_frames(
+                    provider,
+                    Some(&mut stdin),
+                    std::slice::from_ref(initial),
+                    "initial input",
+                )
+                .await?;
+                trace.record(StartupStage::InitialInputWritten);
+            }
+            let stdout = process
+                .take_stdout()
+                .ok_or_else(|| RuntimeError::Protocol {
+                    provider,
+                    message: "retained Codex process did not expose stdout".to_string(),
+                })?;
+            let stderr = process
+                .take_stderr()
+                .ok_or_else(|| RuntimeError::Protocol {
+                    provider,
+                    message: "retained Codex process did not expose stderr".to_string(),
+                })?;
+            let retained = Arc::new(RetainedCodexProcess {
+                fingerprint,
+                io: AsyncMutex::new(Some(RetainedCodexIo {
+                    process,
+                    stdin,
+                    reader: BufReader::new(stdout),
+                    stderr_task: tokio::spawn(crate::process::bounded_stderr(
+                        stderr,
+                        STDERR_TAIL_BYTES,
+                    )),
+                })),
+                generation: AtomicU64::new(0),
+                usable: AtomicBool::new(true),
+                _permit: permit,
+            });
+            supervisor
+                .inner
+                .processes
+                .lock()
+                .await
+                .insert(runtime_id.clone(), Arc::clone(&retained));
+            retained
+        };
+
+        let generation = retained.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        let mut cleanup = RetainedTurnCleanup {
+            armed: true,
+            supervisor: supervisor.clone(),
+            runtime_id: runtime_id.clone(),
+            process: Arc::clone(&retained),
+        };
+        let mut io_guard = retained.io.lock().await;
+        let io = io_guard.as_mut().ok_or_else(|| RuntimeError::Protocol {
+            provider,
+            message: "retained Codex process is no longer available".to_string(),
+        })?;
+        let reused = generation > 1;
+        if reused {
+            let start =
+                adapter
+                    .retained_turn_start(&state)?
+                    .ok_or_else(|| RuntimeError::Protocol {
+                        provider,
+                        message: "configured Codex adapter cannot start a retained turn"
+                            .to_string(),
+                    })?;
+            write_provider_frames(
+                provider,
+                Some(&mut io.stdin),
+                std::slice::from_ref(&start),
+                "retained turn start",
+            )
+            .await?;
+        }
+        trace.record(StartupStage::StreamsAttached);
+        let result = self
+            .drive_retained_codex_turn(adapter.as_ref(), request, events, interactions, trace, io)
+            .await;
+        drop(io_guard);
+        match result {
+            Ok(result) => {
+                cleanup.disarm();
+                let runtime_id = runtime_id.clone();
+                let retained_for_expiry = Arc::clone(&retained);
+                let supervisor_for_expiry = supervisor.clone();
+                let idle_timeout = supervisor.inner.config.idle_timeout;
+                let retained_for_drain = Arc::clone(&retained);
+                let supervisor_for_drain = supervisor.clone();
+                let runtime_id_for_drain = runtime_id.clone();
+                let max_event_line_bytes = self.max_event_line_bytes;
+                tokio::spawn(async move {
+                    loop {
+                        if retained_for_drain.generation.load(Ordering::Acquire) != generation
+                            || !retained_for_drain.usable.load(Ordering::Acquire)
+                        {
+                            return;
+                        }
+                        let observed = {
+                            let mut io = retained_for_drain.io.lock().await;
+                            if retained_for_drain.generation.load(Ordering::Acquire) != generation {
+                                return;
+                            }
+                            let Some(io) = io.as_mut() else { return };
+                            tokio::time::timeout(
+                                Duration::from_millis(25),
+                                read_bounded_retained_line(&mut io.reader, max_event_line_bytes),
+                            )
+                            .await
+                        };
+                        if observed.is_ok() {
+                            // Any frame after the terminal event makes the
+                            // connection ambiguous. Retire it instead of
+                            // assigning or replying under a later turn.
+                            retained_for_drain.usable.store(false, Ordering::Release);
+                            supervisor_for_drain
+                                .remove_if_same(&runtime_id_for_drain, &retained_for_drain)
+                                .await;
+                            let _ = retained_for_drain.terminate().await;
+                            return;
+                        }
+                    }
+                });
+                tokio::spawn(async move {
+                    tokio::time::sleep(idle_timeout).await;
+                    if retained_for_expiry.generation.load(Ordering::Acquire) == generation {
+                        supervisor_for_expiry
+                            .remove_if_same(&runtime_id, &retained_for_expiry)
+                            .await;
+                        let _ = retained_for_expiry.terminate().await;
+                    }
+                });
+                Ok(result)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn drive_retained_codex_turn(
+        &self,
+        adapter: &dyn AgentAdapter,
+        request: &TurnRequest,
+        events: &dyn EventSink,
+        interactions: &dyn InteractionHandler,
+        trace: &StartupTrace,
+        io: &mut RetainedCodexIo,
+    ) -> Result<TurnResult> {
+        let provider = request.provider;
+        let mut state = AdapterState::default();
+        state.result.session_id.clone_from(&request.session_id);
+        adapter.prepare_turn(request, &mut state)?;
+        adapter.mark_retained_turn(&mut state);
+        let mut first_output = true;
+        let mut first_text = true;
+        loop {
+            let line = tokio::select! {
+                _ = request.cancellation.cancelled() => {
+                    if let Some(interrupt) = adapter.interrupt_request(&state) {
+                        let _ = write_provider_frames(provider, Some(&mut io.stdin), &[interrupt], "interrupt").await;
+                    }
+                    return Err(RuntimeError::Cancelled { provider });
+                }
+                line = read_bounded_retained_line(&mut io.reader, self.max_event_line_bytes) => line.map_err(|source| RuntimeError::ProcessIo {
+                    provider,
+                    stream: "stdout read",
+                    source,
+                })?,
+            };
+            let Some(line) = line else {
+                return Err(RuntimeError::ProcessFailed {
+                    provider,
+                    kind: ProviderProcessErrorKind::Unknown,
+                    exit_code: None,
+                    stderr: "retained Codex process exited before completing the turn".to_string(),
+                    provider_code: None,
+                    delivery: crate::lifecycle::DeliveryState::PossiblySent,
+                });
+            };
+            if first_output {
+                first_output = false;
+                trace.record(StartupStage::FirstOutput);
+            }
+            if line.len() > self.max_event_line_bytes {
+                return Err(RuntimeError::Protocol {
+                    provider,
+                    message: format!("event line exceeded {} bytes", self.max_event_line_bytes),
+                });
+            }
+            let output = adapter.parse_line(&line, &mut state)?;
+            for event in output.events {
+                if first_text && matches!(&event, TurnEvent::TextDelta { text } if !text.is_empty())
+                {
+                    first_text = false;
+                    trace.record(StartupStage::FirstText);
+                }
+                let _delivery = trace.event_delivery();
+                events.emit(event).await?;
+            }
+            write_provider_frames(
+                provider,
+                Some(&mut io.stdin),
+                &output.writes,
+                "provider write",
+            )
+            .await?;
+            if let Some(interaction) = output.interaction {
+                let response = match interaction {
+                    InteractionRequest::Approval {
+                        request: approval,
+                        original,
+                    } => {
+                        let decision = tokio::select! {
+                            _ = request.cancellation.cancelled() => return Err(RuntimeError::Cancelled { provider }),
+                            decision = tokio::time::timeout(request.interaction_timeout, interactions.approve(approval.clone())) => {
+                                decision.unwrap_or_else(|_| crate::ApprovalDecision::Deny { reason: Some("Approval timed out".to_string()) })
+                            }
+                        };
+                        adapter.approval_response(&approval, &original, decision)?
+                    }
+                    InteractionRequest::Question {
+                        request: question,
+                        original,
+                    } => {
+                        let answer = tokio::select! {
+                            _ = request.cancellation.cancelled() => return Err(RuntimeError::Cancelled { provider }),
+                            answer = tokio::time::timeout(request.interaction_timeout, interactions.answer(question.clone())) => answer.ok().flatten(),
+                        };
+                        adapter.question_response(&question, &original, answer)?
+                    }
+                };
+                if let Some(response) = response {
+                    write_provider_frames(
+                        provider,
+                        Some(&mut io.stdin),
+                        &[response],
+                        "interaction response",
+                    )
+                    .await?;
+                }
+            }
+            if output.terminal {
+                if let Some(failure) = state.terminal_failure.take() {
+                    return Err(RuntimeError::ProcessFailed {
+                        provider,
+                        kind: failure.kind,
+                        exit_code: None,
+                        stderr: redact_secrets(&failure.diagnostic, &request.environment),
+                        provider_code: failure.provider_code,
+                        delivery: failure.delivery,
+                    });
+                }
+                if state.result.text.is_empty() {
+                    events
+                        .emit(TurnEvent::Warning {
+                            message: format!("{provider} completed without a text response"),
+                        })
+                        .await?;
+                }
+                return Ok(state.result);
+            }
+        }
     }
 
     async fn run_process(

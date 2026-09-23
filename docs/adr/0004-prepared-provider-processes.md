@@ -1,6 +1,6 @@
 # ADR 0004: Prepared provider processes
 
-- Status: Proposed
+- Status: Accepted (Codex retained turns implemented; explicit prewarming deferred)
 - Date: 2026-09-23
 
 ## Problem
@@ -16,42 +16,37 @@ first assistant text. A first output frame is not evidence of provider readiness
 or model request submission. Provider-specific readiness requires an explicit
 handshake acknowledgement, not a sleep or an empty model turn.
 
-## Proposed ownership
+## Ownership
 
 The SDK owns a bounded process supervisor and provider protocol state. Fleet owns
 when a user has selected enough configuration to prepare, durable conversation
 records, authorization, feature rollout, and presentation. Listing projects or
 conversations must never spawn provider processes.
 
-Existing `AgentRuntime::run` and retained-client constructors preserve lazy,
-one-process-per-turn behavior. A separate opt-in client configuration enables
-retained processes. Unsupported adapters and remote protocol versions report a
-typed capability error rather than silently claiming preparation succeeded.
+Existing `AgentRuntime::run` and default retained-client constructors preserve
+lazy, one-process-per-turn behavior. `codex_process_retention` opts the in-process
+retained client into bounded app-server reuse. Custom adapters remain disabled
+unless they implement the lifecycle contract.
 
-## Proposed lifecycle
+## Lifecycle
 
 1. Acquire a logical runtime with project, provider, sandbox and launch settings.
-2. Explicitly prepare it, without a prompt or invocation identifier. This starts
-   the process and completes the provider handshake; it does not call a model,
-   create a synthetic transcript message, or grant tool execution.
-3. Send a turn. Lazy sending performs preparation automatically. Sending during
-   preparation joins the same bounded operation and submits exactly once.
-4. On a successful turn, keep the provider connection and continue draining its
+2. Send the first real turn. This lazily starts and initializes the app server,
+   then submits the prompt exactly once.
+3. On a successful turn, keep the provider connection and continue draining its
    bounded event stream. Idle tool/background events belong to the runtime and
    must not be attached to the next invocation.
-5. Dispose or expire the idle process, confirming process-tree teardown. Preserve
+4. Dispose or expire the idle process, confirming process-tree teardown. Preserve
    session identity so later work can explicitly resume from provider persistence.
 
-The process lifecycle distinguishes unprepared, queued, preparing, ready, busy,
-failed, stopping and stopped. A logical runtime being acquired is not provider
-readiness. Preparation errors expose delivery=not_sent. Failure after submission
-preserves the existing accepted/possibly_sent semantics and must not replay a
-prompt automatically.
+Acquiring a logical runtime does not start a provider process or claim provider
+readiness. Failure before submission remains `delivery=not_sent`; failure after
+submission preserves accepted/possibly-sent semantics and never replays a prompt.
 
-Preparation has a configurable deadline, bounded concurrency, global process
-capacity and idle expiration. Active turns cannot be evicted to admit speculative
-preparation. Abandoned preparations release their capacity. Disposing while
-preparing prevents late successful readiness from resurrecting the runtime.
+Retention has bounded turn concurrency, separate global process capacity and idle
+expiration. Capacity exhaustion falls back to the ordinary cold-turn path.
+Cancellation, timeout, dropped futures, disposal and ambiguous idle output poison
+the connection and terminate its process tree before it can be reused.
 
 ## Configuration and credentials
 

@@ -454,6 +454,26 @@ pub trait RuntimeTurnExecutor: Send + Sync {
         events: &dyn EventSink,
         interactions: Option<&dyn InteractionHandler>,
     ) -> crate::Result<TurnResult>;
+
+    /// Execute a turn associated with one logical retained runtime.
+    ///
+    /// Custom executors keep the legacy behavior by default. Built-in drivers
+    /// may use the stable runtime identity to isolate native process reuse.
+    async fn execute_retained(
+        &self,
+        runtime_id: &RuntimeId,
+        request: TurnRequest,
+        events: &dyn EventSink,
+        interactions: Option<&dyn InteractionHandler>,
+    ) -> crate::Result<TurnResult> {
+        let _ = runtime_id;
+        self.execute(request, events, interactions).await
+    }
+
+    /// Release resources owned by one logical retained runtime.
+    async fn dispose_retained(&self, _runtime_id: &RuntimeId) -> crate::Result<()> {
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -461,7 +481,8 @@ impl RuntimeTurnExecutor for AgentRuntime {
     fn capabilities(&self, provider: Provider) -> RuntimeDriverCapabilities {
         let permissions = self.permission_support(provider).ok();
         RuntimeDriverCapabilities {
-            retained_process: false,
+            retained_process: provider == Provider::Codex
+                && self.codex_process_retention_enabled(provider),
             session_resume: true,
             live_interactions: permissions
                 .is_some_and(|support| support.live_approvals || support.live_questions),
@@ -500,6 +521,21 @@ impl RuntimeTurnExecutor for AgentRuntime {
         interactions: Option<&dyn InteractionHandler>,
     ) -> crate::Result<TurnResult> {
         self.run(request, events, interactions).await
+    }
+
+    async fn execute_retained(
+        &self,
+        runtime_id: &RuntimeId,
+        request: TurnRequest,
+        events: &dyn EventSink,
+        interactions: Option<&dyn InteractionHandler>,
+    ) -> crate::Result<TurnResult> {
+        self.run_retained(runtime_id, request, events, interactions)
+            .await
+    }
+
+    async fn dispose_retained(&self, runtime_id: &RuntimeId) -> crate::Result<()> {
+        self.dispose_retained_process(runtime_id).await
     }
 }
 
@@ -653,8 +689,9 @@ impl RuntimeClient for InProcessRuntimeClient {
         let Some(entry) = entry else {
             return Ok(DisposeOutcome::NotFound);
         };
-        entry.dispose().await?;
+        let result = entry.dispose().await;
         self.runtimes.write().await.remove(runtime_id);
+        result?;
         Ok(DisposeOutcome::Disposed)
     }
 }
@@ -1000,7 +1037,7 @@ impl RuntimeEntry {
             None
         };
         drop(state);
-        if let Some((invocation_id, terminal)) = terminal {
+        let confirmation = if let Some((invocation_id, terminal)) = terminal {
             tokio::time::timeout(
                 INTERRUPT_CONFIRMATION_TIMEOUT,
                 terminal.wait_for_completion(),
@@ -1015,9 +1052,23 @@ impl RuntimeEntry {
                     DeliveryState::PossiblySent,
                     "retained provider termination was not confirmed during disposal",
                 )
-            })?;
-        }
-        Ok(())
+            })
+            .map(|_| ())
+        } else {
+            Ok(())
+        };
+        let cleanup = self
+            .executor
+            .dispose_retained(&self.spec.runtime_id)
+            .await
+            .map_err(|error| {
+                runtime_error_to_failure(
+                    error,
+                    self.spec.runtime_id.clone(),
+                    InvocationId::new("dispose").expect("static invocation id is valid"),
+                )
+            });
+        confirmation.and(cleanup)
     }
 
     async fn start_turn(
@@ -1132,7 +1183,12 @@ impl RuntimeEntry {
             let mut result = match started {
                 Ok(()) => entry
                     .executor
-                    .execute(request, &sink, interactions.as_deref())
+                    .execute_retained(
+                        &entry.spec.runtime_id,
+                        request,
+                        &sink,
+                        interactions.as_deref(),
+                    )
                     .await
                     .map_err(|error| {
                         runtime_error_to_failure(

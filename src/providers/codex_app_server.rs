@@ -60,6 +60,7 @@ struct TurnState {
     turn_params: Value,
     /// Whether this turn resumes an existing Codex thread.
     resume: bool,
+    retained: bool,
     /// Model requested for this turn, used to label context-window usage
     /// before the app server reports the thread's resolved model.
     model: Option<String>,
@@ -72,6 +73,12 @@ struct TurnState {
     streamed: Vec<String>,
     /// Last `error` notification, surfaced when the turn ends badly.
     error_message: Option<String>,
+}
+
+pub(super) fn mark_retained(state: &mut AdapterState) {
+    let mut turn = load(state);
+    turn.retained = true;
+    store(state, &turn);
 }
 
 fn load(state: &AdapterState) -> TurnState {
@@ -219,6 +226,17 @@ pub(super) fn interrupt(state: &AdapterState) -> Option<Vec<u8>> {
     .ok()
 }
 
+/// Start a turn after this app-server connection has already initialized.
+pub(super) fn retained_turn_start(state: &AdapterState) -> Result<Vec<u8>> {
+    let turn = load(state);
+    let method = if turn.resume {
+        "thread/resume"
+    } else {
+        "thread/start"
+    };
+    encode(&request(ID_THREAD, method, turn.thread_params))
+}
+
 /// Translate one JSON-RPC message from the app server.
 pub(super) fn parse_line(line: &str, state: &mut AdapterState) -> Result<AdapterOutput> {
     let value: Value = serde_json::from_str(line)
@@ -230,6 +248,28 @@ pub(super) fn parse_line(line: &str, state: &mut AdapterState) -> Result<Adapter
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
+    if turn.retained
+        && !method.is_empty()
+        && value.get("id").is_none()
+        && reported_turn_id(&value).is_none()
+    {
+        // Uncorrelated notifications cannot be assigned to an invocation on a
+        // reused connection. Process-global state is refreshed explicitly by
+        // its dedicated APIs instead of leaking into the active turn stream.
+        return Ok(output);
+    }
+    if turn.retained
+        && reported_turn_id(&value)
+            .is_some_and(|reported| turn.turn_id.as_deref() != Some(reported))
+    {
+        return Ok(output);
+    }
+    if turn_scoped_method(&method) && !belongs_to_active_turn(&value, &turn) {
+        // App-server connections can emit delayed frames after a completed
+        // turn. A retained connection must never project those frames into a
+        // later invocation's fresh parser state.
+        return Ok(output);
+    }
     if method.is_empty() {
         parse_response(&value, &mut turn, state, &mut output)?;
     } else if value.get("id").is_some() {
@@ -239,6 +279,39 @@ pub(super) fn parse_line(line: &str, state: &mut AdapterState) -> Result<Adapter
     }
     store(state, &turn);
     Ok(output)
+}
+
+fn turn_scoped_method(method: &str) -> bool {
+    matches!(
+        method,
+        "item/agentMessage/delta"
+            | "item/reasoning/textDelta"
+            | "item/reasoning/summaryTextDelta"
+            | "item/started"
+            | "item/completed"
+            | "item/commandExecution/requestApproval"
+            | "item/fileChange/requestApproval"
+            | "item/permissions/requestApproval"
+            | "item/tool/requestUserInput"
+            | "thread/tokenUsage/updated"
+            | "turn/completed"
+            | "turn/failed"
+    )
+}
+
+fn belongs_to_active_turn(value: &Value, turn: &TurnState) -> bool {
+    if !turn.retained {
+        return true;
+    }
+    let reported = reported_turn_id(value);
+    matches!((reported, turn.turn_id.as_deref()), (Some(reported), Some(current)) if reported == current)
+}
+
+fn reported_turn_id(value: &Value) -> Option<&str> {
+    value
+        .pointer("/params/turnId")
+        .or_else(|| value.pointer("/params/turn/id"))
+        .and_then(Value::as_str)
 }
 
 /// Advance the handshake with the response to one of our own requests.

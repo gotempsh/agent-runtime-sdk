@@ -638,6 +638,10 @@ impl AgentAdapter for Codex {
         Provider::Codex
     }
 
+    fn supports_retained_process(&self) -> bool {
+        self.app_server_mode()
+    }
+
     fn executable(&self) -> PathBuf {
         self.configured_executable()
     }
@@ -1014,6 +1018,20 @@ impl AgentAdapter for Codex {
             codex_app_server::prepare_turn(request, state)?;
         }
         Ok(())
+    }
+
+    fn retained_turn_start(&self, state: &AdapterState) -> Result<Option<Vec<u8>>> {
+        if self.app_server_mode() {
+            codex_app_server::retained_turn_start(state).map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn mark_retained_turn(&self, state: &mut AdapterState) {
+        if self.app_server_mode() {
+            codex_app_server::mark_retained(state);
+        }
     }
 
     fn interrupt_request(&self, state: &AdapterState) -> Option<Vec<u8>> {
