@@ -127,3 +127,7 @@ needless_pass_by_value = "allow"
 return_self_not_must_use = "allow"
 struct_excessive_bools = "allow"
 too_many_lines = "allow"
+
+[[example]]
+name = "startup_timings"
+required-features = ["claude", "codex"]

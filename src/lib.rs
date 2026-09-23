@@ -30,6 +30,7 @@ pub mod retained;
 mod runtime;
 mod sandbox;
 pub mod services;
+pub mod startup;
 pub mod transport;
 mod types;
 mod url_security;
@@ -104,3 +105,5 @@ pub use types::{
     QuestionPrompt, QuestionRequest, RunStatus, SecretString, ToolCallStatus, ToolProcessPolicy,
     TurnCapabilities, TurnEvent, TurnProvenance, TurnRequest, TurnResult, Usage,
 };
+
+pub use startup::{StartupObserver, StartupStage, StartupTiming};

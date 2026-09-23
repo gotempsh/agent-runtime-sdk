@@ -8,6 +8,7 @@ use tokio::sync::Semaphore;
 
 use crate::adapter::{AdapterState, AgentAdapter, CommandSpec, InteractionRequest};
 use crate::error::classify_provider_failure;
+use crate::startup::{StartupObserver, StartupObserverState, StartupStage, StartupTrace};
 use crate::{
     AccountUsageReport, DenyAll, EventSink, ExecutionTransport, HarnessAuthentication,
     HarnessCatalogError, HarnessCatalogErrorKind, HarnessCatalogStatus, HarnessControlGroup,
@@ -329,6 +330,7 @@ pub struct AgentRuntimeBuilder {
     concurrency_limit: usize,
     max_prompt_bytes: usize,
     max_event_line_bytes: usize,
+    startup_observer: Option<Arc<StartupObserverState>>,
 }
 
 impl AgentRuntimeBuilder {
@@ -341,6 +343,7 @@ impl AgentRuntimeBuilder {
             concurrency_limit: 2,
             max_prompt_bytes: DEFAULT_MAX_PROMPT_BYTES,
             max_event_line_bytes: DEFAULT_MAX_EVENT_LINE_BYTES,
+            startup_observer: None,
         };
         #[cfg(feature = "claude")]
         builder.register(crate::providers::Claude::default());
@@ -387,6 +390,16 @@ impl AgentRuntimeBuilder {
         self
     }
 
+    /// Observe payload-free startup boundaries. Disabled by default.
+    ///
+    /// Callbacks must return promptly; see [`StartupObserver`]. Observations
+    /// do not add provider events, change the remote protocol, or start extra
+    /// processes. A resumed session still starts a fresh process in this driver.
+    pub fn startup_observer(mut self, observer: Arc<dyn StartupObserver>) -> Self {
+        self.startup_observer = Some(Arc::new(StartupObserverState::new(observer)));
+        self
+    }
+
     /// Validate limits and construct the runtime.
     pub fn build(self) -> Result<AgentRuntime> {
         if self.concurrency_limit == 0 {
@@ -407,6 +420,7 @@ impl AgentRuntimeBuilder {
             permits: Arc::new(Semaphore::new(self.concurrency_limit)),
             max_prompt_bytes: self.max_prompt_bytes,
             max_event_line_bytes: self.max_event_line_bytes,
+            startup_observer: self.startup_observer,
         })
     }
 }
@@ -723,6 +737,7 @@ pub struct AgentRuntime {
     permits: Arc<Semaphore>,
     max_prompt_bytes: usize,
     max_event_line_bytes: usize,
+    startup_observer: Option<Arc<StartupObserverState>>,
 }
 
 impl AgentRuntime {
@@ -1897,6 +1912,19 @@ impl AgentRuntime {
         events: &dyn EventSink,
         interactions: Option<&dyn InteractionHandler>,
     ) -> Result<TurnResult> {
+        let mut trace = StartupTrace::new(request.provider, self.startup_observer.clone());
+        let result = self.run_inner(request, events, interactions, &trace).await;
+        trace.finish(&result);
+        result
+    }
+
+    async fn run_inner(
+        &self,
+        request: TurnRequest,
+        events: &dyn EventSink,
+        interactions: Option<&dyn InteractionHandler>,
+        trace: &StartupTrace,
+    ) -> Result<TurnResult> {
         self.validate(&request)?;
         self.validate_working_directory(&request).await?;
         let provider = request.provider;
@@ -1941,21 +1969,30 @@ impl AgentRuntime {
                 });
             }
         }
+        trace.record(StartupStage::Validated);
         // A pre-cancelled turn must never race an immediately available permit
         // into spawning a provider executable.
         if request.cancellation.is_cancelled() {
             return Err(RuntimeError::Cancelled { provider });
         }
+        trace.record(StartupStage::WaitingForPermit);
         let permit = tokio::select! {
             _ = request.cancellation.cancelled() => {
                 return Err(RuntimeError::Cancelled { provider });
             }
             permit = self.permits.clone().acquire_owned() => permit.map_err(|_| RuntimeError::Cancelled { provider })?,
         };
+        trace.record(StartupStage::PermitAcquired);
         let timeout = request.timeout;
         let result = tokio::time::timeout(
             timeout,
-            self.run_process(adapter, &request, events, interactions.unwrap_or(&DenyAll)),
+            self.run_process(
+                adapter,
+                &request,
+                events,
+                interactions.unwrap_or(&DenyAll),
+                trace,
+            ),
         )
         .await;
         drop(permit);
@@ -2078,6 +2115,7 @@ impl AgentRuntime {
             attempt.sandbox = Some(resolved.as_request());
             let tracking_events = SandboxEventSink::new(events, &resolved);
             let timeout = attempt.timeout;
+            let mut trace = StartupTrace::new(provider, self.startup_observer.clone());
             let result = tokio::time::timeout(
                 timeout,
                 self.run_process(
@@ -2085,13 +2123,17 @@ impl AgentRuntime {
                     &attempt,
                     &tracking_events,
                     interactions.unwrap_or(&DenyAll),
+                    &trace,
                 ),
             )
             .await
             .map_err(|_| RuntimeError::Timeout {
                 provider,
                 seconds: timeout.as_secs(),
-            })??;
+            })
+            .and_then(std::convert::identity);
+            trace.finish(&result);
+            let result = result?;
             let Some(violation) = tracking_events.violation() else {
                 return Ok(result);
             };
@@ -2265,6 +2307,7 @@ impl AgentRuntime {
         request: &TurnRequest,
         events: &dyn EventSink,
         interactions: &dyn InteractionHandler,
+        trace: &StartupTrace,
     ) -> Result<TurnResult> {
         let provider = request.provider;
         let mut state = AdapterState::default();
@@ -2282,6 +2325,7 @@ impl AgentRuntime {
         for (name, value) in &request.environment {
             spec.environment.insert(name.into(), value.expose().into());
         }
+        trace.record(StartupStage::CommandPrepared);
         if let Some(sandbox) = &request.sandbox {
             let context = SandboxContext {
                 provider,
@@ -2293,6 +2337,7 @@ impl AgentRuntime {
                 }
                 prepared = sandbox.prepare(context, spec) => prepared?,
             };
+            trace.record(StartupStage::SandboxPrepared);
         }
         let capabilities = self.transport.capabilities();
         if spec.interactive_stdin && !capabilities.interactive_stdin {
@@ -2333,6 +2378,7 @@ impl AgentRuntime {
                     }
                 }
             })?;
+        trace.record(StartupStage::ProcessSpawned);
         let stdin = process
             .take_stdin()
             .ok_or_else(|| RuntimeError::ProcessIo {
@@ -2367,6 +2413,9 @@ impl AgentRuntime {
                     stream: "stdin flush",
                     source,
                 })?;
+        }
+        if spec.initial_stdin.is_some() {
+            trace.record(StartupStage::InitialInputWritten);
         }
         if !spec.interactive_stdin {
             stdin.take();
@@ -2406,6 +2455,9 @@ impl AgentRuntime {
                 return Err(error);
             }
         };
+        trace.record(StartupStage::StreamsAttached);
+        let mut first_output = true;
+        let mut first_text = true;
         let mut lines = BufReader::new(reader).lines();
         let mut protocol_completed = false;
         loop {
@@ -2429,6 +2481,10 @@ impl AgentRuntime {
                 })?,
             };
             let Some(line) = line else { break };
+            if first_output {
+                first_output = false;
+                trace.record(StartupStage::FirstOutput);
+            }
             if line.len() > self.max_event_line_bytes {
                 let _ = process.terminate().await;
                 stderr_task.abort();
@@ -2439,7 +2495,15 @@ impl AgentRuntime {
             }
             let output = adapter.parse_line(&line, &mut state)?;
             for event in output.events {
-                events.emit(event).await?;
+                if first_text && matches!(&event, TurnEvent::TextDelta { text } if !text.is_empty())
+                {
+                    first_text = false;
+                    trace.record(StartupStage::FirstText);
+                }
+                {
+                    let _delivery = trace.event_delivery();
+                    events.emit(event).await?;
+                }
             }
             write_provider_frames(provider, stdin.as_mut(), &output.writes, "provider write")
                 .await?;
@@ -2643,6 +2707,7 @@ impl AgentRuntime {
             });
         }
         if state.result.text.is_empty() {
+            let _delivery = trace.event_delivery();
             events
                 .emit(TurnEvent::Warning {
                     message: format!("{provider} completed without a text response"),
@@ -4046,6 +4111,292 @@ mod tests {
                     },
                 }
             }
+        }
+
+        #[derive(Default)]
+        struct TimingCollector {
+            samples: Mutex<Vec<crate::StartupTiming>>,
+            waiting: tokio::sync::Notify,
+        }
+
+        impl crate::StartupObserver for TimingCollector {
+            fn observe(&self, sample: crate::StartupTiming) {
+                self.samples.lock().unwrap().push(sample);
+                if sample.stage == StartupStage::WaitingForPermit {
+                    self.waiting.notify_one();
+                }
+            }
+        }
+
+        impl TimingCollector {
+            fn stages(&self) -> Vec<StartupStage> {
+                self.samples
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|sample| sample.stage)
+                    .collect()
+            }
+        }
+
+        fn observed_runtime(
+            script: &str,
+            observer: Arc<dyn crate::StartupObserver>,
+        ) -> AgentRuntime {
+            let mut builder = AgentRuntime::builder()
+                .startup_observer(observer)
+                .concurrency_limit(1);
+            builder.register(ShellAdapter {
+                script: script.into(),
+                args: Vec::new(),
+            });
+            builder.build().unwrap()
+        }
+
+        #[tokio::test]
+        async fn startup_timings_separate_output_from_text_without_changing_events() {
+            let samples = Arc::new(TimingCollector::default());
+            let runtime = observed_runtime(
+                r#"printf '%s\n' '{"session":"private-session"}' '{"text":""}' '{"text":"hello"}' '{"text":"world"}' '{"terminal":true}'"#,
+                samples.clone(),
+            );
+            let directory = tempfile::tempdir().unwrap();
+            let request = TurnRequest::new(Provider::Claude, directory.path(), "private prompt");
+            let events = CollectEvents::default();
+            let result = runtime.run(request, &events, None).await.unwrap();
+            assert_eq!(result.text, "helloworld");
+            assert_eq!(events.0.lock().unwrap().len(), 4);
+            assert_eq!(
+                samples.stages(),
+                vec![
+                    StartupStage::Started,
+                    StartupStage::Validated,
+                    StartupStage::WaitingForPermit,
+                    StartupStage::PermitAcquired,
+                    StartupStage::CommandPrepared,
+                    StartupStage::ProcessSpawned,
+                    StartupStage::StreamsAttached,
+                    StartupStage::FirstOutput,
+                    StartupStage::FirstText,
+                    StartupStage::Succeeded,
+                ]
+            );
+            let recorded = samples.samples.lock().unwrap();
+            assert!(recorded
+                .windows(2)
+                .all(|pair| pair[0].elapsed <= pair[1].elapsed));
+            assert!(recorded
+                .iter()
+                .all(|sample| sample.observation_id == recorded[0].observation_id));
+            let diagnostic = format!("{recorded:?}");
+            for private in [
+                "private prompt",
+                "private-session",
+                "helloworld",
+                directory.path().to_str().unwrap(),
+            ] {
+                assert!(!diagnostic.contains(private));
+            }
+        }
+
+        #[tokio::test]
+        async fn startup_timings_separate_event_delivery_from_first_text_latency() {
+            #[derive(Default)]
+            struct SlowEvents {
+                waited: Mutex<Duration>,
+            }
+            #[async_trait]
+            impl EventSink for SlowEvents {
+                async fn emit(&self, event: TurnEvent) -> Result<()> {
+                    if matches!(event, TurnEvent::SessionStarted { .. }) {
+                        let start = std::time::Instant::now();
+                        tokio::time::sleep(Duration::from_millis(40)).await;
+                        *self.waited.lock().unwrap() = start.elapsed();
+                    }
+                    Ok(())
+                }
+            }
+            let samples = Arc::new(TimingCollector::default());
+            let runtime = observed_runtime(
+                r#"printf '%s\n' '{"session":"test"}' '{"text":"done"}' '{"terminal":true}'"#,
+                samples.clone(),
+            );
+            let directory = tempfile::tempdir().unwrap();
+            let events = SlowEvents::default();
+            let result = runtime
+                .run(
+                    TurnRequest::new(Provider::Claude, directory.path(), "test"),
+                    &events,
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(result.text, "done");
+            let recorded = samples.samples.lock().unwrap();
+            let output = recorded
+                .iter()
+                .find(|s| s.stage == StartupStage::FirstOutput)
+                .unwrap();
+            let text = recorded
+                .iter()
+                .find(|s| s.stage == StartupStage::FirstText)
+                .unwrap();
+            let actual_wait = *events.waited.lock().unwrap();
+            assert!(actual_wait >= Duration::from_millis(40));
+            assert!(text.elapsed.checked_sub(output.elapsed).unwrap() >= actual_wait);
+            assert!(
+                text.event_delivery_elapsed
+                    .checked_sub(output.event_delivery_elapsed)
+                    .unwrap()
+                    >= actual_wait,
+                "first-text latency must separately report time spent delivering earlier events"
+            );
+            assert!(text.event_delivery_elapsed <= text.elapsed);
+        }
+
+        #[tokio::test]
+        async fn startup_timings_include_terminal_warning_delivery() {
+            #[derive(Default)]
+            struct SlowWarning {
+                waited: Mutex<Duration>,
+            }
+            #[async_trait]
+            impl EventSink for SlowWarning {
+                async fn emit(&self, event: TurnEvent) -> Result<()> {
+                    if matches!(event, TurnEvent::Warning { .. }) {
+                        let start = std::time::Instant::now();
+                        tokio::time::sleep(Duration::from_millis(40)).await;
+                        *self.waited.lock().unwrap() = start.elapsed();
+                    }
+                    Ok(())
+                }
+            }
+            let samples = Arc::new(TimingCollector::default());
+            let runtime = observed_runtime(r#"printf '%s\n' '{"terminal":true}'"#, samples.clone());
+            let directory = tempfile::tempdir().unwrap();
+            let events = SlowWarning::default();
+            let result = runtime
+                .run(
+                    TurnRequest::new(Provider::Claude, directory.path(), "test"),
+                    &events,
+                    None,
+                )
+                .await
+                .unwrap();
+            assert!(result.text.is_empty());
+            let recorded = samples.samples.lock().unwrap();
+            let terminal = recorded.last().unwrap();
+            assert_eq!(terminal.stage, StartupStage::Succeeded);
+            let actual_wait = *events.waited.lock().unwrap();
+            assert!(actual_wait >= Duration::from_millis(40));
+            assert!(
+                terminal.event_delivery_elapsed >= actual_wait,
+                "terminal warning delivery must be included in cumulative sink wait"
+            );
+            assert!(terminal.event_delivery_elapsed <= terminal.elapsed);
+        }
+
+        #[tokio::test]
+        async fn startup_timings_distinguish_queue_wait_and_abandoned_execution() {
+            let samples = Arc::new(TimingCollector::default());
+            let runtime = observed_runtime("exit 0", samples.clone());
+            let permit = runtime.permits.clone().acquire_owned().await.unwrap();
+            let directory = tempfile::tempdir().unwrap();
+            let request = TurnRequest::new(Provider::Claude, directory.path(), "test");
+            let task =
+                tokio::spawn(
+                    async move { runtime.run(request, &crate::NoopEventSink, None).await },
+                );
+            tokio::time::timeout(Duration::from_secs(5), samples.waiting.notified())
+                .await
+                .unwrap();
+            assert_eq!(
+                samples.stages(),
+                vec![
+                    StartupStage::Started,
+                    StartupStage::Validated,
+                    StartupStage::WaitingForPermit
+                ]
+            );
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+            drop(permit);
+            assert_eq!(samples.stages().last(), Some(&StartupStage::Abandoned));
+            assert!(!samples.stages().contains(&StartupStage::ProcessSpawned));
+        }
+
+        #[tokio::test]
+        async fn startup_timings_report_failure_cancellation_and_timeout_once() {
+            let samples = Arc::new(TimingCollector::default());
+            let runtime = observed_runtime("exec sleep 60", samples.clone());
+            let directory = tempfile::tempdir().unwrap();
+            let cancelled = TurnRequest::new(Provider::Claude, directory.path(), "cancel");
+            cancelled.cancellation.cancel();
+            assert!(matches!(
+                runtime.run(cancelled, &crate::NoopEventSink, None).await,
+                Err(RuntimeError::Cancelled { .. })
+            ));
+            let mut timeout = TurnRequest::new(Provider::Claude, directory.path(), "timeout");
+            timeout.timeout = Duration::from_millis(25);
+            assert!(matches!(
+                runtime.run(timeout, &crate::NoopEventSink, None).await,
+                Err(RuntimeError::Timeout { .. })
+            ));
+            let mut invalid = TurnRequest::new(Provider::Claude, directory.path(), "invalid");
+            invalid.timeout = Duration::ZERO;
+            assert!(runtime
+                .run(invalid, &crate::NoopEventSink, None)
+                .await
+                .is_err());
+            let samples = samples.samples.lock().unwrap();
+            let mut observations = std::collections::BTreeMap::new();
+            for sample in samples.iter() {
+                observations
+                    .entry(sample.observation_id)
+                    .or_insert_with(Vec::new)
+                    .push(sample.stage);
+            }
+            assert_eq!(observations.len(), 3);
+            let terminal: Vec<_> = observations
+                .values()
+                .map(|stages| *stages.last().unwrap())
+                .collect();
+            assert_eq!(
+                terminal,
+                vec![
+                    StartupStage::Cancelled,
+                    StartupStage::TimedOut,
+                    StartupStage::Failed
+                ]
+            );
+            assert!(!samples
+                .iter()
+                .any(|sample| sample.stage == StartupStage::Abandoned
+                    || sample.stage == StartupStage::FirstText));
+        }
+
+        #[tokio::test]
+        async fn startup_observer_failure_cannot_fail_a_provider_turn() {
+            struct Panics;
+            impl crate::StartupObserver for Panics {
+                fn observe(&self, _: crate::StartupTiming) {
+                    panic!("observer unavailable");
+                }
+            }
+            let runtime = observed_runtime(
+                r#"printf '%s\n' '{"text":"done"}' '{"terminal":true}'"#,
+                Arc::new(Panics),
+            );
+            let directory = tempfile::tempdir().unwrap();
+            let result = runtime
+                .run(
+                    TurnRequest::new(Provider::Claude, directory.path(), "test"),
+                    &crate::NoopEventSink,
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(result.text, "done");
         }
 
         #[tokio::test]

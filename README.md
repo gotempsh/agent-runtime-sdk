@@ -255,3 +255,5 @@ to separate local verification from publishing and hosting decisions.
 
 Licensed under either the Apache License, Version 2.0 or the MIT License, at
 your option.
+
+- [Measure session startup](docs/how-to/measure-session-startup.md)
