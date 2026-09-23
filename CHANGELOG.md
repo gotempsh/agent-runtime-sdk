@@ -24,6 +24,10 @@ Versioning and Keep a Changelog conventions.
 
 ### Added
 
+- Opt-in payload-free startup timing observers for validation, concurrency admission,
+  sandbox preparation, process spawn, first output/text and terminal outcomes.
+  Existing process lifetime and wire events are unchanged.
+
 - Bidirectional OpenCode support through `opencode serve`. `OpenCodeTurnMode`
   selects the transport; `OpenCode::serve()` starts the server on a reserved
   loopback port and drives it over HTTP and Server-Sent Events, adding live
