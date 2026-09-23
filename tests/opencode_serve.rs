@@ -13,6 +13,7 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -35,12 +36,17 @@ use tokio_util::sync::CancellationToken;
 /// Turn shape the fixture server plays out once the prompt arrives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Script {
+    Complete,
     /// Ask one `bash` permission, then reply according to the decision.
     Permission,
     /// Close the event stream mid-turn, the way a crashing server does.
     Crash,
     /// Stream one delta and then go quiet, so the turn must be cancelled.
     Interrupt,
+    /// Pass health, then never answer session setup.
+    SessionHang,
+    /// Hang the second session lookup; the replacement process answers it.
+    SessionHangOnce,
 }
 
 /// One request the SDK made, recorded for assertions.
@@ -53,6 +59,9 @@ struct Recorded {
 #[derive(Clone)]
 struct Server {
     script: Script,
+    spawns: Arc<AtomicUsize>,
+    health: Arc<Mutex<Vec<Arc<AtomicBool>>>>,
+    stoppers: Arc<Mutex<Vec<tokio::task::AbortHandle>>>,
     requests: Arc<Mutex<Vec<Recorded>>>,
     /// Argument vector the SDK asked the transport to spawn.
     arguments: Arc<Mutex<Vec<String>>>,
@@ -64,6 +73,9 @@ impl Server {
     fn new(script: Script) -> Self {
         Self {
             script,
+            spawns: Arc::new(AtomicUsize::new(0)),
+            health: Arc::default(),
+            stoppers: Arc::default(),
             requests: Arc::new(Mutex::new(Vec::new())),
             arguments: Arc::new(Mutex::new(Vec::new())),
             config: Arc::new(Mutex::new(None)),
@@ -137,6 +149,7 @@ impl ExecutionTransport for Server {
     }
 
     async fn spawn(&self, request: TransportSpawnRequest) -> TransportResult<TransportProcess> {
+        self.spawns.fetch_add(1, Ordering::SeqCst);
         let arguments = request
             .command
             .args
@@ -170,11 +183,15 @@ impl ExecutionTransport for Server {
         let listener = TcpListener::bind(("127.0.0.1", port))
             .await
             .expect("the reserved port is free for the child to bind");
-        tokio::spawn(accept_loop(
+        let health = Arc::new(AtomicBool::new(true));
+        self.health.lock().unwrap().push(health.clone());
+        let task = tokio::spawn(accept_loop(
             listener,
             self.script,
             Arc::clone(&self.requests),
+            health,
         ));
+        self.stoppers.lock().unwrap().push(task.abort_handle());
 
         let (sdk_stdin, child_input) = duplex(1024);
         let (sdk_stdout, child_output) = duplex(1024);
@@ -193,7 +210,10 @@ impl ExecutionTransport for Server {
             Some(Box::new(sdk_stdin) as TransportWriter),
             Box::new(sdk_stdout) as TransportReader,
             Box::new(sdk_stderr) as TransportReader,
-            Control::default(),
+            Control {
+                stopped: false,
+                task: Some(task),
+            },
         ))
     }
 
@@ -216,6 +236,14 @@ impl ExecutionTransport for Server {
 #[derive(Default)]
 struct Control {
     stopped: bool,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+impl Drop for Control {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
 }
 
 #[async_trait]
@@ -235,21 +263,40 @@ impl TransportProcessControl for Control {
 
     async fn terminate(&mut self) -> TransportResult<()> {
         self.stopped = true;
+        if let Some(task) = self.task.take() {
+            task.abort();
+            let _ = task.await;
+        }
         Ok(())
     }
 }
 
-async fn accept_loop(listener: TcpListener, script: Script, requests: Arc<Mutex<Vec<Recorded>>>) {
+async fn accept_loop(
+    listener: TcpListener,
+    script: Script,
+    requests: Arc<Mutex<Vec<Recorded>>>,
+    health: Arc<AtomicBool>,
+) {
     loop {
         let Ok((socket, _)) = listener.accept().await else {
             return;
         };
-        tokio::spawn(handle(socket, script, Arc::clone(&requests)));
+        tokio::spawn(handle(
+            socket,
+            script,
+            Arc::clone(&requests),
+            health.clone(),
+        ));
     }
 }
 
 /// Read one request, record it, and answer it.
-async fn handle(mut socket: TcpStream, script: Script, requests: Arc<Mutex<Vec<Recorded>>>) {
+async fn handle(
+    mut socket: TcpStream,
+    script: Script,
+    requests: Arc<Mutex<Vec<Recorded>>>,
+    health: Arc<AtomicBool>,
+) {
     let mut reader = BufReader::new(&mut socket);
     let mut request_line = String::new();
     if reader.read_line(&mut request_line).await.unwrap_or(0) == 0 {
@@ -287,11 +334,37 @@ async fn handle(mut socket: TcpStream, script: Script, requests: Arc<Mutex<Vec<R
         stream_events(socket, script, requests).await;
         return;
     }
+    if path == "/global/health" && !health.load(Ordering::SeqCst) {
+        std::future::pending::<()>().await;
+    }
+    if script == Script::SessionHang && (path.starts_with("/session?") || path == "/session") {
+        std::future::pending::<()>().await;
+    }
+    if script == Script::SessionHangOnce
+        && (path.starts_with("/session?")
+            || path == "/session"
+            || path.split('?').next() == Some("/session/session-fixture"))
+        && requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| {
+                request.path.starts_with("/session") && !request.path.contains("/message")
+            })
+            .count()
+            == 2
+    {
+        std::future::pending::<()>().await;
+    }
     let payload = if path == "/global/health" {
         json!({"healthy": true}).to_string()
     } else if path == "/app" {
         "<!doctype html><html>OpenCode UI</html>".to_string()
-    } else if path.starts_with("/session?") || path == "/session" {
+    } else if path.starts_with("/session?")
+        || path == "/session"
+        || (request_line.starts_with("GET ")
+            && path.split('?').next() == Some("/session/session-fixture"))
+    {
         json!({"id": "session-fixture", "title": "Fixture session"}).to_string()
     } else {
         json!({}).to_string()
@@ -313,6 +386,12 @@ async fn send(socket: &mut TcpStream, event: &Value) -> bool {
 
 /// Play the scripted turn out over a chunked SSE stream.
 async fn stream_events(mut socket: TcpStream, script: Script, requests: Arc<Mutex<Vec<Recorded>>>) {
+    let prompts_before = requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|r| r.path.contains("/message"))
+        .count();
     let _ = socket
         .write_all(
             b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n",
@@ -320,6 +399,19 @@ async fn stream_events(mut socket: TcpStream, script: Script, requests: Arc<Mute
         .await;
     let _ = socket.flush().await;
 
+    for _ in 0..400 {
+        if requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.path.contains("/message"))
+            .count()
+            > prompts_before
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
     // Establish the assistant message every part below belongs to.
     if !send(
         &mut socket,
@@ -338,6 +430,9 @@ async fn stream_events(mut socket: TcpStream, script: Script, requests: Arc<Mute
         drop(socket);
         return;
     }
+
+    if matches!(script, Script::Complete | Script::SessionHangOnce)
+        && !send(&mut socket, &json!({"type":"message.part.updated","properties":{"sessionID":"session-fixture","part":{"id":"part-1","messageID":"message-1","type":"text","text":"fixture reply"}}})).await { return; }
 
     if script == Script::Permission {
         if !send(
@@ -674,4 +769,265 @@ async fn the_run_turn_mode_keeps_its_one_shot_behaviour() {
         "`opencode run` cannot answer a permission mid-turn and must not claim to"
     );
     assert!(OpenCode::serve().permission_support().live_approvals);
+}
+
+async fn retained_fixture(
+    server: &Server,
+    active: Duration,
+) -> (
+    temps_agent_runtime::retained::InProcessRuntimeClient,
+    temps_agent_runtime::retained::RuntimeHandle,
+) {
+    use temps_agent_runtime::retained::{InProcessRuntimeClient, RuntimeClient, RuntimeSpec};
+    let mut builder = AgentRuntime::builder()
+        .transport(server.clone())
+        .provider_process_retention(temps_agent_runtime::ProviderProcessRetention {
+            max_processes: 1,
+            idle_timeout: Duration::from_secs(30),
+            initialization_timeout: Duration::from_secs(3),
+            active_inactivity_timeout: Some(active),
+        });
+    builder.register(OpenCode::serve());
+    let client = InProcessRuntimeClient::new(builder.build().unwrap());
+    let handle = client
+        .acquire(RuntimeSpec::new(
+            temps_agent_runtime::lifecycle::RuntimeId::new("retained-opencode").unwrap(),
+            Provider::OpenCode,
+            std::env::temp_dir(),
+        ))
+        .await
+        .unwrap();
+    (client, handle)
+}
+
+#[tokio::test]
+async fn retained_server_reuses_port_and_session_for_two_turns() {
+    use temps_agent_runtime::{
+        lifecycle::{InvocationId, RuntimeId},
+        retained::{RuntimeClient, TurnInput},
+    };
+    let server = Server::new(Script::Complete);
+    let (client, handle) = retained_fixture(&server, Duration::from_secs(3)).await;
+    for id in ["first", "second"] {
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            handle
+                .start_turn(TurnInput::new(InvocationId::new(id).unwrap(), id))
+                .await
+                .unwrap()
+                .wait(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(result.session_id.as_deref(), Some("session-fixture"));
+    }
+    assert_eq!(server.spawns.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        server
+            .requests()
+            .iter()
+            .filter(|r| r.path.contains("/message"))
+            .count(),
+        2
+    );
+    client
+        .dispose(&RuntimeId::new("retained-opencode").unwrap())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn retained_server_stall_is_bounded_and_does_not_replay() {
+    use temps_agent_runtime::{
+        lifecycle::{InvocationId, RuntimeId},
+        retained::{RuntimeClient, TurnInput},
+    };
+    let server = Server::new(Script::Interrupt);
+    let (client, handle) = retained_fixture(&server, Duration::from_millis(100)).await;
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        handle
+            .start_turn(TurnInput::new(
+                InvocationId::new("stalled").unwrap(),
+                "stalled",
+            ))
+            .await
+            .unwrap()
+            .wait(),
+    )
+    .await
+    .unwrap();
+    assert!(result.is_err());
+    assert_eq!(
+        server
+            .requests()
+            .iter()
+            .filter(|r| r.path.contains("/message"))
+            .count(),
+        1
+    );
+    client
+        .dispose(&RuntimeId::new("retained-opencode").unwrap())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn retained_session_setup_hang_uses_initialization_deadline() {
+    use temps_agent_runtime::{
+        lifecycle::{InvocationId, RuntimeId},
+        retained::{RuntimeClient, TurnInput},
+    };
+    let server = Server::new(Script::SessionHang);
+    // The active allowance is deliberately much longer than the fixture's
+    // three-second initialization deadline.
+    let (client, handle) = retained_fixture(&server, Duration::from_secs(30)).await;
+    let started = tokio::time::Instant::now();
+    let result = handle
+        .start_turn(TurnInput::new(
+            InvocationId::new("session-hang").unwrap(),
+            "never submitted",
+        ))
+        .await
+        .unwrap()
+        .wait()
+        .await;
+    assert!(result.is_err());
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert_eq!(
+        server
+            .requests()
+            .iter()
+            .filter(|request| request.path.contains("/message"))
+            .count(),
+        0
+    );
+    client
+        .dispose(&RuntimeId::new("retained-opencode").unwrap())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn retained_replaces_when_session_setup_hangs_before_prompt() {
+    use temps_agent_runtime::{
+        lifecycle::{InvocationId, RuntimeId},
+        retained::{RuntimeClient, TurnInput},
+    };
+    let server = Server::new(Script::SessionHangOnce);
+    let (client, handle) = retained_fixture(&server, Duration::from_secs(30)).await;
+    for id in ["first", "second"] {
+        handle
+            .start_turn(TurnInput::new(InvocationId::new(id).unwrap(), id))
+            .await
+            .unwrap()
+            .wait()
+            .await
+            .unwrap();
+    }
+    assert_eq!(server.spawns.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        server
+            .requests()
+            .iter()
+            .filter(|request| request.path.contains("/message"))
+            .count(),
+        2
+    );
+    client
+        .dispose(&RuntimeId::new("retained-opencode").unwrap())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn retained_unresponsive_server_recovers_before_prompt_delivery() {
+    use temps_agent_runtime::{
+        lifecycle::{InvocationId, RuntimeId},
+        retained::{RuntimeClient, TurnInput},
+    };
+    let server = Server::new(Script::Complete);
+    let (client, handle) = retained_fixture(&server, Duration::from_secs(3)).await;
+    handle
+        .start_turn(TurnInput::new(InvocationId::new("first").unwrap(), "first"))
+        .await
+        .unwrap()
+        .wait()
+        .await
+        .unwrap();
+    server.health.lock().unwrap()[0].store(false, Ordering::SeqCst);
+    tokio::time::timeout(
+        Duration::from_secs(8),
+        handle
+            .start_turn(TurnInput::new(
+                InvocationId::new("recovered").unwrap(),
+                "recovered",
+            ))
+            .await
+            .unwrap()
+            .wait(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(server.spawns.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        server
+            .requests()
+            .iter()
+            .filter(|r| r.path.contains("/message"))
+            .count(),
+        2
+    );
+    client
+        .dispose(&RuntimeId::new("retained-opencode").unwrap())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn retained_dead_server_recovers_before_prompt_delivery() {
+    use temps_agent_runtime::{
+        lifecycle::{InvocationId, RuntimeId},
+        retained::{RuntimeClient, TurnInput},
+    };
+    let server = Server::new(Script::Complete);
+    let (client, handle) = retained_fixture(&server, Duration::from_secs(3)).await;
+    handle
+        .start_turn(TurnInput::new(InvocationId::new("first").unwrap(), "first"))
+        .await
+        .unwrap()
+        .wait()
+        .await
+        .unwrap();
+    server.stoppers.lock().unwrap()[0].abort();
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    tokio::time::timeout(
+        Duration::from_secs(8),
+        handle
+            .start_turn(TurnInput::new(
+                InvocationId::new("recovered").unwrap(),
+                "recovered",
+            ))
+            .await
+            .unwrap()
+            .wait(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(server.spawns.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        server
+            .requests()
+            .iter()
+            .filter(|r| r.path.contains("/message"))
+            .count(),
+        2
+    );
+    client
+        .dispose(&RuntimeId::new("retained-opencode").unwrap())
+        .await
+        .unwrap();
 }

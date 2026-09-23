@@ -123,6 +123,10 @@ impl AgentAdapter for OpenCode {
         Provider::OpenCode
     }
 
+    fn supports_retained_process(&self) -> bool {
+        self.serve_mode()
+    }
+
     fn executable(&self) -> PathBuf {
         self.configured_executable()
     }
@@ -290,6 +294,35 @@ impl AgentAdapter for OpenCode {
             })?;
         super::opencode_serve::prepare_turn(request, state, port);
         Ok(())
+    }
+
+    fn prepare_retained_turn(
+        &self,
+        request: &TurnRequest,
+        state: &mut AdapterState,
+        process_hint: Option<u64>,
+    ) -> Result<()> {
+        if !self.serve_mode() {
+            return self.prepare_turn(request, state);
+        }
+        let port = process_hint
+            .and_then(|port| u16::try_from(port).ok())
+            .ok_or_else(|| RuntimeError::Protocol {
+                provider: Provider::OpenCode,
+                message: "retained OpenCode process did not preserve its loopback port".into(),
+            })?;
+        super::opencode_serve::prepare_turn(request, state, port);
+        Ok(())
+    }
+
+    fn retained_process_hint(&self, state: &AdapterState) -> Option<u64> {
+        super::opencode_serve::turn_port(state).map(u64::from)
+    }
+
+    fn mark_retained_turn(&self, state: &mut AdapterState) {
+        if self.serve_mode() {
+            super::opencode_serve::mark_retained(state);
+        }
     }
 
     fn command_for_turn(&self, request: &TurnRequest, state: &AdapterState) -> Result<CommandSpec> {

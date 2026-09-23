@@ -488,6 +488,10 @@ impl AgentAdapter for Claude {
         Provider::Claude
     }
 
+    fn supports_retained_process(&self) -> bool {
+        true
+    }
+
     fn executable(&self) -> PathBuf {
         self.configured_executable()
     }

@@ -72,7 +72,9 @@ pub use extensions::{
     HarnessMcpServer, HarnessSkill, McpServerManagementRequest, SkillManagementRequest,
 };
 pub use interactions::{InteractionBroker, InteractionBrokerError, InteractionResolution};
-pub use runtime::{AgentRuntime, AgentRuntimeBuilder, CodexProcessRetention};
+pub use runtime::{
+    AgentRuntime, AgentRuntimeBuilder, CodexProcessRetention, ProviderProcessRetention,
+};
 pub use sandbox::{
     ResolvedSandboxProfile, SandboxBackend, SandboxCapabilities, SandboxContext, SandboxError,
     SandboxPathAccess, SandboxProfileChange, SandboxProfileManager, SandboxProfileRef,
@@ -101,9 +103,10 @@ pub use types::{
     AgentTaskActivityKind, AgentTaskUsage, ApprovalDecision, ApprovalRequest, AutoCompactionPolicy,
     CompactionTrigger, ContextCompaction, ContextWindowUsage, DenyAll, EventSink,
     InteractionHandler, LaunchContext, LaunchContextCapabilities, McpServerConfig, NoopEventSink,
-    PermissionMode, PermissionSupport, Provider, ProviderReadiness, QuestionAnswer, QuestionOption,
-    QuestionPrompt, QuestionRequest, RunStatus, SecretString, ToolCallStatus, ToolProcessPolicy,
-    TurnCapabilities, TurnEvent, TurnProvenance, TurnRequest, TurnResult, Usage,
+    PermissionMode, PermissionSupport, Provider, ProviderProcessStatus, ProviderReadiness,
+    QuestionAnswer, QuestionOption, QuestionPrompt, QuestionRequest, RunStatus, SecretString,
+    ToolCallStatus, ToolProcessPolicy, TurnCapabilities, TurnEvent, TurnProvenance, TurnRequest,
+    TurnResult, Usage,
 };
 
 pub use startup::{StartupObserver, StartupStage, StartupTiming};

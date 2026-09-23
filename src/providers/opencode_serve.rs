@@ -82,6 +82,8 @@ pub(super) struct TurnState {
     error_message: Option<String>,
     /// Whether any assistant text or tool call was observed.
     saw_activity: bool,
+    /// Require every turn-affecting SSE event to identify this turn's session.
+    retained: bool,
 }
 
 fn load(state: &AdapterState) -> TurnState {
@@ -103,6 +105,12 @@ fn store(state: &mut AdapterState, turn: &TurnState) {
 pub(super) fn turn_port(state: &AdapterState) -> Option<u16> {
     let port = load(state).port;
     (port != 0).then_some(port)
+}
+
+pub(super) fn mark_retained(state: &mut AdapterState) {
+    let mut turn = load(state);
+    turn.retained = true;
+    store(state, &turn);
 }
 
 fn protocol(message: impl Into<String>) -> RuntimeError {
@@ -513,6 +521,9 @@ fn response(
                 "path": "/event",
             }))?);
         }
+        Some(ID_PROMPT) if (200..300).contains(&status) => {
+            output.turn_submitted = true;
+        }
         Some(ID_PROMPT) if status == 0 || status >= 400 => {
             let message = body
                 .pointer("/data/message")
@@ -541,11 +552,18 @@ fn event(
         .and_then(Value::as_str)
         .unwrap_or_default();
     let properties = event.get("properties").unwrap_or(&Value::Null);
-    // Another session's activity must never be charged to this turn.
-    if let (Some(reported), Some(current)) = (
-        properties.get("sessionID").and_then(Value::as_str),
-        turn.session_id.as_deref(),
-    ) {
+    // A retained server carries traffic for more than one turn. Fail closed:
+    // every event that can mutate or finish a turn must identify the current
+    // session, so delayed or unrelated traffic cannot leak across turns.
+    let reported = properties.get("sessionID").and_then(Value::as_str);
+    if turn.retained {
+        if reported
+            .zip(turn.session_id.as_deref())
+            .is_none_or(|(a, b)| a != b)
+        {
+            return;
+        }
+    } else if let (Some(reported), Some(current)) = (reported, turn.session_id.as_deref()) {
         if reported != current {
             return;
         }

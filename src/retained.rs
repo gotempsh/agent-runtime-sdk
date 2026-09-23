@@ -481,8 +481,7 @@ impl RuntimeTurnExecutor for AgentRuntime {
     fn capabilities(&self, provider: Provider) -> RuntimeDriverCapabilities {
         let permissions = self.permission_support(provider).ok();
         RuntimeDriverCapabilities {
-            retained_process: provider == Provider::Codex
-                && self.codex_process_retention_enabled(provider),
+            retained_process: self.process_retention_enabled(provider),
             session_resume: true,
             live_interactions: permissions
                 .is_some_and(|support| support.live_approvals || support.live_questions),
