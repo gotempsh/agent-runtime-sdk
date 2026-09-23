@@ -149,7 +149,7 @@ struct RetainedCodexProcess {
     io: AsyncMutex<Option<RetainedCodexIo>>,
     generation: AtomicU64,
     usable: AtomicBool,
-    _permit: OwnedSemaphorePermit,
+    permit: AsyncMutex<Option<OwnedSemaphorePermit>>,
 }
 
 struct RetainedCodexIo {
@@ -2588,13 +2588,14 @@ impl AgentRuntime {
         trace: &StartupTrace,
     ) -> Result<TurnResult> {
         let provider = request.provider;
-        let has_runtime_process = supervisor
+        let initial_process = supervisor
             .inner
             .processes
             .lock()
             .await
-            .contains_key(runtime_id);
-        let reserved_permit = if has_runtime_process {
+            .get(runtime_id)
+            .cloned();
+        let reserved_permit = if initial_process.is_some() {
             None
         } else {
             match supervisor.inner.permits.clone().try_acquire_owned() {
@@ -2671,7 +2672,14 @@ impl AgentRuntime {
                 None => None,
             }
         };
+        let mut available_permit = reserved_permit;
         if let Some(previous) = previous {
+            // Transfer the slot before teardown. This makes a configuration
+            // replacement atomic with respect to pool capacity: another
+            // runtime cannot steal the released slot after sandbox preparation.
+            if available_permit.is_none() {
+                available_permit = previous.permit.lock().await.take();
+            }
             previous.terminate().await?;
         }
 
@@ -2685,7 +2693,13 @@ impl AgentRuntime {
         let retained = if let Some(existing) = existing {
             existing
         } else {
-            let permit = if let Some(permit) = reserved_permit {
+            if available_permit.is_none() {
+                if let Some(initial) = &initial_process {
+                    available_permit = initial.permit.lock().await.take();
+                    initial.terminate().await?;
+                }
+            }
+            let permit = if let Some(permit) = available_permit {
                 permit
             } else {
                 supervisor
@@ -2765,7 +2779,7 @@ impl AgentRuntime {
                 })),
                 generation: AtomicU64::new(0),
                 usable: AtomicBool::new(true),
-                _permit: permit,
+                permit: AsyncMutex::new(Some(permit)),
             });
             supervisor
                 .inner

@@ -560,6 +560,43 @@ async fn changed_permission_replaces_the_retained_process() {
 }
 
 #[tokio::test]
+async fn configuration_replacement_transfers_its_only_pool_slot() {
+    let transport = AppServer::new(Script::AsyncQuestion);
+    let mut builder = AgentRuntime::builder()
+        .transport(transport.clone())
+        .codex_process_retention(CodexProcessRetention {
+            max_processes: 1,
+            idle_timeout: Duration::from_secs(30),
+        });
+    builder.register(Codex::app_server());
+    let (_client, handle) = retained_handle(builder.build().unwrap()).await;
+    handle
+        .start_turn(TurnInput::new(
+            InvocationId::new("replace-only-slot-one").unwrap(),
+            "first",
+        ))
+        .await
+        .unwrap()
+        .wait()
+        .await
+        .unwrap();
+    let mut changed = TurnInput::new(
+        InvocationId::new("replace-only-slot-two").unwrap(),
+        "second",
+    );
+    changed.permission_mode = Some(PermissionMode::FullAccess);
+    handle
+        .start_turn(changed)
+        .await
+        .unwrap()
+        .wait()
+        .await
+        .unwrap();
+    assert_eq!(transport.spawn_count(), 2);
+    assert!(transport.termination_count() >= 1);
+}
+
+#[tokio::test]
 async fn idle_expiry_and_dispose_terminate_retained_processes() {
     let transport = AppServer::new(Script::AsyncQuestion);
     let runtime = retained_runtime(transport.clone(), Duration::from_millis(20));
