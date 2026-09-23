@@ -5,6 +5,12 @@ Versioning and Keep a Changelog conventions.
 
 ## [Unreleased]
 
+### Fixed
+
+- Codex resumes and active-writer forks omit historical turns from their replies,
+  so long conversations can continue without exceeding the protocol frame limit.
+  Saved provider context is preserved.
+
 ### Changed
 
 - Preserve Windows system and profile environment variables when launching providers,
