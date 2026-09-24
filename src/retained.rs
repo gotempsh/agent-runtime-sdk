@@ -1109,6 +1109,7 @@ impl RuntimeEntry {
             invocation_id: invocation_id.clone(),
             sequence: AtomicU64::new(0),
             sender: event_sender,
+            announced_session_id: std::sync::Mutex::new(None),
         };
         let entry = Arc::clone(self);
         let task_terminal = Arc::clone(&terminal);
@@ -1181,13 +1182,22 @@ impl RuntimeEntry {
                 {
                     state.active = None;
                 }
-                if let Ok(turn) = &result {
-                    if let Some(session_id) = &turn.session_id {
-                        state.provider_session_id = Some(session_id.clone());
-                    }
-                    state.detail = None;
-                } else if let Err(failure) = &result {
-                    state.detail = Some(failure.message.clone());
+                // A provider session exists as soon as the provider announces
+                // it, not only once the turn succeeds. An interrupted or
+                // failed turn still leaves that session on disk with the
+                // conversation so far; forgetting it would make the next
+                // turn start a fresh session with no history.
+                let session_id = result
+                    .as_ref()
+                    .ok()
+                    .and_then(|turn| turn.session_id.clone())
+                    .or_else(|| sink.announced_session_id());
+                if let Some(session_id) = session_id {
+                    state.provider_session_id = Some(session_id);
+                }
+                match &result {
+                    Ok(_) => state.detail = None,
+                    Err(failure) => state.detail = Some(failure.message.clone()),
                 }
                 state.status = if entry.disposed.load(Ordering::Acquire) {
                     RuntimeStatus::Stopped
@@ -1459,17 +1469,32 @@ struct ChannelEventSink {
     invocation_id: InvocationId,
     sequence: AtomicU64,
     sender: mpsc::Sender<EventEnvelope>,
+    /// Latest `SessionStarted` the provider emitted during this invocation.
+    announced_session_id: std::sync::Mutex<Option<String>>,
 }
 
 #[async_trait]
 impl EventSink for ChannelEventSink {
     async fn emit(&self, event: TurnEvent) -> crate::Result<()> {
+        if let TurnEvent::SessionStarted { session_id, .. } = &event {
+            *self
+                .announced_session_id
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(session_id.clone());
+        }
         self.emit_runtime(RuntimeEvent::ProviderEvent { event })
             .await
     }
 }
 
 impl ChannelEventSink {
+    fn announced_session_id(&self) -> Option<String> {
+        self.announced_session_id
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     async fn emit_runtime(&self, event: RuntimeEvent) -> crate::Result<()> {
         let envelope = EventEnvelope {
             schema_version: 1,
@@ -1987,6 +2012,118 @@ mod tests {
                 provider: request.provider,
             })
         }
+    }
+
+    /// Announces a provider session on the first turn, then blocks until the
+    /// turn is interrupted -- a user sending a follow-up mid-turn. Later
+    /// turns finish immediately and echo the session they were asked to
+    /// resume.
+    struct SessionThenBlockExecutor {
+        requested_sessions: StdMutex<Vec<Option<String>>>,
+    }
+
+    #[async_trait]
+    impl RuntimeTurnExecutor for SessionThenBlockExecutor {
+        fn capabilities(&self, _provider: Provider) -> RuntimeDriverCapabilities {
+            RuntimeDriverCapabilities {
+                retained_process: true,
+                session_resume: true,
+                ..RuntimeDriverCapabilities::default()
+            }
+        }
+
+        fn configuration_impact(&self, _key: RuntimeConfigurationKey) -> ConfigurationImpact {
+            ConfigurationImpact::Live
+        }
+
+        async fn execute(
+            &self,
+            request: TurnRequest,
+            events: &dyn EventSink,
+            _interactions: Option<&dyn InteractionHandler>,
+        ) -> crate::Result<TurnResult> {
+            let first = {
+                let mut sessions = self
+                    .requested_sessions
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                sessions.push(request.session_id.clone());
+                sessions.len() == 1
+            };
+            if first {
+                events
+                    .emit(TurnEvent::SessionStarted {
+                        session_id: "session-interrupted".to_owned(),
+                        title: None,
+                    })
+                    .await?;
+                request.cancellation.cancelled().await;
+                return Err(RuntimeError::Cancelled {
+                    provider: request.provider,
+                });
+            }
+            Ok(TurnResult {
+                status: RunStatus::Succeeded,
+                text: "ok".to_owned(),
+                reasoning: None,
+                session_id: request.session_id.clone(),
+                session_title: None,
+                model: None,
+                usage: Usage::default(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn interrupted_turn_keeps_the_session_the_provider_already_started() {
+        let executor = Arc::new(SessionThenBlockExecutor {
+            requested_sessions: StdMutex::new(Vec::new()),
+        });
+        let client = InProcessRuntimeClient::from_executor(executor.clone());
+        let handle = client
+            .acquire(runtime_spec("runtime-interrupted-session"))
+            .await
+            .expect("acquire runtime");
+
+        let turn = handle
+            .start_turn(turn_input("turn-interrupted", "investigate the alerts"))
+            .await
+            .expect("start first turn");
+        let interrupt = turn.interrupt_handle();
+        let (mut events, completion) = turn.into_parts();
+        loop {
+            let envelope = events.next().await.expect("session announcement");
+            if matches!(
+                envelope.event,
+                RuntimeEvent::ProviderEvent {
+                    event: TurnEvent::SessionStarted { .. }
+                }
+            ) {
+                break;
+            }
+        }
+        assert_eq!(interrupt.interrupt().await, InterruptOutcome::Interrupted);
+        while events.next().await.is_some() {}
+        let failure = completion.wait().await.expect_err("interrupted turn");
+        assert_eq!(failure.kind, RuntimeFailureKind::Cancelled);
+
+        handle
+            .start_turn(turn_input("turn-follow-up", "keep going"))
+            .await
+            .expect("start follow-up turn")
+            .wait()
+            .await
+            .expect("follow-up result");
+
+        let sessions = executor
+            .requested_sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            sessions.as_slice(),
+            [None, Some("session-interrupted".to_owned())],
+            "a follow-up after an interrupted turn must resume the provider session, not start a fresh one"
+        );
     }
 
     fn runtime_spec(id: &str) -> RuntimeSpec {
