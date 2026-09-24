@@ -828,6 +828,13 @@ pub enum TurnEvent {
         /// Human-readable diagnostic.
         message: String,
     },
+    /// Retained provider process lifecycle progress.
+    ProviderProcessStatus {
+        /// Current process lifecycle state.
+        status: ProviderProcessStatus,
+        /// Bounded content-free explanation suitable for user feedback.
+        message: String,
+    },
     /// A sandbox backend identified a denied provider tool step.
     SandboxAccessDenied {
         /// Exact managed profile revision, when the turn used one.
@@ -849,6 +856,21 @@ pub enum TurnEvent {
         /// One-based retry attempt number.
         attempt: u8,
     },
+}
+
+/// Lifecycle state for an opt-in retained provider process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ProviderProcessStatus {
+    /// The runtime is checking whether an idle process is responsive.
+    Checking,
+    /// A stale process is being replaced before prompt submission.
+    Replacing,
+    /// A provider process is ready to receive a turn.
+    Ready,
+    /// A retained process was stopped after a failure or lifecycle boundary.
+    Stopped,
 }
 
 /// Human approval requested by an adapter.

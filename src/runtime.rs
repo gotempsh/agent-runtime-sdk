@@ -68,6 +68,46 @@ pub struct CodexProcessRetention {
     pub idle_timeout: Duration,
 }
 
+/// Limits and health deadlines for opt-in built-in provider process reuse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderProcessRetention {
+    /// Maximum retained Claude, Codex, and OpenCode processes in aggregate.
+    pub max_processes: usize,
+    /// How long an idle process may remain alive after a completed turn.
+    pub idle_timeout: Duration,
+    /// Maximum time for a retained provider to become ready for a turn.
+    pub initialization_timeout: Duration,
+    /// Optional maximum silence while a submitted turn is active.
+    pub active_inactivity_timeout: Option<Duration>,
+}
+
+impl ProviderProcessRetention {
+    fn validate(self) -> Result<()> {
+        if self.max_processes == 0 {
+            return Err(RuntimeError::InvalidRequest {
+                field: "provider_process_retention.max_processes",
+                message: "must be greater than zero".to_string(),
+            });
+        }
+        if self.idle_timeout.is_zero() || self.initialization_timeout.is_zero() {
+            return Err(RuntimeError::InvalidRequest {
+                field: "provider_process_retention",
+                message: "idle and initialization timeouts must be greater than zero".to_string(),
+            });
+        }
+        if self
+            .active_inactivity_timeout
+            .is_some_and(|timeout| timeout.is_zero())
+        {
+            return Err(RuntimeError::InvalidRequest {
+                field: "provider_process_retention.active_inactivity_timeout",
+                message: "must be greater than zero when configured".to_string(),
+            });
+        }
+        Ok(())
+    }
+}
+
 impl CodexProcessRetention {
     fn validate(self) -> Result<()> {
         if self.max_processes == 0 {
@@ -92,13 +132,13 @@ struct CodexProcessSupervisor {
 }
 
 struct CodexProcessSupervisorInner {
-    config: CodexProcessRetention,
+    config: ProviderProcessRetention,
     permits: Arc<Semaphore>,
     processes: AsyncMutex<HashMap<crate::lifecycle::RuntimeId, Arc<RetainedCodexProcess>>>,
 }
 
 impl CodexProcessSupervisor {
-    fn new(config: CodexProcessRetention) -> Self {
+    fn new(config: ProviderProcessRetention) -> Self {
         Self {
             inner: Arc::new(CodexProcessSupervisorInner {
                 config,
@@ -144,11 +184,30 @@ struct RetainedCodexFingerprint {
     required_sandbox_capabilities: crate::SandboxCapabilities,
 }
 
+fn retained_fingerprint_command(provider: Provider, mut command: CommandSpec) -> CommandSpec {
+    command.initial_stdin = None;
+    if provider == Provider::Claude {
+        let mut filtered = Vec::with_capacity(command.args.len());
+        let mut arguments = command.args.into_iter();
+        while let Some(argument) = arguments.next() {
+            if argument == "--resume" {
+                let _ = arguments.next();
+            } else {
+                filtered.push(argument);
+            }
+        }
+        command.args = filtered;
+    }
+    command
+}
+
 struct RetainedCodexProcess {
     fingerprint: RetainedCodexFingerprint,
     io: AsyncMutex<Option<RetainedCodexIo>>,
     generation: AtomicU64,
     usable: AtomicBool,
+    process_hint: Option<u64>,
+    session_id: AsyncMutex<Option<String>>,
     permit: AsyncMutex<Option<OwnedSemaphorePermit>>,
 }
 
@@ -157,6 +216,7 @@ struct RetainedCodexIo {
     stdin: crate::TransportWriter,
     reader: BufReader<crate::TransportReader>,
     stderr_task: tokio::task::JoinHandle<std::io::Result<String>>,
+    stdout_task: Option<tokio::task::JoinHandle<std::io::Result<String>>>,
 }
 
 async fn read_bounded_retained_line(
@@ -204,6 +264,9 @@ impl RetainedCodexProcess {
         self.generation.fetch_add(1, Ordering::AcqRel);
         if let Some(mut io) = self.io.lock().await.take() {
             io.stderr_task.abort();
+            if let Some(stdout_task) = io.stdout_task.take() {
+                stdout_task.abort();
+            }
             io.process
                 .terminate()
                 .await
@@ -519,6 +582,7 @@ pub struct AgentRuntimeBuilder {
     max_event_line_bytes: usize,
     startup_observer: Option<Arc<StartupObserverState>>,
     codex_process_retention: Option<CodexProcessRetention>,
+    provider_process_retention: Option<ProviderProcessRetention>,
 }
 
 impl AgentRuntimeBuilder {
@@ -533,6 +597,7 @@ impl AgentRuntimeBuilder {
             max_event_line_bytes: DEFAULT_MAX_EVENT_LINE_BYTES,
             startup_observer: None,
             codex_process_retention: None,
+            provider_process_retention: None,
         };
         #[cfg(feature = "claude")]
         builder.register(crate::providers::Claude::default());
@@ -599,6 +664,12 @@ impl AgentRuntimeBuilder {
         self
     }
 
+    /// Keep supported built-in provider processes across retained-runtime turns.
+    pub fn provider_process_retention(mut self, config: ProviderProcessRetention) -> Self {
+        self.provider_process_retention = Some(config);
+        self
+    }
+
     /// Validate limits and construct the runtime.
     pub fn build(self) -> Result<AgentRuntime> {
         if self.concurrency_limit == 0 {
@@ -616,6 +687,18 @@ impl AgentRuntimeBuilder {
         if let Some(config) = self.codex_process_retention {
             config.validate()?;
         }
+        if let Some(config) = self.provider_process_retention {
+            config.validate()?;
+        }
+        let retention = self.provider_process_retention.or_else(|| {
+            self.codex_process_retention
+                .map(|config| ProviderProcessRetention {
+                    max_processes: config.max_processes,
+                    idle_timeout: config.idle_timeout,
+                    initialization_timeout: Duration::from_secs(30),
+                    active_inactivity_timeout: None,
+                })
+        });
         Ok(AgentRuntime {
             adapters: self.adapters,
             transport: self.transport,
@@ -623,9 +706,8 @@ impl AgentRuntimeBuilder {
             max_prompt_bytes: self.max_prompt_bytes,
             max_event_line_bytes: self.max_event_line_bytes,
             startup_observer: self.startup_observer,
-            codex_process_retention: self
-                .codex_process_retention
-                .map(CodexProcessSupervisor::new),
+            codex_process_retention: retention.map(CodexProcessSupervisor::new),
+            provider_process_retention: self.provider_process_retention,
         })
     }
 }
@@ -944,6 +1026,7 @@ pub struct AgentRuntime {
     max_event_line_bytes: usize,
     startup_observer: Option<Arc<StartupObserverState>>,
     codex_process_retention: Option<CodexProcessSupervisor>,
+    provider_process_retention: Option<ProviderProcessRetention>,
 }
 
 impl AgentRuntime {
@@ -2124,9 +2207,10 @@ impl AgentRuntime {
         result
     }
 
-    pub(crate) fn codex_process_retention_enabled(&self, provider: Provider) -> bool {
-        provider == Provider::Codex
-            && self.codex_process_retention.is_some()
+    pub(crate) fn process_retention_enabled(&self, provider: Provider) -> bool {
+        self.codex_process_retention.is_some()
+            && (provider == Provider::Codex || self.provider_process_retention.is_some())
+            && !(provider == Provider::OpenCode && self.transport.capabilities().remote)
             && self
                 .adapters
                 .get(&provider)
@@ -2140,7 +2224,7 @@ impl AgentRuntime {
         events: &dyn EventSink,
         interactions: Option<&dyn InteractionHandler>,
     ) -> Result<TurnResult> {
-        if !self.codex_process_retention_enabled(request.provider) {
+        if !self.process_retention_enabled(request.provider) {
             return self.run(request, events, interactions).await;
         }
         let mut trace = StartupTrace::new(request.provider, self.startup_observer.clone());
@@ -2612,7 +2696,15 @@ impl AgentRuntime {
         };
         let mut state = AdapterState::default();
         state.result.session_id.clone_from(&request.session_id);
-        adapter.prepare_turn(request, &mut state)?;
+        if provider == Provider::OpenCode {
+            if let Some(initial) = &initial_process {
+                adapter.prepare_retained_turn(request, &mut state, initial.process_hint)?;
+            } else {
+                adapter.prepare_turn(request, &mut state)?;
+            }
+        } else {
+            adapter.prepare_turn(request, &mut state)?;
+        }
         adapter.mark_retained_turn(&mut state);
         let mut spec = adapter.command_for_turn(request, &state)?;
         for (name, value) in &request.environment {
@@ -2631,12 +2723,14 @@ impl AgentRuntime {
             trace.record(StartupStage::SandboxPrepared);
         }
         let capabilities = self.transport.capabilities();
-        if !spec.interactive_stdin || !capabilities.interactive_stdin {
+        if provider != Provider::OpenCode
+            && (!spec.interactive_stdin || !capabilities.interactive_stdin)
+        {
             return Err(RuntimeError::TransportCapabilityUnavailable {
                 provider,
                 transport: self.transport.name().to_string(),
                 capability: "interactive_stdin",
-                message: "retained Codex requires writable provider stdin".to_string(),
+                message: format!("retained {provider} requires writable provider stdin"),
             });
         }
         if !capabilities.process_tree_termination {
@@ -2644,11 +2738,11 @@ impl AgentRuntime {
                 provider,
                 transport: self.transport.name().to_string(),
                 capability: "process_tree_termination",
-                message: "retained Codex requires complete process-tree termination".to_string(),
+                message: format!("retained {provider} requires complete process-tree termination"),
             });
         }
         let fingerprint = RetainedCodexFingerprint {
-            command: spec.clone(),
+            command: retained_fingerprint_command(provider, spec.clone()),
             working_directory: request.working_directory.clone(),
             model: request.model.clone(),
             reasoning: request.reasoning.clone(),
@@ -2683,13 +2777,211 @@ impl AgentRuntime {
             previous.terminate().await?;
         }
 
-        let existing = supervisor
+        let mut existing = supervisor
             .inner
             .processes
             .lock()
             .await
             .get(runtime_id)
             .cloned();
+        if let Some(candidate) = existing.clone() {
+            if *candidate.session_id.lock().await != request.session_id {
+                supervisor.remove_if_same(runtime_id, &candidate).await;
+                if available_permit.is_none() {
+                    available_permit = candidate.permit.lock().await.take();
+                }
+                candidate.terminate().await?;
+                existing = None;
+            }
+        }
+        let mut prepared_protocol_streams = None;
+        let mut prefetched_line = None;
+        let mut preflight_events = Vec::new();
+        let mut claimed_generation = None;
+        if provider == Provider::Claude {
+            if let Some(candidate) = existing.clone() {
+                events
+                    .emit(TurnEvent::ProviderProcessStatus {
+                        status: crate::ProviderProcessStatus::Checking,
+                        message: "Checking the retained Claude process before sending the prompt."
+                            .to_string(),
+                    })
+                    .await?;
+                let claim = candidate.generation.fetch_add(1, Ordering::AcqRel) + 1;
+                claimed_generation = Some(claim);
+                let request_id = format!("temps-agent-runtime-health-{claim}");
+                let probe = serde_json::to_vec(&serde_json::json!({
+                    "type": "control_request",
+                    "request_id": request_id,
+                    "request": { "subtype": "mcp_status" }
+                }))
+                .map_err(|error| RuntimeError::Protocol {
+                    provider,
+                    message: format!("could not encode Claude health probe: {error}"),
+                })?;
+                let health_timeout = supervisor
+                    .inner
+                    .config
+                    .initialization_timeout
+                    .min(Duration::from_secs(3));
+                let healthy = {
+                    let mut guard = candidate.io.lock().await;
+                    if let Some(io) = guard.as_mut() {
+                        let exchange = async {
+                            write_provider_frames(
+                                provider,
+                                Some(&mut io.stdin),
+                                &[probe],
+                                "health probe",
+                            )
+                            .await?;
+                            read_bounded_retained_line(&mut io.reader, self.max_event_line_bytes)
+                                .await
+                                .map_err(|source| RuntimeError::ProcessIo {
+                                    provider,
+                                    stream: "stdout read",
+                                    source,
+                                })
+                        };
+                        tokio::time::timeout(health_timeout, exchange)
+                            .await
+                            .ok()
+                            .and_then(std::result::Result::ok)
+                            .flatten()
+                            .and_then(|line| serde_json::from_str::<serde_json::Value>(&line).ok())
+                            .is_some_and(|frame| {
+                                frame
+                                    .pointer("/response/request_id")
+                                    .and_then(serde_json::Value::as_str)
+                                    == Some(request_id.as_str())
+                                    && frame
+                                        .pointer("/response/subtype")
+                                        .and_then(serde_json::Value::as_str)
+                                        == Some("success")
+                            })
+                    } else {
+                        false
+                    }
+                };
+                if !healthy {
+                    supervisor.remove_if_same(runtime_id, &candidate).await;
+                    if available_permit.is_none() {
+                        available_permit = candidate.permit.lock().await.take();
+                    }
+                    candidate.terminate().await?;
+                    existing = None;
+                    claimed_generation = None;
+                    events
+                        .emit(TurnEvent::ProviderProcessStatus {
+                            status: crate::ProviderProcessStatus::Replacing,
+                            message: "The retained Claude process stopped responding before prompt submission; starting a replacement.".to_string(),
+                        })
+                        .await?;
+                }
+            }
+        } else if provider == Provider::OpenCode {
+            if let Some(candidate) = existing.clone() {
+                // Handshake parsing can record a terminal failure. Keep it in
+                // disposable state until every pre-prompt step succeeds so a
+                // replacement never inherits failure from the stale server.
+                let mut preflight_state = AdapterState::default();
+                preflight_state
+                    .result
+                    .session_id
+                    .clone_from(&request.session_id);
+                adapter.prepare_retained_turn(
+                    request,
+                    &mut preflight_state,
+                    candidate.process_hint,
+                )?;
+                adapter.mark_retained_turn(&mut preflight_state);
+                events
+                    .emit(TurnEvent::ProviderProcessStatus {
+                        status: crate::ProviderProcessStatus::Checking,
+                        message: "Checking the retained OpenCode server before sending the prompt."
+                            .to_string(),
+                    })
+                    .await?;
+                claimed_generation = Some(candidate.generation.fetch_add(1, Ordering::AcqRel) + 1);
+                let health_timeout = supervisor
+                    .inner
+                    .config
+                    .initialization_timeout
+                    .min(Duration::from_secs(3));
+                let health = tokio::time::timeout(health_timeout, async {
+                    let streams = adapter.attach(request, &state).await?.ok_or_else(|| {
+                        RuntimeError::Protocol {
+                            provider,
+                            message:
+                                "retained OpenCode adapter did not provide HTTP bridge streams"
+                                    .to_string(),
+                        }
+                    })?;
+                    let mut writer = streams.writer;
+                    let mut reader = BufReader::new(streams.reader);
+                    let mut pending_events = Vec::new();
+                    loop {
+                        let line =
+                            read_bounded_retained_line(&mut reader, self.max_event_line_bytes)
+                                .await
+                                .map_err(|source| RuntimeError::ProcessIo {
+                                    provider,
+                                    stream: "HTTP bridge read",
+                                    source,
+                                })?
+                                .ok_or_else(|| RuntimeError::Protocol {
+                                    provider,
+                                    message: "OpenCode's pre-prompt bridge closed".to_string(),
+                                })?;
+                        let kind = serde_json::from_str::<serde_json::Value>(&line)
+                            .ok()
+                            .and_then(|frame| {
+                                frame
+                                    .get("type")
+                                    .and_then(serde_json::Value::as_str)
+                                    .map(str::to_owned)
+                            });
+                        if kind.as_deref() == Some("@subscribed") {
+                            break Ok::<_, RuntimeError>((writer, reader, line, pending_events));
+                        }
+                        let output = adapter.parse_line(&line, &mut preflight_state)?;
+                        if output.terminal || output.interaction.is_some() {
+                            return Err(RuntimeError::Protocol {
+                                provider,
+                                message: "OpenCode failed before prompt submission".to_string(),
+                            });
+                        }
+                        pending_events.extend(output.events);
+                        write_provider_frames(
+                            provider,
+                            Some(&mut writer),
+                            &output.writes,
+                            "OpenCode preflight",
+                        )
+                        .await?;
+                    }
+                })
+                .await;
+                if let Ok(Ok((writer, reader, line, pending_events))) = health {
+                    state = preflight_state;
+                    prepared_protocol_streams = Some((writer, reader));
+                    prefetched_line = Some(line);
+                    preflight_events = pending_events;
+                } else {
+                    supervisor.remove_if_same(runtime_id, &candidate).await;
+                    if available_permit.is_none() {
+                        available_permit = candidate.permit.lock().await.take();
+                    }
+                    candidate.terminate().await?;
+                    existing = None;
+                    claimed_generation = None;
+                    events.emit(TurnEvent::ProviderProcessStatus {
+                            status: crate::ProviderProcessStatus::Replacing,
+                            message: "The retained OpenCode server stopped responding before prompt submission; starting a replacement.".to_string(),
+                        }).await?;
+                }
+            }
+        }
         let retained = if let Some(existing) = existing {
             existing
         } else {
@@ -2713,7 +3005,9 @@ impl AgentRuntime {
                             TransportErrorKind::SpawnFailed,
                             self.transport.name(),
                             "retain_process",
-                            "retained Codex capacity changed while preparing the process",
+                            format!(
+                                "retained {provider} capacity changed while preparing the process"
+                            ),
                             true,
                         ),
                     })?
@@ -2740,45 +3034,86 @@ impl AgentRuntime {
                     }
                 })?;
             trace.record(StartupStage::ProcessSpawned);
-            let mut stdin = process.take_stdin().ok_or_else(|| RuntimeError::Protocol {
-                provider,
-                message: "retained Codex process did not expose stdin".to_string(),
-            })?;
-            if let Some(initial) = &spec.initial_stdin {
-                write_provider_frames(
-                    provider,
-                    Some(&mut stdin),
-                    std::slice::from_ref(initial),
-                    "initial input",
-                )
-                .await?;
-                trace.record(StartupStage::InitialInputWritten);
+            // From this point until the process is registered, every fallible
+            // setup step must explicitly terminate the child.
+            let setup_result: Result<_> = async {
+                let mut stdin = if provider == Provider::OpenCode {
+                    let (writer, _reader) = tokio::io::duplex(1);
+                    Box::new(writer) as crate::TransportWriter
+                } else {
+                    process.take_stdin().ok_or_else(|| RuntimeError::Protocol {
+                        provider,
+                        message: "retained provider process did not expose stdin".to_string(),
+                    })?
+                };
+                if let Some(initial) = &spec.initial_stdin {
+                    write_provider_frames(
+                        provider,
+                        Some(&mut stdin),
+                        std::slice::from_ref(initial),
+                        "initial input",
+                    )
+                    .await?;
+                    trace.record(StartupStage::InitialInputWritten);
+                }
+                let stdout = process
+                    .take_stdout()
+                    .ok_or_else(|| RuntimeError::Protocol {
+                        provider,
+                        message: format!("retained {provider} process did not expose stdout"),
+                    })?;
+                let stderr = process
+                    .take_stderr()
+                    .ok_or_else(|| RuntimeError::Protocol {
+                        provider,
+                        message: format!("retained {provider} process did not expose stderr"),
+                    })?;
+                let (stdin, reader, stdout_task) = if provider == Provider::OpenCode {
+                    let streams = adapter.attach(request, &state).await?.ok_or_else(|| {
+                        RuntimeError::Protocol {
+                            provider,
+                            message:
+                                "retained OpenCode adapter did not provide HTTP bridge streams"
+                                    .to_string(),
+                        }
+                    })?;
+                    (
+                        streams.writer,
+                        BufReader::new(streams.reader),
+                        Some(tokio::spawn(crate::process::bounded_stderr(
+                            stdout,
+                            STDERR_TAIL_BYTES,
+                        ))),
+                    )
+                } else {
+                    (stdin, BufReader::new(stdout), None)
+                };
+                Ok((stdin, reader, stdout_task, stderr))
             }
-            let stdout = process
-                .take_stdout()
-                .ok_or_else(|| RuntimeError::Protocol {
-                    provider,
-                    message: "retained Codex process did not expose stdout".to_string(),
-                })?;
-            let stderr = process
-                .take_stderr()
-                .ok_or_else(|| RuntimeError::Protocol {
-                    provider,
-                    message: "retained Codex process did not expose stderr".to_string(),
-                })?;
+            .await;
+            let (stdin, reader, stdout_task, stderr) = match setup_result {
+                Ok(parts) => parts,
+                Err(error) => {
+                    let _ = process.terminate().await;
+                    return Err(error);
+                }
+            };
             let retained = Arc::new(RetainedCodexProcess {
                 fingerprint,
                 io: AsyncMutex::new(Some(RetainedCodexIo {
                     process,
                     stdin,
-                    reader: BufReader::new(stdout),
+                    reader,
                     stderr_task: tokio::spawn(crate::process::bounded_stderr(
                         stderr,
                         STDERR_TAIL_BYTES,
                     )),
+                    stdout_task,
                 })),
                 generation: AtomicU64::new(0),
                 usable: AtomicBool::new(true),
+                process_hint: adapter.retained_process_hint(&state),
+                session_id: AsyncMutex::new(request.session_id.clone()),
                 permit: AsyncMutex::new(Some(permit)),
             });
             supervisor
@@ -2790,7 +3125,8 @@ impl AgentRuntime {
             retained
         };
 
-        let generation = retained.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        let generation = claimed_generation
+            .unwrap_or_else(|| retained.generation.fetch_add(1, Ordering::AcqRel) + 1);
         let mut cleanup = RetainedTurnCleanup {
             armed: true,
             supervisor: supervisor.clone(),
@@ -2800,33 +3136,67 @@ impl AgentRuntime {
         let mut io_guard = retained.io.lock().await;
         let io = io_guard.as_mut().ok_or_else(|| RuntimeError::Protocol {
             provider,
-            message: "retained Codex process is no longer available".to_string(),
+            message: format!("retained {provider} process is no longer available"),
         })?;
         let reused = generation > 1;
         if reused {
-            let start =
-                adapter
-                    .retained_turn_start(&state)?
-                    .ok_or_else(|| RuntimeError::Protocol {
-                        provider,
-                        message: "configured Codex adapter cannot start a retained turn"
-                            .to_string(),
+            if provider == Provider::OpenCode {
+                if let Some((writer, reader)) = prepared_protocol_streams.take() {
+                    io.stdin = writer;
+                    io.reader = reader;
+                } else {
+                    let streams = adapter.attach(request, &state).await?.ok_or_else(|| {
+                        RuntimeError::Protocol {
+                            provider,
+                            message:
+                                "retained OpenCode adapter did not provide HTTP bridge streams"
+                                    .to_string(),
+                        }
                     })?;
-            write_provider_frames(
-                provider,
-                Some(&mut io.stdin),
-                std::slice::from_ref(&start),
-                "retained turn start",
-            )
-            .await?;
+                    io.stdin = streams.writer;
+                    io.reader = BufReader::new(streams.reader);
+                }
+            }
+            if provider != Provider::OpenCode {
+                let start = if provider == Provider::Claude {
+                    spec.initial_stdin.clone()
+                } else {
+                    adapter.retained_turn_start(&state)?
+                }
+                .ok_or_else(|| RuntimeError::Protocol {
+                    provider,
+                    message: format!("configured {provider} adapter cannot start a retained turn"),
+                })?;
+                write_provider_frames(
+                    provider,
+                    Some(&mut io.stdin),
+                    std::slice::from_ref(&start),
+                    "retained turn start",
+                )
+                .await?;
+            }
         }
         trace.record(StartupStage::StreamsAttached);
+        for event in preflight_events {
+            events.emit(event).await?;
+        }
         let result = self
-            .drive_retained_codex_turn(adapter.as_ref(), request, events, interactions, trace, io)
+            .drive_retained_codex_turn(
+                adapter.as_ref(),
+                request,
+                events,
+                interactions,
+                trace,
+                io,
+                supervisor.inner.config,
+                state,
+                prefetched_line,
+            )
             .await;
         drop(io_guard);
         match result {
             Ok(result) => {
+                *retained.session_id.lock().await = result.session_id.clone();
                 cleanup.disarm();
                 let runtime_id = runtime_id.clone();
                 let retained_for_expiry = Arc::clone(&retained);
@@ -2836,38 +3206,45 @@ impl AgentRuntime {
                 let supervisor_for_drain = supervisor.clone();
                 let runtime_id_for_drain = runtime_id.clone();
                 let max_event_line_bytes = self.max_event_line_bytes;
-                tokio::spawn(async move {
-                    loop {
-                        if retained_for_drain.generation.load(Ordering::Acquire) != generation
-                            || !retained_for_drain.usable.load(Ordering::Acquire)
-                        {
-                            return;
-                        }
-                        let observed = {
-                            let mut io = retained_for_drain.io.lock().await;
-                            if retained_for_drain.generation.load(Ordering::Acquire) != generation {
+                if provider != Provider::OpenCode {
+                    tokio::spawn(async move {
+                        loop {
+                            if retained_for_drain.generation.load(Ordering::Acquire) != generation
+                                || !retained_for_drain.usable.load(Ordering::Acquire)
+                            {
                                 return;
                             }
-                            let Some(io) = io.as_mut() else { return };
-                            tokio::time::timeout(
-                                Duration::from_millis(25),
-                                read_bounded_retained_line(&mut io.reader, max_event_line_bytes),
-                            )
-                            .await
-                        };
-                        if observed.is_ok() {
-                            // Any frame after the terminal event makes the
-                            // connection ambiguous. Retire it instead of
-                            // assigning or replying under a later turn.
-                            retained_for_drain.usable.store(false, Ordering::Release);
-                            supervisor_for_drain
-                                .remove_if_same(&runtime_id_for_drain, &retained_for_drain)
-                                .await;
-                            let _ = retained_for_drain.terminate().await;
-                            return;
+                            let observed = {
+                                let mut io = retained_for_drain.io.lock().await;
+                                if retained_for_drain.generation.load(Ordering::Acquire)
+                                    != generation
+                                {
+                                    return;
+                                }
+                                let Some(io) = io.as_mut() else { return };
+                                tokio::time::timeout(
+                                    Duration::from_millis(25),
+                                    read_bounded_retained_line(
+                                        &mut io.reader,
+                                        max_event_line_bytes,
+                                    ),
+                                )
+                                .await
+                            };
+                            if observed.is_ok() {
+                                // Any frame after the terminal event makes the
+                                // connection ambiguous. Retire it instead of
+                                // assigning or replying under a later turn.
+                                retained_for_drain.usable.store(false, Ordering::Release);
+                                supervisor_for_drain
+                                    .remove_if_same(&runtime_id_for_drain, &retained_for_drain)
+                                    .await;
+                                let _ = retained_for_drain.terminate().await;
+                                return;
+                            }
                         }
-                    }
-                });
+                    });
+                }
                 tokio::spawn(async move {
                     tokio::time::sleep(idle_timeout).await;
                     if retained_for_expiry.generation.load(Ordering::Acquire) == generation {
@@ -2883,6 +3260,7 @@ impl AgentRuntime {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn drive_retained_codex_turn(
         &self,
         adapter: &dyn AgentAdapter,
@@ -2891,34 +3269,56 @@ impl AgentRuntime {
         interactions: &dyn InteractionHandler,
         trace: &StartupTrace,
         io: &mut RetainedCodexIo,
+        retention: ProviderProcessRetention,
+        mut state: AdapterState,
+        mut prefetched_line: Option<String>,
     ) -> Result<TurnResult> {
         let provider = request.provider;
-        let mut state = AdapterState::default();
-        state.result.session_id.clone_from(&request.session_id);
-        adapter.prepare_turn(request, &mut state)?;
-        adapter.mark_retained_turn(&mut state);
         let mut first_output = true;
+        let mut saw_semantic_activity = false;
+        let mut turn_submitted = provider != Provider::OpenCode;
+        let mut last_semantic_activity = tokio::time::Instant::now();
         let mut first_text = true;
+        let mut process_ready = false;
         loop {
-            let line = tokio::select! {
-                _ = request.cancellation.cancelled() => {
-                    if let Some(interrupt) = adapter.interrupt_request(&state) {
-                        let _ = write_provider_frames(provider, Some(&mut io.stdin), &[interrupt], "interrupt").await;
+            let inactivity_timeout = if !saw_semantic_activity || !turn_submitted {
+                retention.initialization_timeout
+            } else {
+                retention
+                    .active_inactivity_timeout
+                    .unwrap_or(request.timeout)
+            };
+            let line = if let Some(line) = prefetched_line.take() {
+                Some(line)
+            } else {
+                tokio::select! {
+                    _ = request.cancellation.cancelled() => {
+                        if let Some(interrupt) = adapter.interrupt_request(&state) {
+                            let _ = write_provider_frames(provider, Some(&mut io.stdin), &[interrupt], "interrupt").await;
+                        }
+                        return Err(RuntimeError::Cancelled { provider });
                     }
-                    return Err(RuntimeError::Cancelled { provider });
+                    line = read_bounded_retained_line(&mut io.reader, self.max_event_line_bytes) => line.map_err(|source| RuntimeError::ProcessIo {
+                        provider,
+                        stream: "stdout read",
+                        source,
+                    })?,
+                    _ = tokio::time::sleep_until(last_semantic_activity + inactivity_timeout) => {
+                        return Err(RuntimeError::Timeout {
+                            provider,
+                            seconds: inactivity_timeout.as_secs(),
+                        });
+                    }
                 }
-                line = read_bounded_retained_line(&mut io.reader, self.max_event_line_bytes) => line.map_err(|source| RuntimeError::ProcessIo {
-                    provider,
-                    stream: "stdout read",
-                    source,
-                })?,
             };
             let Some(line) = line else {
                 return Err(RuntimeError::ProcessFailed {
                     provider,
                     kind: ProviderProcessErrorKind::Unknown,
                     exit_code: None,
-                    stderr: "retained Codex process exited before completing the turn".to_string(),
+                    stderr: format!(
+                        "retained {provider} process exited before completing the turn"
+                    ),
                     provider_code: None,
                     delivery: crate::lifecycle::DeliveryState::PossiblySent,
                 });
@@ -2934,6 +3334,30 @@ impl AgentRuntime {
                 });
             }
             let output = adapter.parse_line(&line, &mut state)?;
+            let semantic_activity = !output.events.is_empty()
+                || !output.writes.is_empty()
+                || output.interaction.is_some()
+                || output.terminal
+                || output.turn_submitted;
+            if output.turn_submitted {
+                turn_submitted = true;
+            }
+            if semantic_activity {
+                saw_semantic_activity = true;
+                last_semantic_activity = tokio::time::Instant::now();
+            }
+            if !process_ready
+                && semantic_activity
+                && (provider != Provider::OpenCode || output.turn_submitted)
+            {
+                events
+                    .emit(TurnEvent::ProviderProcessStatus {
+                        status: crate::ProviderProcessStatus::Ready,
+                        message: format!("The retained {provider} process is ready."),
+                    })
+                    .await?;
+                process_ready = true;
+            }
             for event in output.events {
                 if first_text && matches!(&event, TurnEvent::TextDelta { text } if !text.is_empty())
                 {
@@ -4607,6 +5031,7 @@ mod tests {
                     }),
                     writes: Vec::new(),
                     terminal: false,
+                    turn_submitted: false,
                 })
             }
 

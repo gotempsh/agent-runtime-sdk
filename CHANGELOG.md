@@ -13,6 +13,11 @@ Versioning and Keep a Changelog conventions.
 
 ### Changed
 
+- Add opt-in bounded native process reuse for Claude streaming and OpenCode serve,
+  alongside Codex app-server reuse. Retained processes use provider-specific
+  preflight checks, strict session/configuration isolation, idle expiry, and
+  no-replay delivery boundaries. Default one-process-per-turn behavior is unchanged.
+
 - Preserve Windows system and profile environment variables when launching providers,
   without inheriting unrelated credentials. Hide provider and cleanup console windows.
   Add native process fixtures for arguments, stdin, failures, cancellation, and

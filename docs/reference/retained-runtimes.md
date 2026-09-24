@@ -11,21 +11,31 @@ reports `session_resume: true` and `retained_process: false`: Claude, Codex, and
 OpenCode can continue their provider-native sessions even though the CLI is
 currently relaunched for each turn.
 
-Codex app-server reuse is explicit and in-process only:
+Provider process reuse is explicit and in-process only. `ProviderProcessRetention`
+enables the built-in Claude streaming driver, Codex app-server driver, and
+OpenCode serve driver with one shared process budget:
 
 ```rust
 use std::time::Duration;
-use temps_agent_runtime::providers::Codex;
-use temps_agent_runtime::{AgentRuntime, CodexProcessRetention};
+use temps_agent_runtime::providers::{Claude, Codex, OpenCode};
+use temps_agent_runtime::{AgentRuntime, ProviderProcessRetention};
 
 let mut builder = AgentRuntime::builder()
-    .codex_process_retention(CodexProcessRetention {
+    .provider_process_retention(ProviderProcessRetention {
         max_processes: 4,
         idle_timeout: Duration::from_secs(120),
+        initialization_timeout: Duration::from_secs(30),
+        active_inactivity_timeout: Some(Duration::from_secs(30 * 60)),
     });
+builder.register(Claude::default());
 builder.register(Codex::app_server());
+builder.register(OpenCode::serve());
 let runtime = builder.build()?;
 ```
+
+`codex_process_retention` remains available for applications that only want
+Codex app-server reuse. Both settings are disabled by default. One-shot modes,
+custom adapters, and remote OpenCode transports retain their existing behavior.
 
 Pass that runtime to `InProcessRuntimeClient::new`. Each `RuntimeId` owns at most
 one process. The SDK compares the complete sandbox-wrapped command plus working
@@ -39,9 +49,13 @@ The process pool is bounded independently from acquired logical runtimes. A new
 runtime that reaches capacity runs through the ordinary one-process turn path;
 existing retained runtimes remain warm and usable without waiting for an idle
 slot.
-Any unsolicited idle frame, crash, cancellation, timeout, dropped turn future or
-disposal retires the process tree. Late frames are correlated by native turn ID
-and cannot enter a later invocation.
+Crash, failed health checks, cancellation, timeout, dropped turn futures, and
+disposal retire the process tree. Before submitting a later prompt, Claude uses
+a bounded read-only control probe and OpenCode checks its loopback health endpoint
+through a fresh per-turn bridge. A pre-submission failure may start a replacement;
+the SDK never automatically replays a prompt after delivery is possible. Codex
+correlates native turn IDs, OpenCode requires the active session ID, and Claude
+retires a connection that emits ambiguous idle output.
 
 Use `RuntimeHandle::configuration_impact` before presenting a live setting
 change. The compatibility driver applies per-turn model, reasoning, permission,

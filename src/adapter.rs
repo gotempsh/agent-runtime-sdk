@@ -213,6 +213,8 @@ pub struct AdapterOutput {
     pub writes: Vec<Vec<u8>>,
     /// True after a provider terminal frame. The runtime then closes stdin.
     pub terminal: bool,
+    /// The provider acknowledged the submitted prompt for this turn.
+    pub turn_submitted: bool,
 }
 
 /// Protocol carrier an adapter supplies in place of the provider's own stdio.
@@ -390,6 +392,23 @@ pub trait AgentAdapter: Send + Sync {
     fn prepare_turn(&self, request: &TurnRequest, state: &mut AdapterState) -> Result<()> {
         let _ = (request, state);
         Ok(())
+    }
+
+    /// Seed a retained turn, optionally reusing provider-specific process state.
+    fn prepare_retained_turn(
+        &self,
+        request: &TurnRequest,
+        state: &mut AdapterState,
+        process_hint: Option<u64>,
+    ) -> Result<()> {
+        let _ = process_hint;
+        self.prepare_turn(request, state)
+    }
+
+    /// Opaque provider-specific state needed to address this retained process.
+    fn retained_process_hint(&self, state: &AdapterState) -> Option<u64> {
+        let _ = state;
+        None
     }
 
     /// Begin another turn on an already initialized retained process.

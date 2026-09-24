@@ -1,6 +1,6 @@
 # ADR 0004: Prepared provider processes
 
-- Status: Accepted (Codex retained turns implemented; explicit prewarming deferred)
+- Status: Accepted (Claude, Codex, and OpenCode retained turns implemented; explicit prewarming deferred)
 - Date: 2026-09-23
 
 ## Problem
@@ -24,9 +24,11 @@ records, authorization, feature rollout, and presentation. Listing projects or
 conversations must never spawn provider processes.
 
 Existing `AgentRuntime::run` and default retained-client constructors preserve
-lazy, one-process-per-turn behavior. `codex_process_retention` opts the in-process
-retained client into bounded app-server reuse. Custom adapters remain disabled
-unless they implement the lifecycle contract.
+lazy, one-process-per-turn behavior. `provider_process_retention` opts the
+in-process retained client into bounded reuse for the built-in Claude streaming,
+Codex app-server, and OpenCode serve protocols. `codex_process_retention` remains
+the compatibility opt-in for Codex alone. Custom adapters remain disabled unless
+they implement the lifecycle contract.
 
 ## Lifecycle
 
@@ -72,9 +74,11 @@ a prerequisite to Fleet enabling retention.
 
 Claude keeps a streaming input channel open and separates initialization from user
 messages. Codex keeps one app-server connection and thread alive, issues one
-initialize handshake per process, and starts later turns on that connection. Both
-need bounded background draining, crash detection, cancellation, late-event
-isolation and cleanup. One-shot Codex exec and unsupported providers remain lazy.
+initialize handshake per process, and starts later turns on that connection.
+OpenCode retains its loopback serve process while creating a fresh health-checked
+HTTP/SSE bridge for each turn. All three use bounded initialization and inactivity
+deadlines, crash detection, cancellation, late-event isolation, and process-tree
+cleanup. One-shot modes and unsupported providers remain lazy.
 
 ## Fleet adoption
 
