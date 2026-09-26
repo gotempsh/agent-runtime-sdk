@@ -11,6 +11,38 @@ reports `session_resume: true` and `retained_process: false`: Claude, Codex, and
 OpenCode can continue their provider-native sessions even though the CLI is
 currently relaunched for each turn.
 
+Codex app-server reuse is explicit and in-process only:
+
+```rust
+use std::time::Duration;
+use temps_agent_runtime::providers::Codex;
+use temps_agent_runtime::{AgentRuntime, CodexProcessRetention};
+
+let mut builder = AgentRuntime::builder()
+    .codex_process_retention(CodexProcessRetention {
+        max_processes: 4,
+        idle_timeout: Duration::from_secs(120),
+    });
+builder.register(Codex::app_server());
+let runtime = builder.build()?;
+```
+
+Pass that runtime to `InProcessRuntimeClient::new`. Each `RuntimeId` owns at most
+one process. The SDK compares the complete sandbox-wrapped command plus working
+directory, model, reasoning, permission, harness, launch context, compaction and
+sandbox requirements before reuse. Changed explicit credentials or environment
+replace the process. Ambient inherited environment is read when a process starts;
+applications that rotate ambient credentials must dispose the logical runtime or
+rebuild the `AgentRuntime`.
+
+The process pool is bounded independently from acquired logical runtimes. A new
+runtime that reaches capacity runs through the ordinary one-process turn path;
+existing retained runtimes remain warm and usable without waiting for an idle
+slot.
+Any unsolicited idle frame, crash, cancellation, timeout, dropped turn future or
+disposal retires the process tree. Late frames are correlated by native turn ID
+and cannot enter a later invocation.
+
 Use `RuntimeHandle::configuration_impact` before presenting a live setting
 change. The compatibility driver applies per-turn model, reasoning, permission,
 harness, launch-context, environment, and timeout changes live. Provider,

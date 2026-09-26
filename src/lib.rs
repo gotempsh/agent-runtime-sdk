@@ -72,7 +72,7 @@ pub use extensions::{
     HarnessMcpServer, HarnessSkill, McpServerManagementRequest, SkillManagementRequest,
 };
 pub use interactions::{InteractionBroker, InteractionBrokerError, InteractionResolution};
-pub use runtime::{AgentRuntime, AgentRuntimeBuilder};
+pub use runtime::{AgentRuntime, AgentRuntimeBuilder, CodexProcessRetention};
 pub use sandbox::{
     ResolvedSandboxProfile, SandboxBackend, SandboxCapabilities, SandboxContext, SandboxError,
     SandboxPathAccess, SandboxProfileChange, SandboxProfileManager, SandboxProfileRef,

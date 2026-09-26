@@ -1,6 +1,7 @@
 import architecture from "../../../docs/explanation/architecture.md?raw";
 import approvals from "../../../docs/how-to/persist-approvals.md?raw";
 import commandExecution from "../../../docs/how-to/persist-command-execution.md?raw";
+import codexResume from "../../../docs/how-to/resume-large-codex-conversations.md?raw";
 import persistence from "../../../docs/how-to/persist-conversations.md?raw";
 import toolProcesses from "../../../docs/how-to/keep-tool-processes-running.md?raw";
 import managedProcesses from "../../../docs/how-to/manage-background-processes.md?raw";
@@ -36,6 +37,14 @@ export const categories: DocCategory[] = [
 ];
 
 export const docs: DocPage[] = [
+  {
+    slug: "resume-large-codex-conversations",
+    sourcePath: "docs/how-to/resume-large-codex-conversations.md",
+    title: "Resume large Codex conversations",
+    description: "Continue long threads without returning oversized history frames or losing provider context.",
+    category: "How-to guides",
+    body: codexResume,
+  },
   {
     slug: "quickstart",
     sourcePath: "docs/tutorials/quickstart.md",

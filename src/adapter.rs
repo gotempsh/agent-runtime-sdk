@@ -18,7 +18,7 @@ use crate::{
 ///
 /// Programs and arguments remain separate values throughout execution; this
 /// crate never constructs a shell command string.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct CommandSpec {
     /// Executable path.
     pub program: PathBuf,
@@ -254,6 +254,14 @@ pub trait AgentAdapter: Send + Sync {
     /// Provider implemented by this adapter.
     fn provider(&self) -> Provider;
 
+    /// Whether this exact adapter supports retaining one native process across turns.
+    ///
+    /// Custom adapters remain disabled unless they explicitly implement the
+    /// complete lifecycle contract.
+    fn supports_retained_process(&self) -> bool {
+        false
+    }
+
     /// Executable name or path meaningful inside the selected execution transport.
     fn executable(&self) -> PathBuf {
         PathBuf::from(match self.provider() {
@@ -382,6 +390,19 @@ pub trait AgentAdapter: Send + Sync {
     fn prepare_turn(&self, request: &TurnRequest, state: &mut AdapterState) -> Result<()> {
         let _ = (request, state);
         Ok(())
+    }
+
+    /// Begin another turn on an already initialized retained process.
+    ///
+    /// Returning `None` means the adapter cannot safely reuse its process.
+    fn retained_turn_start(&self, state: &AdapterState) -> Result<Option<Vec<u8>>> {
+        let _ = state;
+        Ok(None)
+    }
+
+    /// Mark parser state as belonging to a retained native process.
+    fn mark_retained_turn(&self, state: &mut AdapterState) {
+        let _ = state;
     }
 
     /// Supply a protocol carrier to use instead of the child's stdout and stdin.

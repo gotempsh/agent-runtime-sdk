@@ -60,6 +60,7 @@ struct TurnState {
     turn_params: Value,
     /// Whether this turn resumes an existing Codex thread.
     resume: bool,
+    retained: bool,
     /// Model requested for this turn, used to label context-window usage
     /// before the app server reports the thread's resolved model.
     model: Option<String>,
@@ -72,6 +73,12 @@ struct TurnState {
     streamed: Vec<String>,
     /// Last `error` notification, surfaced when the turn ends badly.
     error_message: Option<String>,
+}
+
+pub(super) fn mark_retained(state: &mut AdapterState) {
+    let mut turn = load(state);
+    turn.retained = true;
+    store(state, &turn);
 }
 
 fn load(state: &AdapterState) -> TurnState {
@@ -156,6 +163,10 @@ pub(super) fn prepare_turn(request: &TurnRequest, state: &mut AdapterState) -> R
     }
     if let Some(resumed) = request.session_id.as_deref() {
         thread_params["threadId"] = json!(resumed);
+        // Only metadata is needed to start the next turn. Returning the entire
+        // history can exceed the event frame limit on long conversations.
+        // The same parameters also cover the active-writer fork fallback.
+        thread_params["excludeTurns"] = json!(true);
     }
 
     // Image attachments become native `localImage` user inputs; every other
@@ -215,6 +226,17 @@ pub(super) fn interrupt(state: &AdapterState) -> Option<Vec<u8>> {
     .ok()
 }
 
+/// Start a turn after this app-server connection has already initialized.
+pub(super) fn retained_turn_start(state: &AdapterState) -> Result<Vec<u8>> {
+    let turn = load(state);
+    let method = if turn.resume {
+        "thread/resume"
+    } else {
+        "thread/start"
+    };
+    encode(&request(ID_THREAD, method, turn.thread_params))
+}
+
 /// Translate one JSON-RPC message from the app server.
 pub(super) fn parse_line(line: &str, state: &mut AdapterState) -> Result<AdapterOutput> {
     let value: Value = serde_json::from_str(line)
@@ -226,6 +248,28 @@ pub(super) fn parse_line(line: &str, state: &mut AdapterState) -> Result<Adapter
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
+    if turn.retained
+        && !method.is_empty()
+        && value.get("id").is_none()
+        && reported_turn_id(&value).is_none()
+    {
+        // Uncorrelated notifications cannot be assigned to an invocation on a
+        // reused connection. Process-global state is refreshed explicitly by
+        // its dedicated APIs instead of leaking into the active turn stream.
+        return Ok(output);
+    }
+    if turn.retained
+        && reported_turn_id(&value)
+            .is_some_and(|reported| turn.turn_id.as_deref() != Some(reported))
+    {
+        return Ok(output);
+    }
+    if turn_scoped_method(&method) && !belongs_to_active_turn(&value, &turn) {
+        // App-server connections can emit delayed frames after a completed
+        // turn. A retained connection must never project those frames into a
+        // later invocation's fresh parser state.
+        return Ok(output);
+    }
     if method.is_empty() {
         parse_response(&value, &mut turn, state, &mut output)?;
     } else if value.get("id").is_some() {
@@ -235,6 +279,39 @@ pub(super) fn parse_line(line: &str, state: &mut AdapterState) -> Result<Adapter
     }
     store(state, &turn);
     Ok(output)
+}
+
+fn turn_scoped_method(method: &str) -> bool {
+    matches!(
+        method,
+        "item/agentMessage/delta"
+            | "item/reasoning/textDelta"
+            | "item/reasoning/summaryTextDelta"
+            | "item/started"
+            | "item/completed"
+            | "item/commandExecution/requestApproval"
+            | "item/fileChange/requestApproval"
+            | "item/permissions/requestApproval"
+            | "item/tool/requestUserInput"
+            | "thread/tokenUsage/updated"
+            | "turn/completed"
+            | "turn/failed"
+    )
+}
+
+fn belongs_to_active_turn(value: &Value, turn: &TurnState) -> bool {
+    if !turn.retained {
+        return true;
+    }
+    let reported = reported_turn_id(value);
+    matches!((reported, turn.turn_id.as_deref()), (Some(reported), Some(current)) if reported == current)
+}
+
+fn reported_turn_id(value: &Value) -> Option<&str> {
+    value
+        .pointer("/params/turnId")
+        .or_else(|| value.pointer("/params/turn/id"))
+        .and_then(Value::as_str)
 }
 
 /// Advance the handshake with the response to one of our own requests.
@@ -1219,6 +1296,32 @@ mod tests {
     }
 
     #[test]
+    fn resume_and_writer_conflict_fork_exclude_historical_turns() {
+        let mut request = TurnRequest::new(Provider::Codex, ".", "continue");
+        let mut state = AdapterState::default();
+        prepare_turn(&request, &mut state).unwrap();
+        let opened = parse_line(r#"{"id":1,"result":{}}"#, &mut state).unwrap();
+        let start = decode(opened.writes[0].clone());
+        assert_eq!(start["method"], "thread/start");
+        assert!(start["params"].get("excludeTurns").is_none());
+
+        request.session_id = Some("large-thread".into());
+        prepare_turn(&request, &mut state).unwrap();
+        let opened = parse_line(r#"{"id":1,"result":{}}"#, &mut state).unwrap();
+        let resume = decode(opened.writes[0].clone());
+        assert_eq!(resume["params"]["excludeTurns"], true);
+        let conflict = parse_line(
+            r#"{"id":2,"error":{"message":"thread already has an active writer"}}"#,
+            &mut state,
+        )
+        .unwrap();
+        let fork = decode(conflict.writes[0].clone());
+        assert_eq!(fork["method"], "thread/fork");
+        assert_eq!(fork["params"]["threadId"], "large-thread");
+        assert_eq!(fork["params"]["excludeTurns"], true);
+    }
+
+    #[test]
     fn the_handshake_response_opens_the_requested_thread_and_starts_the_turn() {
         let mut request = TurnRequest::new(Provider::Codex, ".", "continue");
         request.session_id = Some("thread-7".into());
@@ -1230,6 +1333,7 @@ mod tests {
         let resume = decode(opened.writes[0].clone());
         assert_eq!(resume["method"], json!("thread/resume"));
         assert_eq!(resume["params"]["threadId"], json!("thread-7"));
+        assert_eq!(resume["params"]["excludeTurns"], json!(true));
 
         let started = parse_line(
             r#"{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thread-7"}}}"#,

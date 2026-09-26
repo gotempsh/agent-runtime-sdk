@@ -5,6 +5,12 @@ Versioning and Keep a Changelog conventions.
 
 ## [Unreleased]
 
+### Fixed
+
+- Codex resumes and active-writer forks omit historical turns from their replies,
+  so long conversations can continue without exceeding the protocol frame limit.
+  Saved provider context is preserved.
+
 ### Changed
 
 - Preserve Windows system and profile environment variables when launching providers,
@@ -24,6 +30,9 @@ Versioning and Keep a Changelog conventions.
 
 ### Added
 
+- Add opt-in, bounded Codex app-server process reuse for in-process retained
+  runtimes, with strict runtime/configuration isolation, cold fallback at pool
+  capacity, idle expiry, and process-tree cleanup on cancellation or failure.
 - Contain observer panic-payload cleanup failures and disable failed observers
   across runtime clones. Report event-delivery wait separately from observed
   first-text latency, preserving bounded backpressure.

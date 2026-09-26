@@ -9,18 +9,23 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
+use temps_agent_runtime::lifecycle::{InvocationId, RuntimeId};
 use temps_agent_runtime::providers::{Codex, CodexTurnMode};
 use temps_agent_runtime::retained::TurnAttachment;
+use temps_agent_runtime::retained::{
+    InProcessRuntimeClient, RuntimeClient, RuntimeSpec, TurnInput,
+};
 use temps_agent_runtime::{
-    AgentRuntime, ApprovalDecision, ApprovalRequest, EventSink, ExecutionTransport,
-    InteractionHandler, McpServerConfig, PermissionMode, Provider, ProviderReadiness,
-    QuestionAnswer, QuestionRequest, Result, RuntimeError, SandboxCapabilities, SecretString,
-    TransportCapabilities, TransportError, TransportErrorKind, TransportExitStatus,
+    AgentRuntime, ApprovalDecision, ApprovalRequest, CodexProcessRetention, EventSink,
+    ExecutionTransport, InteractionHandler, McpServerConfig, PermissionMode, Provider,
+    ProviderReadiness, QuestionAnswer, QuestionRequest, Result, RuntimeError, SandboxCapabilities,
+    SecretString, TransportCapabilities, TransportError, TransportErrorKind, TransportExitStatus,
     TransportProcess, TransportProcessControl, TransportProcessHandle, TransportReader,
     TransportReadinessRequest, TransportResult, TransportSpawnRequest, TransportWriter, TurnEvent,
     TurnRequest,
@@ -39,6 +44,10 @@ enum Script {
     AsyncQuestion,
     /// Stream one delta and then wait for `turn/interrupt`.
     Interrupt,
+    /// Exit after accepting a turn, before a terminal notification.
+    Crash,
+    /// Complete, then emit an old-turn frame while the process is idle.
+    DelayedIdleFrame,
 }
 
 #[derive(Clone)]
@@ -48,6 +57,8 @@ struct AppServer {
     frames: Arc<Mutex<Vec<Value>>>,
     /// Arguments the SDK asked the transport to spawn `codex` with.
     arguments: Arc<Mutex<Vec<String>>>,
+    spawns: Arc<AtomicUsize>,
+    terminations: Arc<AtomicUsize>,
 }
 
 impl AppServer {
@@ -56,6 +67,8 @@ impl AppServer {
             script,
             frames: Arc::new(Mutex::new(Vec::new())),
             arguments: Arc::new(Mutex::new(Vec::new())),
+            spawns: Arc::new(AtomicUsize::new(0)),
+            terminations: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -65,6 +78,14 @@ impl AppServer {
 
     fn frames(&self) -> Vec<Value> {
         self.frames.lock().unwrap().clone()
+    }
+
+    fn spawn_count(&self) -> usize {
+        self.spawns.load(Ordering::Acquire)
+    }
+
+    fn termination_count(&self) -> usize {
+        self.terminations.load(Ordering::Acquire)
     }
 
     fn method_frame(&self, method: &str) -> Option<Value> {
@@ -120,6 +141,7 @@ impl ExecutionTransport for AppServer {
     }
 
     async fn spawn(&self, request: TransportSpawnRequest) -> TransportResult<TransportProcess> {
+        self.spawns.fetch_add(1, Ordering::AcqRel);
         assert_eq!(
             request
                 .command
@@ -143,6 +165,7 @@ impl ExecutionTransport for AppServer {
         drop(server_stderr);
         let script = self.script;
         let frames = Arc::clone(&self.frames);
+        let terminations = Arc::clone(&self.terminations);
         tokio::spawn(async move { serve(script, frames, server_input, server_output).await });
         Ok(TransportProcess::new(
             TransportProcessHandle {
@@ -153,7 +176,7 @@ impl ExecutionTransport for AppServer {
             Some(Box::new(sdk_stdin) as TransportWriter),
             Box::new(sdk_stdout) as TransportReader,
             Box::new(sdk_stderr) as TransportReader,
-            Control,
+            Control { terminations },
         ))
     }
 
@@ -172,7 +195,9 @@ impl ExecutionTransport for AppServer {
     }
 }
 
-struct Control;
+struct Control {
+    terminations: Arc<AtomicUsize>,
+}
 
 #[async_trait]
 impl TransportProcessControl for Control {
@@ -184,6 +209,7 @@ impl TransportProcessControl for Control {
     }
 
     async fn terminate(&mut self) -> TransportResult<()> {
+        self.terminations.fetch_add(1, Ordering::AcqRel);
         Ok(())
     }
 }
@@ -236,10 +262,14 @@ async fn serve(
                     json!({"jsonrpc":"2.0","id":id,"result":{"turn":{"id":"turn-1"}}}),
                 )
                 .await;
+                if script == Script::Crash {
+                    return;
+                }
                 send(
                     &mut output,
                     json!({"jsonrpc":"2.0","method":"item/agentMessage/delta",
-                        "params":{"itemId":"item-1","delta":"Working"}}),
+                        "params":{"threadId":"thread-fixture","turnId":"turn-1",
+                            "itemId":"item-1","delta":"Working"}}),
                 )
                 .await;
                 for frame in opening_frames(script) {
@@ -250,6 +280,16 @@ async fn serve(
             None => {
                 for frame in completion_frames(script) {
                     send(&mut output, frame).await;
+                }
+                if script == Script::DelayedIdleFrame {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    send(
+                        &mut output,
+                        json!({"jsonrpc":"2.0","method":"item/agentMessage/delta",
+                            "params":{"threadId":"thread-fixture","turnId":"turn-1",
+                                "itemId":"late","delta":"STALE"}}),
+                    )
+                    .await;
                 }
             }
             // `initialize` and `turn/interrupt` need only a bare acknowledgement.
@@ -265,7 +305,7 @@ fn opening_frames(script: Script) -> Vec<Value> {
         Script::Approval => vec![
             json!({"jsonrpc":"2.0","method":"item/started","params":{"item":{
                 "id":"item-2","type":"commandExecution","command":"cargo test","status":"inProgress"
-            }}}),
+            },"threadId":"thread-fixture","turnId":"turn-1"}}),
             json!({"jsonrpc":"2.0","id":"server-1","method":"item/commandExecution/requestApproval",
                 "params":{"threadId":"thread-fixture","turnId":"turn-1","itemId":"item-2",
                     "command":"cargo test","startedAtMs":1}}),
@@ -278,14 +318,14 @@ fn opening_frames(script: Script) -> Vec<Value> {
                     "options":[{"label":"Banana","description":"Yellow"},
                                {"label":"Plantain","description":"Also yellow"}]}]}
         })],
-        Script::AsyncQuestion => vec![json!({
+        Script::AsyncQuestion | Script::DelayedIdleFrame => vec![json!({
             "jsonrpc":"2.0","id":"server-3","method":"item/tool/requestUserInput",
             "params":{"threadId":"thread-fixture","turnId":"turn-1","itemId":"item-4",
                 "isBlocking":false,
                 "questions":[{"id":"q2","header":"Theme","question":"Dark or light?",
                     "options":[{"label":"Dark","description":"Dim"}]}]}
         })],
-        Script::Interrupt => Vec::new(),
+        Script::Interrupt | Script::Crash => Vec::new(),
     }
 }
 
@@ -296,12 +336,12 @@ fn completion_frames(script: Script) -> Vec<Value> {
             json!({"jsonrpc":"2.0","method":"item/completed","params":{"item":{
                 "id":"item-2","type":"commandExecution","command":"cargo test",
                 "status":"completed","aggregatedOutput":"ok","exitCode":0
-            }}}),
+            },"threadId":"thread-fixture","turnId":"turn-1"}}),
         );
     }
     frames.extend([
         json!({"jsonrpc":"2.0","method":"thread/tokenUsage/updated","params":{
-            "threadId":"thread-fixture",
+            "threadId":"thread-fixture","turnId":"turn-1",
             "tokenUsage":{"last":{"inputTokens":120,"outputTokens":34,"totalTokens":154},
                 "modelContextWindow":272_000}
         }}),
@@ -369,6 +409,35 @@ fn runtime(transport: AppServer) -> AgentRuntime {
     builder.build().unwrap()
 }
 
+fn retained_runtime(transport: AppServer, idle_timeout: Duration) -> AgentRuntime {
+    let mut builder = AgentRuntime::builder()
+        .transport(transport)
+        .codex_process_retention(CodexProcessRetention {
+            max_processes: 2,
+            idle_timeout,
+        });
+    builder.register(Codex::app_server());
+    builder.build().unwrap()
+}
+
+async fn retained_handle(
+    runtime: AgentRuntime,
+) -> (
+    InProcessRuntimeClient,
+    temps_agent_runtime::retained::RuntimeHandle,
+) {
+    let client = InProcessRuntimeClient::new(runtime);
+    let handle = client
+        .acquire(RuntimeSpec::new(
+            RuntimeId::new("codex-fixture-runtime").unwrap(),
+            Provider::Codex,
+            ".",
+        ))
+        .await
+        .unwrap();
+    (client, handle)
+}
+
 fn request() -> TurnRequest {
     let mut request = TurnRequest::new(Provider::Codex, ".", "review the workspace");
     request.permission_mode = PermissionMode::Default;
@@ -398,6 +467,344 @@ async fn the_app_server_mode_advertises_live_interactions() {
     let turn = runtime.turn_capabilities(Provider::Codex).unwrap();
     assert!(turn.context_window_usage);
     assert!(turn.native_image_attachments);
+}
+
+#[tokio::test]
+async fn retained_client_reuses_one_app_server_for_two_turns() {
+    let transport = AppServer::new(Script::AsyncQuestion);
+    let runtime = retained_runtime(transport.clone(), Duration::from_secs(30));
+    let (_client, handle) = retained_handle(runtime).await;
+    assert!(handle.driver_capabilities().retained_process);
+
+    let first = handle
+        .start_turn(TurnInput::new(
+            InvocationId::new("turn-one").unwrap(),
+            "first",
+        ))
+        .await
+        .unwrap()
+        .wait()
+        .await
+        .unwrap();
+    assert_eq!(first.session_id.as_deref(), Some("thread-fixture"));
+
+    let second = handle
+        .start_turn(TurnInput::new(
+            InvocationId::new("turn-two").unwrap(),
+            "second",
+        ))
+        .await
+        .unwrap()
+        .wait()
+        .await
+        .unwrap();
+    assert_eq!(second.session_id.as_deref(), Some("thread-fixture"));
+    assert_eq!(transport.spawn_count(), 1);
+    assert_eq!(
+        transport
+            .frames()
+            .iter()
+            .filter(|frame| frame.get("method").and_then(Value::as_str) == Some("initialize"))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn retained_processes_are_disabled_by_default() {
+    let transport = AppServer::new(Script::AsyncQuestion);
+    let runtime = runtime(transport.clone());
+    let (_client, handle) = retained_handle(runtime).await;
+    assert!(!handle.driver_capabilities().retained_process);
+
+    for invocation in ["default-one", "default-two"] {
+        handle
+            .start_turn(TurnInput::new(
+                InvocationId::new(invocation).unwrap(),
+                invocation,
+            ))
+            .await
+            .unwrap()
+            .wait()
+            .await
+            .unwrap();
+    }
+    assert_eq!(transport.spawn_count(), 2);
+}
+
+#[tokio::test]
+async fn changed_permission_replaces_the_retained_process() {
+    let transport = AppServer::new(Script::AsyncQuestion);
+    let runtime = retained_runtime(transport.clone(), Duration::from_secs(30));
+    let (_client, handle) = retained_handle(runtime).await;
+    handle
+        .start_turn(TurnInput::new(
+            InvocationId::new("permission-one").unwrap(),
+            "first",
+        ))
+        .await
+        .unwrap()
+        .wait()
+        .await
+        .unwrap();
+    let mut changed = TurnInput::new(InvocationId::new("permission-two").unwrap(), "second");
+    changed.permission_mode = Some(PermissionMode::FullAccess);
+    handle
+        .start_turn(changed)
+        .await
+        .unwrap()
+        .wait()
+        .await
+        .unwrap();
+    assert_eq!(transport.spawn_count(), 2);
+}
+
+#[tokio::test]
+async fn configuration_replacement_transfers_its_only_pool_slot() {
+    let transport = AppServer::new(Script::AsyncQuestion);
+    let mut builder = AgentRuntime::builder()
+        .transport(transport.clone())
+        .codex_process_retention(CodexProcessRetention {
+            max_processes: 1,
+            idle_timeout: Duration::from_secs(30),
+        });
+    builder.register(Codex::app_server());
+    let (_client, handle) = retained_handle(builder.build().unwrap()).await;
+    handle
+        .start_turn(TurnInput::new(
+            InvocationId::new("replace-only-slot-one").unwrap(),
+            "first",
+        ))
+        .await
+        .unwrap()
+        .wait()
+        .await
+        .unwrap();
+    let mut changed = TurnInput::new(
+        InvocationId::new("replace-only-slot-two").unwrap(),
+        "second",
+    );
+    changed.permission_mode = Some(PermissionMode::FullAccess);
+    handle
+        .start_turn(changed)
+        .await
+        .unwrap()
+        .wait()
+        .await
+        .unwrap();
+    assert_eq!(transport.spawn_count(), 2);
+    assert!(transport.termination_count() >= 1);
+}
+
+#[tokio::test]
+async fn idle_expiry_and_dispose_terminate_retained_processes() {
+    let transport = AppServer::new(Script::AsyncQuestion);
+    let runtime = retained_runtime(transport.clone(), Duration::from_millis(20));
+    let (client, handle) = retained_handle(runtime).await;
+    handle
+        .start_turn(TurnInput::new(
+            InvocationId::new("idle-one").unwrap(),
+            "first",
+        ))
+        .await
+        .unwrap()
+        .wait()
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    handle
+        .start_turn(TurnInput::new(
+            InvocationId::new("idle-two").unwrap(),
+            "second",
+        ))
+        .await
+        .unwrap()
+        .wait()
+        .await
+        .unwrap();
+    assert_eq!(transport.spawn_count(), 2);
+    let runtime_id = handle.runtime_id().clone();
+    client.dispose(&runtime_id).await.unwrap();
+    client
+        .acquire(RuntimeSpec::new(runtime_id, Provider::Codex, "."))
+        .await
+        .expect("a disposed runtime identifier can be acquired again");
+    assert!(transport.termination_count() >= 2);
+}
+
+#[tokio::test]
+async fn process_capacity_does_not_starve_an_existing_retained_runtime() {
+    let transport = AppServer::new(Script::AsyncQuestion);
+    let mut builder = AgentRuntime::builder()
+        .transport(transport.clone())
+        .codex_process_retention(CodexProcessRetention {
+            max_processes: 1,
+            idle_timeout: Duration::from_secs(30),
+        });
+    builder.register(Codex::app_server());
+    let client = InProcessRuntimeClient::new(builder.build().unwrap());
+    let first = client
+        .acquire(RuntimeSpec::new(
+            RuntimeId::new("capacity-one").unwrap(),
+            Provider::Codex,
+            ".",
+        ))
+        .await
+        .unwrap();
+    let second = client
+        .acquire(RuntimeSpec::new(
+            RuntimeId::new("capacity-two").unwrap(),
+            Provider::Codex,
+            ".",
+        ))
+        .await
+        .unwrap();
+    first
+        .start_turn(TurnInput::new(
+            InvocationId::new("capacity-first").unwrap(),
+            "first",
+        ))
+        .await
+        .unwrap()
+        .wait()
+        .await
+        .unwrap();
+    second
+        .start_turn(TurnInput::new(
+            InvocationId::new("capacity-rejected").unwrap(),
+            "second runtime",
+        ))
+        .await
+        .unwrap()
+        .wait()
+        .await
+        .unwrap();
+    first
+        .start_turn(TurnInput::new(
+            InvocationId::new("capacity-reuse").unwrap(),
+            "reuse",
+        ))
+        .await
+        .unwrap()
+        .wait()
+        .await
+        .unwrap();
+    assert_eq!(transport.spawn_count(), 2);
+}
+
+#[tokio::test]
+async fn a_timed_out_turn_is_never_reused() {
+    let transport = AppServer::new(Script::Interrupt);
+    let runtime = retained_runtime(transport.clone(), Duration::from_secs(30));
+    let client = InProcessRuntimeClient::new(runtime);
+    let mut spec = RuntimeSpec::new(
+        RuntimeId::new("timeout-runtime").unwrap(),
+        Provider::Codex,
+        ".",
+    );
+    spec.turn_timeout = Duration::from_millis(20);
+    let handle = client.acquire(spec).await.unwrap();
+    for invocation in ["timeout-one", "timeout-two"] {
+        let failure = handle
+            .start_turn(TurnInput::new(
+                InvocationId::new(invocation).unwrap(),
+                invocation,
+            ))
+            .await
+            .unwrap()
+            .wait()
+            .await
+            .unwrap_err();
+        assert_eq!(
+            failure.kind,
+            temps_agent_runtime::lifecycle::RuntimeFailureKind::Timeout
+        );
+    }
+    assert_eq!(transport.spawn_count(), 2);
+}
+
+#[tokio::test]
+async fn a_crashed_process_is_replaced_for_the_next_turn() {
+    let transport = AppServer::new(Script::Crash);
+    let runtime = retained_runtime(transport.clone(), Duration::from_secs(30));
+    let (_client, handle) = retained_handle(runtime).await;
+    for invocation in ["crash-one", "crash-two"] {
+        assert!(handle
+            .start_turn(TurnInput::new(
+                InvocationId::new(invocation).unwrap(),
+                invocation,
+            ))
+            .await
+            .unwrap()
+            .wait()
+            .await
+            .is_err());
+    }
+    assert_eq!(transport.spawn_count(), 2);
+}
+
+#[tokio::test]
+async fn an_idle_frame_retires_the_process_before_the_next_turn() {
+    let transport = AppServer::new(Script::DelayedIdleFrame);
+    let runtime = retained_runtime(transport.clone(), Duration::from_secs(30));
+    let (_client, handle) = retained_handle(runtime).await;
+    let first = handle
+        .start_turn(TurnInput::new(
+            InvocationId::new("late-one").unwrap(),
+            "first",
+        ))
+        .await
+        .unwrap()
+        .wait()
+        .await
+        .unwrap();
+    assert!(!first.text.contains("STALE"));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let second = handle
+        .start_turn(TurnInput::new(
+            InvocationId::new("late-two").unwrap(),
+            "second",
+        ))
+        .await
+        .unwrap()
+        .wait()
+        .await
+        .unwrap();
+    assert!(!second.text.contains("STALE"));
+    assert_eq!(transport.spawn_count(), 2);
+    assert!(transport.termination_count() >= 1);
+}
+
+#[tokio::test]
+async fn cancellation_retires_the_process_before_an_immediate_retry() {
+    let transport = AppServer::new(Script::Interrupt);
+    let runtime = retained_runtime(transport.clone(), Duration::from_secs(30));
+    let (_client, handle) = retained_handle(runtime).await;
+    let first = handle
+        .start_turn(TurnInput::new(
+            InvocationId::new("cancel-one").unwrap(),
+            "first",
+        ))
+        .await
+        .unwrap();
+    transport.wait_for("turn/start").await.unwrap();
+    first.interrupt().await;
+
+    let second = handle
+        .start_turn(TurnInput::new(
+            InvocationId::new("cancel-two").unwrap(),
+            "second",
+        ))
+        .await
+        .unwrap();
+    for _ in 0..100 {
+        if transport.spawn_count() == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(transport.spawn_count(), 2);
+    second.interrupt().await;
 }
 
 #[tokio::test]
