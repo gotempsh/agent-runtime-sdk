@@ -156,6 +156,10 @@ pub(super) fn prepare_turn(request: &TurnRequest, state: &mut AdapterState) -> R
     }
     if let Some(resumed) = request.session_id.as_deref() {
         thread_params["threadId"] = json!(resumed);
+        // Only metadata is needed to start the next turn. Returning the entire
+        // history can exceed the event frame limit on long conversations.
+        // The same parameters also cover the active-writer fork fallback.
+        thread_params["excludeTurns"] = json!(true);
     }
 
     // Image attachments become native `localImage` user inputs; every other
@@ -1219,6 +1223,32 @@ mod tests {
     }
 
     #[test]
+    fn resume_and_writer_conflict_fork_exclude_historical_turns() {
+        let mut request = TurnRequest::new(Provider::Codex, ".", "continue");
+        let mut state = AdapterState::default();
+        prepare_turn(&request, &mut state).unwrap();
+        let opened = parse_line(r#"{"id":1,"result":{}}"#, &mut state).unwrap();
+        let start = decode(opened.writes[0].clone());
+        assert_eq!(start["method"], "thread/start");
+        assert!(start["params"].get("excludeTurns").is_none());
+
+        request.session_id = Some("large-thread".into());
+        prepare_turn(&request, &mut state).unwrap();
+        let opened = parse_line(r#"{"id":1,"result":{}}"#, &mut state).unwrap();
+        let resume = decode(opened.writes[0].clone());
+        assert_eq!(resume["params"]["excludeTurns"], true);
+        let conflict = parse_line(
+            r#"{"id":2,"error":{"message":"thread already has an active writer"}}"#,
+            &mut state,
+        )
+        .unwrap();
+        let fork = decode(conflict.writes[0].clone());
+        assert_eq!(fork["method"], "thread/fork");
+        assert_eq!(fork["params"]["threadId"], "large-thread");
+        assert_eq!(fork["params"]["excludeTurns"], true);
+    }
+
+    #[test]
     fn the_handshake_response_opens_the_requested_thread_and_starts_the_turn() {
         let mut request = TurnRequest::new(Provider::Codex, ".", "continue");
         request.session_id = Some("thread-7".into());
@@ -1230,6 +1260,7 @@ mod tests {
         let resume = decode(opened.writes[0].clone());
         assert_eq!(resume["method"], json!("thread/resume"));
         assert_eq!(resume["params"]["threadId"], json!("thread-7"));
+        assert_eq!(resume["params"]["excludeTurns"], json!(true));
 
         let started = parse_line(
             r#"{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thread-7"}}}"#,
