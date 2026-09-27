@@ -276,7 +276,7 @@ on the crate exposes no relay tools. See
 
 The non-exhaustive event enum currently includes session start, text and
 reasoning deltas, tool lifecycle, Claude native task snapshots/activity,
-context compaction boundaries,
+context compaction start/completion/failure,
 content-free Agent Relay activity, approval, question, turn usage, provider
 account-usage snapshots, and warnings. A `ToolCall` can carry the native
 `task_id` that owns it. Consumers must include a fallback match arm so minor

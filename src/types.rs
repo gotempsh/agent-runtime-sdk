@@ -65,6 +65,13 @@ pub struct TurnCapabilities {
     /// so an application can show live context occupancy instead of only the
     /// terminal token totals.
     pub context_window_usage: bool,
+    /// The adapter reports the provider's own compaction lifecycle inside
+    /// ordinary turns: [`TurnEvent::CompactionStarted`] when the harness
+    /// begins compacting (automatically or on request) and
+    /// [`TurnEvent::CompactionCompleted`] or [`TurnEvent::CompactionFailed`]
+    /// when it ends, so an application can show an in-progress state instead
+    /// of only a completed boundary.
+    pub compaction_lifecycle: bool,
 }
 
 impl fmt::Debug for LaunchContext {
@@ -782,7 +789,13 @@ pub enum TurnEvent {
         /// Ordered activity record.
         activity: AgentTaskActivity,
     },
-    /// An explicit manual compaction invocation began.
+    /// The provider began compacting the active context.
+    ///
+    /// Emitted for an explicit manual compaction invocation and, when the
+    /// adapter reports [`TurnCapabilities::compaction_lifecycle`], when the
+    /// harness starts an automatic compaction inside an ordinary turn. At most
+    /// one compaction is open at a time; it ends with
+    /// [`TurnEvent::CompactionCompleted`] or [`TurnEvent::CompactionFailed`].
     CompactionStarted {
         /// Requested compaction cause.
         trigger: CompactionTrigger,
@@ -791,6 +804,16 @@ pub enum TurnEvent {
     CompactionCompleted {
         /// Bounded provider-neutral compaction metadata.
         compaction: ContextCompaction,
+    },
+    /// The provider reported that an open compaction ended without compacting.
+    ///
+    /// The turn itself may continue; this only closes the in-progress
+    /// compaction opened by [`TurnEvent::CompactionStarted`].
+    CompactionFailed {
+        /// Cause of the compaction that failed.
+        trigger: CompactionTrigger,
+        /// Bounded provider diagnostic, when one was reported.
+        message: Option<String>,
     },
     /// Content-free Agent Relay lifecycle activity emitted by a host bridge.
     AgentRelayActivity {

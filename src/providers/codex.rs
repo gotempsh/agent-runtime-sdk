@@ -677,6 +677,9 @@ impl AgentAdapter for Codex {
             // `thread/tokenUsage/updated` reports the active window and the
             // model's limit; `exec --json` reports turn totals only.
             context_window_usage: self.app_server_mode(),
+            // The app server reports `contextCompaction` items as they start
+            // and complete; `exec --json` does not surface compaction.
+            compaction_lifecycle: self.app_server_mode(),
         }
     }
 
@@ -1195,6 +1198,12 @@ impl AgentAdapter for Codex {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_app_server_reports_the_compaction_lifecycle() {
+        assert!(Codex::app_server().turn_capabilities().compaction_lifecycle);
+        assert!(!Codex::default().turn_capabilities().compaction_lifecycle);
+    }
 
     #[test]
     fn broker_config_does_not_reenable_nested_sandboxing() {

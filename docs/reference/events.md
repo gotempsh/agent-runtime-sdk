@@ -13,8 +13,9 @@ fallback match arm so minor releases can add variants.
 | `PermissionModeChanged` | The harness's effective permission mode changed, including native entry to or exit from plan mode | Replace the materialized effective mode without rewriting the originally requested turn configuration |
 | `Usage` | Billing-token totals, cache-token components, cost, or active context occupancy changed | Merge billing totals and replace the latest context snapshot |
 | `AccountUsageUpdated` | Provider-account quota windows or credits were refreshed | Replace the latest account snapshot for that provider; never add percentages together |
-| `CompactionStarted` | A provider-native manual compaction invocation began | Add visible running activity keyed by the retained invocation ID |
-| `CompactionCompleted` | Claude reported a native automatic or manual compact boundary | Append the boundary and replace context occupancy with `post_tokens` when present |
+| `CompactionStarted` | The provider began compacting the active context: a manual compaction invocation, or an automatic compaction inside an ordinary turn | Show a visible in-progress state until the matching completion or failure |
+| `CompactionCompleted` | The provider reported a native automatic or manual compact boundary | Close the in-progress state, append the boundary, and replace context occupancy with `post_tokens` when present |
+| `CompactionFailed` | An open compaction ended without compacting (provider error, skipped compaction, or the turn ended first) | Close the in-progress state and show the optional provider message; the turn may continue |
 | `Warning` | Recoverable diagnostic | Add a visible diagnostic without ending the run |
 | `AgentRelayActivity` | Content-free relay operation, receipt, rejection, or limit result | Append to the relay timeline and reconcile by message ID |
 
@@ -57,6 +58,27 @@ the account windows.
 `ContextCompaction` contains bounded pre/post/dropped token counts, cumulative
 dropped tokens, duration, and a normalized automatic/manual/unknown trigger.
 Provider-private transcript identifiers are not part of the normalized event.
+
+### Compaction lifecycle by provider
+
+At most one compaction is open at a time. Every `CompactionStarted` is followed
+by exactly one `CompactionCompleted` or `CompactionFailed` before the turn
+ends; a retained invocation delivers a single start even when the runtime
+announces a manual compaction and the provider then reports its own start.
+`TurnCapabilities::compaction_lifecycle` and
+`RuntimeDriverCapabilities::compaction_lifecycle` report whether an adapter
+emits start signals for automatic compaction. Without it, an application only
+sees the completed boundary.
+
+| Provider | Start signal | Completion | Failure | Token counts |
+| --- | --- | --- | --- | --- |
+| Claude Code (stream-JSON) | `system`/`status` with `status: "compacting"` (repeated as a keepalive; deduplicated) | `system`/`compact_boundary` | `status: null` with `compact_result: "failed"` and `compact_error`, or the terminal `result` arriving first | `pre_tokens`, `post_tokens`, and derived `dropped_tokens` from `compact_metadata` |
+| Codex (`app-server`) | `item/started` with a `contextCompaction` item | `item/completed` for that item; the deprecated `thread/compacted` only when no item was reported | `turn/completed` or `turn/failed` while the item is open | `pre_tokens` from the latest `thread/tokenUsage/updated` snapshot; the next snapshot carries the post-compaction occupancy |
+| OpenCode (`serve`) | `message.part.updated` with a `compaction` part (`auto: false` means manual) | `session.compacted` | the summary message (`summary: true`, agent `compaction`) reports an `error`, or `session.idle` arrives first | `pre_tokens` from the latest assistant message's token counts |
+
+`codex exec --json` and `opencode run --format json` do not expose compaction.
+OpenCode's compaction summary is harness-internal and is not streamed as
+assistant `TextDelta`.
 
 ## Tool execution
 

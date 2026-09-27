@@ -21,9 +21,9 @@ use crate::adapter::{AdapterOutput, AdapterState, IdleFrame, InteractionRequest}
 use crate::error::classify_provider_failure;
 use crate::lifecycle::DeliveryState;
 use crate::{
-    ApprovalDecision, ApprovalRequest, Provider, ProviderTerminalFailure, QuestionAnswer,
-    QuestionRequest, Result, RunStatus, RuntimeError, ToolCallStatus, TurnEvent, TurnRequest,
-    Usage,
+    ApprovalDecision, ApprovalRequest, CompactionTrigger, ContextCompaction, Provider,
+    ProviderTerminalFailure, QuestionAnswer, QuestionRequest, Result, RunStatus, RuntimeError,
+    ToolCallStatus, TurnEvent, TurnRequest, Usage,
 };
 
 /// Key under which this transport keeps its per-turn protocol state.
@@ -75,6 +75,14 @@ struct TurnState {
     streamed: Vec<String>,
     /// Last `error` notification, surfaced when the turn ends badly.
     error_message: Option<String>,
+    /// `contextCompaction` item currently in progress.
+    open_compaction: Option<String>,
+    /// A `contextCompaction` item completed during this turn, so the
+    /// deprecated `thread/compacted` notification must not repeat it.
+    saw_compaction_item: bool,
+    /// Latest active-context occupancy, the pre-compaction size when a
+    /// compaction starts.
+    last_context_tokens: Option<u64>,
 }
 
 pub(super) fn mark_retained(state: &mut AdapterState) {
@@ -334,6 +342,7 @@ fn turn_scoped_method(method: &str) -> bool {
             | "item/permissions/requestApproval"
             | "item/tool/requestUserInput"
             | "thread/tokenUsage/updated"
+            | "thread/compacted"
             | "turn/completed"
             | "turn/failed"
     )
@@ -553,6 +562,9 @@ fn notification(
                 return;
             };
             match item.get("type").and_then(Value::as_str) {
+                Some("contextCompaction") => {
+                    compaction_item(item, completed, turn, output);
+                }
                 Some("agentMessage") if completed => {
                     if let Some(text) = consolidated(turn, item, "text") {
                         state.result.text.push_str(&text);
@@ -614,9 +626,26 @@ fn notification(
                 .or(turn.model.as_deref())
                 .map(str::to_owned);
             let usage = token_usage(&params, model);
+            if let Some(used) = usage
+                .context_window
+                .as_ref()
+                .and_then(|context| context.used_tokens)
+            {
+                turn.last_context_tokens = Some(used);
+            }
             if usage != Usage::default() {
                 super::merge_usage(&mut state.result.usage, &usage);
                 output.events.push(TurnEvent::Usage(usage));
+            }
+        }
+        "thread/compacted" => {
+            // Deprecated in favor of the `contextCompaction` item, but still
+            // the only signal from older app servers. Report it only when no
+            // item already described this compaction.
+            if turn.open_compaction.is_none() && !turn.saw_compaction_item {
+                output.events.push(TurnEvent::CompactionCompleted {
+                    compaction: completed_compaction(turn.last_context_tokens),
+                });
             }
         }
         "error" => {
@@ -639,6 +668,16 @@ fn notification(
                 }
             }
             output.terminal = true;
+            if turn.open_compaction.take().is_some() {
+                // A turn cannot end with its compaction still running; the
+                // application must see it close instead of spinning forever.
+                output.events.push(TurnEvent::CompactionFailed {
+                    trigger: CompactionTrigger::Automatic,
+                    message: Some(turn.error_message.clone().unwrap_or_else(|| {
+                        "Codex ended the turn before the compaction finished.".to_string()
+                    })),
+                });
+            }
             if let Some(model) = completed.get("model").and_then(Value::as_str) {
                 state.result.model = Some(model.to_string());
             }
@@ -669,6 +708,53 @@ fn notification(
             }
         }
         _ => {}
+    }
+}
+
+/// Translate a `contextCompaction` item into the compaction lifecycle.
+///
+/// Codex runs automatic compaction inside the turn that crossed its
+/// `model_auto_compact_token_limit` (or before it, when the history is already
+/// too large) and reports it as an ordinary thread item: `item/started` when
+/// the summary request begins and `item/completed` when the history has been
+/// replaced. The item carries no token counts, so the pre-compaction size is
+/// the latest context occupancy the turn reported; the post-compaction size
+/// arrives as the next `thread/tokenUsage/updated` snapshot.
+fn compaction_item(
+    item: &Value,
+    completed: bool,
+    turn: &mut TurnState,
+    output: &mut AdapterOutput,
+) {
+    let id = item
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    if !completed {
+        if turn.open_compaction.is_none() {
+            turn.open_compaction = Some(id);
+            output.events.push(TurnEvent::CompactionStarted {
+                trigger: CompactionTrigger::Automatic,
+            });
+        }
+        return;
+    }
+    turn.open_compaction = None;
+    turn.saw_compaction_item = true;
+    output.events.push(TurnEvent::CompactionCompleted {
+        compaction: completed_compaction(turn.last_context_tokens),
+    });
+}
+
+fn completed_compaction(pre_tokens: Option<u64>) -> ContextCompaction {
+    ContextCompaction {
+        trigger: CompactionTrigger::Automatic,
+        pre_tokens,
+        post_tokens: None,
+        dropped_tokens: None,
+        cumulative_dropped_tokens: None,
+        duration_ms: None,
     }
 }
 
@@ -1167,6 +1253,106 @@ mod tests {
             }
         }})
         .to_string()
+    }
+
+    fn compaction_item_frame(method: &str) -> String {
+        json!({"jsonrpc": "2.0", "method": method, "params": {
+            "threadId": "thread-1", "turnId": "turn-1",
+            "item": {"type": "contextCompaction", "id": "item-compact-1"}
+        }})
+        .to_string()
+    }
+
+    fn thread_compacted_frame() -> String {
+        json!({"jsonrpc": "2.0", "method": "thread/compacted", "params": {
+            "threadId": "thread-1", "turnId": "turn-1"
+        }})
+        .to_string()
+    }
+
+    fn compaction_events(state: &mut AdapterState, frames: &[String]) -> Vec<TurnEvent> {
+        frames
+            .iter()
+            .flat_map(|frame| parse_line(frame, state).unwrap().events)
+            .filter(|event| {
+                matches!(
+                    event,
+                    TurnEvent::CompactionStarted { .. }
+                        | TurnEvent::CompactionCompleted { .. }
+                        | TurnEvent::CompactionFailed { .. }
+                )
+            })
+            .collect()
+    }
+
+    /// Frame shapes of `codex app-server` 0.155.1 (`ThreadItem::ContextCompaction`
+    /// and the deprecated `ContextCompactedNotification`).
+    #[test]
+    fn reports_an_automatic_compaction_item_once_from_start_to_completion() {
+        let mut state = started_turn(None);
+        let events = compaction_events(
+            &mut state,
+            &[
+                token_usage_frame("thread-1", 180_000),
+                compaction_item_frame("item/started"),
+                compaction_item_frame("item/completed"),
+                thread_compacted_frame(),
+            ],
+        );
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert!(matches!(
+            events[0],
+            TurnEvent::CompactionStarted {
+                trigger: CompactionTrigger::Automatic
+            }
+        ));
+        assert!(matches!(
+            events[1],
+            TurnEvent::CompactionCompleted {
+                compaction: ContextCompaction {
+                    trigger: CompactionTrigger::Automatic,
+                    pre_tokens: Some(180_000),
+                    post_tokens: None,
+                    ..
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn falls_back_to_the_deprecated_compacted_notification() {
+        let mut state = started_turn(None);
+        let events = compaction_events(&mut state, &[thread_compacted_frame()]);
+        assert!(matches!(
+            events.as_slice(),
+            [TurnEvent::CompactionCompleted { .. }]
+        ));
+    }
+
+    #[test]
+    fn a_turn_that_ends_mid_compaction_closes_it_as_failed() {
+        let mut state = started_turn(None);
+        let events = compaction_events(
+            &mut state,
+            &[
+                compaction_item_frame("item/started"),
+                json!({"jsonrpc": "2.0", "method": "turn/completed", "params": {
+                    "threadId": "thread-1",
+                    "turn": {"id": "turn-1", "status": "interrupted"}
+                }})
+                .to_string(),
+            ],
+        );
+        assert!(matches!(
+            events.as_slice(),
+            [
+                TurnEvent::CompactionStarted { .. },
+                TurnEvent::CompactionFailed {
+                    trigger: CompactionTrigger::Automatic,
+                    message: Some(_),
+                }
+            ]
+        ));
     }
 
     /// Open a thread so token-usage notifications can be attributed to it.

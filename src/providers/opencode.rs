@@ -11,7 +11,7 @@ use crate::{
     HarnessCatalogStatus, HarnessControlGroup, HarnessControlKind, HarnessControlOption,
     HarnessModel, HarnessModelCatalog, PermissionMode, PermissionSupport, Provider,
     ProviderReadiness, ProviderTerminalFailure, QuestionAnswer, QuestionRequest, Result,
-    RuntimeError, ToolCallStatus, TurnEvent, TurnRequest,
+    RuntimeError, ToolCallStatus, TurnCapabilities, TurnEvent, TurnRequest,
 };
 
 /// Transport used to run one OpenCode turn.
@@ -121,6 +121,16 @@ impl OpenCode {
 impl AgentAdapter for OpenCode {
     fn provider(&self) -> Provider {
         Provider::OpenCode
+    }
+
+    fn turn_capabilities(&self) -> TurnCapabilities {
+        TurnCapabilities {
+            // `opencode serve` publishes the compaction request part, the
+            // summary message, and `session.compacted` over its event stream;
+            // `opencode run --format json` does not.
+            compaction_lifecycle: self.serve_mode(),
+            ..TurnCapabilities::default()
+        }
     }
 
     fn supports_retained_process(&self) -> bool {

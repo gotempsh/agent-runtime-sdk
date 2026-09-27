@@ -349,6 +349,11 @@ pub struct RuntimeDriverCapabilities {
     /// instead of describing their host paths in the prompt.
     #[serde(default)]
     pub native_image_attachments: bool,
+    /// The driver reports the provider's compaction lifecycle inside ordinary
+    /// turns: a start event when an automatic compaction begins and a
+    /// completed or failed event when it ends.
+    #[serde(default)]
+    pub compaction_lifecycle: bool,
 }
 
 /// Runtime setting whose update impact is being inspected.
@@ -494,6 +499,9 @@ impl RuntimeTurnExecutor for AgentRuntime {
             native_image_attachments: self
                 .turn_capabilities(provider)
                 .is_ok_and(|capabilities| capabilities.native_image_attachments),
+            compaction_lifecycle: self
+                .turn_capabilities(provider)
+                .is_ok_and(|capabilities| capabilities.compaction_lifecycle),
         }
     }
 
@@ -1160,6 +1168,7 @@ impl RuntimeEntry {
             sequence: AtomicU64::new(0),
             sender: event_sender,
             announced_session_id: std::sync::Mutex::new(None),
+            compaction_open: std::sync::atomic::AtomicBool::new(false),
         };
         let entry = Arc::clone(self);
         let task_terminal = Arc::clone(&terminal);
@@ -1526,16 +1535,34 @@ struct ChannelEventSink {
     sender: mpsc::Sender<EventEnvelope>,
     /// Latest `SessionStarted` the provider emitted during this invocation.
     announced_session_id: std::sync::Mutex<Option<String>>,
+    /// Whether a `CompactionStarted` is open (not yet completed or failed).
+    ///
+    /// A manual compaction is announced by the runtime before the provider
+    /// runs, and the provider then reports its own start signal (Claude also
+    /// repeats it as a keepalive). Consumers get exactly one start per
+    /// compaction.
+    compaction_open: std::sync::atomic::AtomicBool,
 }
 
 #[async_trait]
 impl EventSink for ChannelEventSink {
     async fn emit(&self, event: TurnEvent) -> crate::Result<()> {
-        if let TurnEvent::SessionStarted { session_id, .. } = &event {
-            *self
-                .announced_session_id
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(session_id.clone());
+        match &event {
+            TurnEvent::SessionStarted { session_id, .. } => {
+                *self
+                    .announced_session_id
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(session_id.clone());
+            }
+            TurnEvent::CompactionStarted { .. } => {
+                if self.compaction_open.swap(true, Ordering::AcqRel) {
+                    return Ok(());
+                }
+            }
+            TurnEvent::CompactionCompleted { .. } | TurnEvent::CompactionFailed { .. } => {
+                self.compaction_open.store(false, Ordering::Release);
+            }
+            _ => {}
         }
         self.emit_runtime(RuntimeEvent::ProviderEvent { event })
             .await
@@ -1995,6 +2022,7 @@ mod tests {
                 manual_compaction: true,
                 context_window_usage: true,
                 native_image_attachments: true,
+                compaction_lifecycle: true,
             }
         }
 
@@ -2032,6 +2060,71 @@ mod tests {
                 text: "ok".to_owned(),
                 reasoning: None,
                 session_id: Some(session_id),
+                session_title: None,
+                model: None,
+                usage: Usage::default(),
+            })
+        }
+    }
+
+    /// Emits the provider's own compaction signals the way the Claude adapter
+    /// does: its start (repeated as a keepalive), completion, then a later
+    /// automatic compaction that fails.
+    struct CompactingExecutor;
+
+    #[async_trait]
+    impl RuntimeTurnExecutor for CompactingExecutor {
+        fn capabilities(&self, _provider: Provider) -> RuntimeDriverCapabilities {
+            RuntimeDriverCapabilities {
+                session_resume: true,
+                manual_compaction: true,
+                compaction_lifecycle: true,
+                ..RuntimeDriverCapabilities::default()
+            }
+        }
+
+        fn configuration_impact(&self, _key: RuntimeConfigurationKey) -> ConfigurationImpact {
+            ConfigurationImpact::Live
+        }
+
+        async fn execute(
+            &self,
+            request: TurnRequest,
+            events: &dyn EventSink,
+            _interactions: Option<&dyn InteractionHandler>,
+        ) -> crate::Result<TurnResult> {
+            for event in [
+                TurnEvent::CompactionStarted {
+                    trigger: CompactionTrigger::Manual,
+                },
+                TurnEvent::CompactionStarted {
+                    trigger: CompactionTrigger::Manual,
+                },
+                TurnEvent::CompactionCompleted {
+                    compaction: crate::ContextCompaction {
+                        trigger: CompactionTrigger::Manual,
+                        pre_tokens: Some(50_000),
+                        post_tokens: Some(4_000),
+                        dropped_tokens: Some(46_000),
+                        cumulative_dropped_tokens: None,
+                        duration_ms: None,
+                    },
+                },
+                TurnEvent::CompactionStarted {
+                    trigger: CompactionTrigger::Automatic,
+                },
+                TurnEvent::CompactionFailed {
+                    trigger: CompactionTrigger::Automatic,
+                    message: None,
+                },
+            ] {
+                events.emit(event).await?;
+            }
+            Ok(TurnResult {
+                status: RunStatus::Succeeded,
+                text: String::new(),
+                reasoning: None,
+                session_id: request.session_id,
                 session_title: None,
                 model: None,
                 usage: Usage::default(),
@@ -2525,6 +2618,45 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert_eq!(requests[0].prompt, "/compact Preserve open decisions");
         assert_eq!(requests[0].session_id.as_deref(), Some("session-existing"));
+    }
+
+    #[tokio::test]
+    async fn a_compaction_is_announced_once_even_when_the_provider_repeats_its_start() {
+        let client = InProcessRuntimeClient::from_executor(Arc::new(CompactingExecutor));
+        let mut spec = runtime_spec("runtime-compact-dedupe");
+        spec.provider_session_id = Some("session-existing".to_owned());
+        let handle = client.acquire(spec).await.expect("acquire runtime");
+        let turn = handle
+            .compact(CompactionInput::new(
+                InvocationId::new("compact-dedupe").expect("valid invocation identifier"),
+            ))
+            .await
+            .expect("start compaction");
+        let (mut events, completion) = turn.into_parts();
+        let mut observed = Vec::new();
+        while let Some(envelope) = events.next().await {
+            if let RuntimeEvent::ProviderEvent { event } = envelope.event {
+                observed.push(event);
+            }
+        }
+        completion.wait().await.expect("compaction result");
+
+        assert!(
+            matches!(
+                observed.as_slice(),
+                [
+                    TurnEvent::CompactionStarted {
+                        trigger: CompactionTrigger::Manual
+                    },
+                    TurnEvent::CompactionCompleted { .. },
+                    TurnEvent::CompactionStarted {
+                        trigger: CompactionTrigger::Automatic
+                    },
+                    TurnEvent::CompactionFailed { .. },
+                ]
+            ),
+            "{observed:?}"
+        );
     }
 
     #[tokio::test]

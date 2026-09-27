@@ -4,9 +4,10 @@ This guide describes the application boundary for Temps Fleet and similar durabl
 owns harness configuration, Claude stream parsing, normalized events, and the manual compaction
 operation. Fleet owns authorization, durable operation IDs, event persistence, replay, and UI.
 
-Claude Code is currently the implementing driver. Inspect
-`RuntimeHandle::driver_capabilities()` before exposing controls; do not infer support from the
-provider name in application code.
+Claude Code is currently the driver that implements configurable automatic compaction and
+manual compaction. Claude, Codex (`app-server`), and OpenCode (`serve`) all report the compaction
+lifecycle. Inspect `RuntimeHandle::driver_capabilities()` before exposing controls; do not infer
+support from the provider name in application code.
 
 ## Configure automatic compaction
 
@@ -36,8 +37,13 @@ For a one-invocation override, set `TurnInput::auto_compaction`. `None` inherits
 default. The retained driver reports `configurable_auto_compaction`; unsupported settings fail
 closed rather than being silently ignored.
 
-Automatic compaction does not create a separate Fleet message. It occurs inside an ordinary turn
-and emits `TurnEvent::CompactionCompleted` at the exact provider boundary.
+Automatic compaction does not create a separate Fleet message. It occurs inside an ordinary turn.
+When `driver_capabilities().compaction_lifecycle` is true, the SDK emits
+`TurnEvent::CompactionStarted { trigger: Automatic }` as soon as the harness starts compacting,
+then `TurnEvent::CompactionCompleted` at the exact provider boundary or `TurnEvent::CompactionFailed`
+when the compaction ends without compacting. Show the turn as “Compacting context” between the
+two; do not keep describing it as generic agent work. See
+[the provider signal table](../reference/events.md#compaction-lifecycle-by-provider).
 
 ## Persist context-window usage
 
@@ -93,6 +99,9 @@ match event {
     TurnEvent::CompactionCompleted { compaction } => {
         persist("compaction_completed", &compaction)
     }
+    TurnEvent::CompactionFailed { trigger, message } => {
+        persist("compaction_failed", &(trigger, message))
+    }
     TurnEvent::Usage(usage) => persist("usage", &usage),
     _ => {}
 }
@@ -146,8 +155,12 @@ The runtime must already have a provider session. A sessionless request fails wi
 1. `RuntimeEvent::InvocationStarted`;
 2. `TurnEvent::CompactionStarted { trigger: Manual }`;
 3. any provider progress or usage events;
-4. `TurnEvent::CompactionCompleted` when Claude reports the native boundary;
+4. `TurnEvent::CompactionCompleted` when Claude reports the native boundary, or
+   `TurnEvent::CompactionFailed` when Claude reports a failed compact result;
 5. `RuntimeEvent::InvocationCompleted` or `InvocationFailed`.
+
+Claude also reports its own start signal for a manual compaction. The retained runtime delivers
+only the first `CompactionStarted` of an open compaction, so step 2 is never duplicated.
 
 Claude repeats the attached session ID in the startup handshake for a resumed
 compaction process. The SDK treats that as transport bookkeeping and does not
@@ -180,9 +193,11 @@ manual-compaction semantics; an older negotiated peer rejects them instead of dr
 3. Persist cache-token components and the latest context snapshot separately from cumulative run
    usage.
 4. Merge catalog limits only when the usage snapshot omits its limit.
-5. Store `CompactionCompleted` as ordered activity before WebSocket/SSE publication.
+5. Store `CompactionStarted`, `CompactionCompleted`, and `CompactionFailed` as ordered activity
+   before WebSocket/SSE publication, and render an open compaction as in progress.
 6. Add an authorized manual-compaction endpoint backed by a durable operation record and
    `RuntimeHandle::compact`.
 7. Recover accepted or indeterminate operations by attach/replay using the original invocation ID.
-8. Test automatic boundaries, manual success, unsupported harnesses, missing sessions, runtime
-   busy, disconnect after acceptance, daemon restart, and duplicate button submissions.
+8. Test automatic start/boundary pairs, failed compactions, manual success, unsupported harnesses,
+   missing sessions, runtime busy, disconnect after acceptance, daemon restart, and duplicate
+   button submissions.

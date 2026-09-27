@@ -32,9 +32,9 @@ use crate::adapter::{AdapterOutput, AdapterState, InteractionRequest};
 use crate::error::classify_provider_failure;
 use crate::lifecycle::DeliveryState;
 use crate::{
-    ApprovalDecision, ApprovalRequest, PermissionMode, Provider, ProviderTerminalFailure,
-    QuestionAnswer, QuestionRequest, Result, RunStatus, RuntimeError, ToolCallStatus, TurnEvent,
-    TurnRequest,
+    ApprovalDecision, ApprovalRequest, CompactionTrigger, ContextCompaction, PermissionMode,
+    Provider, ProviderTerminalFailure, QuestionAnswer, QuestionRequest, Result, RunStatus,
+    RuntimeError, ToolCallStatus, TurnEvent, TurnRequest,
 };
 
 use super::opencode_http::{
@@ -84,7 +84,16 @@ pub(super) struct TurnState {
     saw_activity: bool,
     /// Require every turn-affecting SSE event to identify this turn's session.
     retained: bool,
+    /// Trigger of the compaction OpenCode is currently running, if any.
+    open_compaction: Option<CompactionTrigger>,
+    /// Active-context size of the latest ordinary assistant message, the
+    /// pre-compaction size when a compaction starts.
+    last_context_tokens: Option<u64>,
 }
+
+/// Role recorded for OpenCode's compaction summary message. Its text is the
+/// summary the harness writes for itself, not a reply to the user.
+const COMPACTION_SUMMARY_ROLE: &str = "compaction";
 
 fn load(state: &AdapterState) -> TurnState {
     state
@@ -571,20 +580,46 @@ fn event(
     match kind {
         "message.updated" => {
             let info = properties.get("info").unwrap_or(&Value::Null);
+            let summary = is_compaction_summary(info);
             if let (Some(id), Some(role)) = (
                 info.get("id").and_then(Value::as_str),
                 info.get("role").and_then(Value::as_str),
             ) {
+                let role = if summary {
+                    COMPACTION_SUMMARY_ROLE
+                } else {
+                    role
+                };
                 turn.roles.insert(id.to_string(), role.to_string());
             }
-            if info.get("role").and_then(Value::as_str) == Some("assistant") {
+            if summary {
+                compaction_summary(info, turn, output);
+            } else if info.get("role").and_then(Value::as_str) == Some("assistant") {
                 if let Some(cost) = info.get("cost").and_then(Value::as_f64) {
                     state.result.usage.cost_usd = Some(cost);
+                }
+                if let Some(tokens) = context_tokens(info) {
+                    turn.last_context_tokens = Some(tokens);
                 }
             }
         }
         "message.part.updated" => {
             let part = properties.get("part").unwrap_or(&Value::Null);
+            if part.get("type").and_then(Value::as_str) == Some("compaction") {
+                // OpenCode requests a compaction by appending a `compaction`
+                // part to a synthetic user message, `auto: true` when it
+                // crossed its overflow threshold mid-turn.
+                if turn.open_compaction.is_none() {
+                    let trigger = if part.get("auto").and_then(Value::as_bool) == Some(false) {
+                        CompactionTrigger::Manual
+                    } else {
+                        CompactionTrigger::Automatic
+                    };
+                    turn.open_compaction = Some(trigger);
+                    output.events.push(TurnEvent::CompactionStarted { trigger });
+                }
+                return;
+            }
             let message = part.get("messageID").and_then(Value::as_str);
             if message.is_none_or(|id| turn.roles.get(id).map(String::as_str) != Some("assistant"))
             {
@@ -628,6 +663,22 @@ fn event(
             emit_delta(&kind, delta, state, output);
         }
         "permission.asked" => permission(properties, turn, output),
+        "session.compacted" => {
+            let trigger = turn
+                .open_compaction
+                .take()
+                .unwrap_or(CompactionTrigger::Automatic);
+            output.events.push(TurnEvent::CompactionCompleted {
+                compaction: ContextCompaction {
+                    trigger,
+                    pre_tokens: turn.last_context_tokens,
+                    post_tokens: None,
+                    dropped_tokens: None,
+                    cumulative_dropped_tokens: None,
+                    duration_ms: None,
+                },
+            });
+        }
         "session.error" => {
             turn.error_message = properties
                 .pointer("/error/data/message")
@@ -638,6 +689,14 @@ fn event(
         }
         "session.idle" => {
             output.terminal = true;
+            if let Some(trigger) = turn.open_compaction.take() {
+                output.events.push(TurnEvent::CompactionFailed {
+                    trigger,
+                    message: Some(turn.error_message.clone().unwrap_or_else(|| {
+                        "OpenCode stopped before the compaction finished.".to_string()
+                    })),
+                });
+            }
             if let Some(message) = turn.error_message.clone() {
                 fail(turn, state, output, &message, None);
             } else if state.result.text.trim().is_empty() && !turn.saw_activity {
@@ -657,6 +716,54 @@ fn event(
         }
         _ => {}
     }
+}
+
+/// Whether a `message.updated` describes OpenCode's compaction summary.
+fn is_compaction_summary(info: &Value) -> bool {
+    info.get("role").and_then(Value::as_str) == Some("assistant")
+        && (info.get("summary").and_then(Value::as_bool) == Some(true)
+            || info.get("mode").and_then(Value::as_str) == Some("compaction")
+            || info.get("agent").and_then(Value::as_str) == Some("compaction"))
+}
+
+/// Close the open compaction when its summary message reports an error.
+///
+/// Success is reported separately by `session.compacted`; a summary that
+/// fails (for example because the history exceeds even the compaction
+/// model's window) never publishes that event.
+fn compaction_summary(info: &Value, turn: &mut TurnState, output: &mut AdapterOutput) {
+    let Some(error) = info.get("error").filter(|error| !error.is_null()) else {
+        return;
+    };
+    let trigger = turn
+        .open_compaction
+        .take()
+        .unwrap_or(CompactionTrigger::Automatic);
+    let message = error
+        .pointer("/data/message")
+        .or_else(|| error.get("message"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
+        .map(truncate);
+    output
+        .events
+        .push(TurnEvent::CompactionFailed { trigger, message });
+}
+
+/// Active-context tokens reported on an assistant message.
+fn context_tokens(info: &Value) -> Option<u64> {
+    let tokens = info.get("tokens")?;
+    if let Some(total) = tokens.get("total").and_then(Value::as_u64) {
+        return (total > 0).then_some(total);
+    }
+    let field = |pointer: &str| tokens.pointer(pointer).and_then(Value::as_u64).unwrap_or(0);
+    let total = field("/input")
+        + field("/output")
+        + field("/reasoning")
+        + field("/cache/read")
+        + field("/cache/write");
+    (total > 0).then_some(total)
 }
 
 /// Surface a permission request, or refuse it outright when the turn's policy
@@ -932,6 +1039,191 @@ mod tests {
             }
         }})
         .to_string()
+    }
+
+    fn sse(kind: &str, properties: Value) -> String {
+        json!({"type": FRAME_EVENT, "event": {"type": kind, "properties": properties}}).to_string()
+    }
+
+    fn feed(state: &mut AdapterState, frames: &[String]) -> Vec<TurnEvent> {
+        frames
+            .iter()
+            .flat_map(|frame| parse_line(frame, state).unwrap().events)
+            .collect()
+    }
+
+    fn is_compaction(event: &TurnEvent) -> bool {
+        matches!(
+            event,
+            TurnEvent::CompactionStarted { .. }
+                | TurnEvent::CompactionCompleted { .. }
+                | TurnEvent::CompactionFailed { .. }
+        )
+    }
+
+    /// Event shapes of `opencode 1.18.30 serve`: an overflowing assistant step
+    /// is followed by a synthetic user message carrying a `compaction` part,
+    /// a `summary` assistant message written by the `compaction` agent, and
+    /// `session.compacted` once the history was replaced.
+    fn automatic_compaction_frames() -> Vec<String> {
+        vec![
+            sse(
+                "message.updated",
+                json!({"sessionID": "session-1", "info": {
+                    "id": "msg-a1", "sessionID": "session-1", "role": "assistant",
+                    "tokens": {"input": 150_000, "output": 2_000, "reasoning": 0,
+                               "cache": {"read": 20_000, "write": 0}}
+                }}),
+            ),
+            sse(
+                "message.updated",
+                json!({"sessionID": "session-1", "info": {
+                    "id": "msg-u2", "sessionID": "session-1", "role": "user"
+                }}),
+            ),
+            sse(
+                "message.part.updated",
+                json!({"sessionID": "session-1", "part": {
+                    "id": "prt-c1", "messageID": "msg-u2", "sessionID": "session-1",
+                    "type": "compaction", "auto": true
+                }}),
+            ),
+            sse(
+                "message.updated",
+                json!({"sessionID": "session-1", "info": {
+                    "id": "msg-s3", "sessionID": "session-1", "role": "assistant",
+                    "mode": "compaction", "agent": "compaction", "summary": true
+                }}),
+            ),
+            sse(
+                "message.part.updated",
+                json!({"sessionID": "session-1", "part": {
+                    "id": "prt-s1", "messageID": "msg-s3", "sessionID": "session-1",
+                    "type": "text", "text": "## Summary of the conversation so far"
+                }}),
+            ),
+            sse(
+                "message.part.delta",
+                json!({"sessionID": "session-1",
+                "messageID": "msg-s3", "partID": "prt-s1", "delta": " (continued)"}),
+            ),
+            sse(
+                "message.part.updated",
+                json!({"sessionID": "session-1", "part": {
+                    "id": "prt-c1", "messageID": "msg-u2", "sessionID": "session-1",
+                    "type": "compaction", "auto": true, "tail_start_id": "msg-9"
+                }}),
+            ),
+            sse("session.compacted", json!({"sessionID": "session-1"})),
+        ]
+    }
+
+    #[test]
+    fn reports_an_automatic_compaction_without_streaming_its_summary_as_a_reply() {
+        let mut state = running_turn(PermissionMode::Default);
+        let events = feed(&mut state, &automatic_compaction_frames());
+        let compaction: Vec<_> = events.iter().filter(|event| is_compaction(event)).collect();
+        assert_eq!(compaction.len(), 2, "{compaction:?}");
+        assert!(matches!(
+            compaction[0],
+            TurnEvent::CompactionStarted {
+                trigger: CompactionTrigger::Automatic
+            }
+        ));
+        assert!(matches!(
+            compaction[1],
+            TurnEvent::CompactionCompleted {
+                compaction: ContextCompaction {
+                    trigger: CompactionTrigger::Automatic,
+                    pre_tokens: Some(172_000),
+                    ..
+                }
+            }
+        ));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, TurnEvent::TextDelta { .. })),
+            "the compaction summary is harness-internal, not assistant output: {events:?}"
+        );
+        assert!(state.result.text.is_empty());
+    }
+
+    #[test]
+    fn only_serve_mode_reports_the_compaction_lifecycle() {
+        use crate::AgentAdapter;
+        assert!(
+            crate::providers::OpenCode::serve()
+                .turn_capabilities()
+                .compaction_lifecycle
+        );
+        assert!(
+            !crate::providers::OpenCode::default()
+                .turn_capabilities()
+                .compaction_lifecycle
+        );
+    }
+
+    #[test]
+    fn a_manual_summarize_request_is_reported_as_manual() {
+        let mut state = running_turn(PermissionMode::Default);
+        let events = feed(
+            &mut state,
+            &[sse(
+                "message.part.updated",
+                json!({"sessionID": "session-1", "part": {
+                    "id": "prt-c1", "messageID": "msg-u2", "sessionID": "session-1",
+                    "type": "compaction", "auto": false
+                }}),
+            )],
+        );
+        assert!(matches!(
+            events.as_slice(),
+            [TurnEvent::CompactionStarted {
+                trigger: CompactionTrigger::Manual
+            }]
+        ));
+    }
+
+    #[test]
+    fn a_failed_summary_closes_the_compaction_with_its_error() {
+        let mut state = running_turn(PermissionMode::Default);
+        let mut frames = automatic_compaction_frames();
+        frames.truncate(4);
+        frames.push(sse("message.updated", json!({"sessionID": "session-1", "info": {
+            "id": "msg-s3", "sessionID": "session-1", "role": "assistant",
+            "mode": "compaction", "summary": true, "finish": "error",
+            "error": {"name": "ContextOverflowError",
+                      "data": {"message": "Session too large to compact - context exceeds model limit even after stripping media"}}
+        }})));
+        frames.push(sse("session.idle", json!({"sessionID": "session-1"})));
+        let events = feed(&mut state, &frames);
+        let compaction: Vec<_> = events.iter().filter(|event| is_compaction(event)).collect();
+        assert_eq!(compaction.len(), 2, "{compaction:?}");
+        assert!(matches!(
+            compaction[1],
+            TurnEvent::CompactionFailed {
+                trigger: CompactionTrigger::Automatic,
+                message: Some(message),
+            } if message.starts_with("Session too large to compact")
+        ));
+    }
+
+    #[test]
+    fn an_idle_session_never_leaves_a_compaction_running() {
+        let mut state = running_turn(PermissionMode::Default);
+        let mut frames = automatic_compaction_frames();
+        frames.truncate(3);
+        frames.push(sse("session.idle", json!({"sessionID": "session-1"})));
+        let events = feed(&mut state, &frames);
+        let compaction: Vec<_> = events.iter().filter(|event| is_compaction(event)).collect();
+        assert!(matches!(
+            compaction.as_slice(),
+            [
+                TurnEvent::CompactionStarted { .. },
+                TurnEvent::CompactionFailed { .. }
+            ]
+        ));
     }
 
     #[test]

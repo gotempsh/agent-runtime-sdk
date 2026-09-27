@@ -18,7 +18,8 @@ use crate::{
     HarnessModel, HarnessModelCatalog, HarnessReasoningEffort, InteractionRequest,
     LaunchContextCapabilities, McpServerConfig, PermissionMode, PermissionSupport, Provider,
     ProviderReadiness, ProviderTerminalFailure, QuestionAnswer, QuestionRequest, Result, RunStatus,
-    RuntimeError, ToolCallStatus, TransportExitStatus, TurnEvent, TurnRequest, Usage,
+    RuntimeError, ToolCallStatus, TransportExitStatus, TurnCapabilities, TurnEvent, TurnRequest,
+    Usage,
 };
 
 const CLAUDE_STATE_KEY: &str = "claude.native_tasks";
@@ -361,6 +362,13 @@ struct ClaudeNativeState {
     effective_permission_mode: Option<PermissionMode>,
     permission_mode_before_plan: Option<PermissionMode>,
     result_seen: bool,
+    /// This turn is an explicit `/compact` request, so compaction it reports
+    /// is manual rather than automatic.
+    manual_compaction_turn: bool,
+    /// Trigger of the compaction Claude reported as in progress, if any.
+    open_compaction: Option<CompactionTrigger>,
+    /// Claude reported the open compaction succeeded; its boundary follows.
+    open_compaction_succeeded: bool,
 }
 
 fn claude_permission_mode(value: &str) -> PermissionMode {
@@ -828,6 +836,23 @@ impl AgentAdapter for Claude {
         inspect_executable(Provider::Claude, self.resolved()).await
     }
 
+    fn prepare_turn(&self, request: &TurnRequest, state: &mut AdapterState) -> Result<()> {
+        let mut native = take_native_state(state);
+        native.manual_compaction_turn = is_manual_compaction_prompt(&request.prompt);
+        put_native_state(state, native);
+        Ok(())
+    }
+
+    fn turn_capabilities(&self) -> TurnCapabilities {
+        TurnCapabilities {
+            // Claude reports `system/status` `compacting` when it starts
+            // compacting and `compact_boundary` (or a failed compact result)
+            // when it ends, for automatic and manual compaction alike.
+            compaction_lifecycle: true,
+            ..TurnCapabilities::default()
+        }
+    }
+
     fn command(&self, request: &TurnRequest) -> Result<CommandSpec> {
         let mut spec = CommandSpec::new(self.configured_executable());
         spec.args.extend([
@@ -981,7 +1006,11 @@ impl AgentAdapter for Claude {
                         .map(str::to_owned);
                 }
                 if value.get("subtype").and_then(Value::as_str) == Some("compact_boundary") {
+                    native.open_compaction = None;
+                    native.open_compaction_succeeded = false;
                     translate_compaction(&value, state, &mut output);
+                } else if value.get("subtype").and_then(Value::as_str) == Some("status") {
+                    translate_compaction_status(&value, &mut native, &mut output);
                 } else {
                     translate_system_task(&value, &mut native, &mut output);
                 }
@@ -1195,6 +1224,7 @@ impl AgentAdapter for Claude {
             }
             "result" => {
                 native.result_seen = true;
+                close_unfinished_compaction(&mut native, &mut output);
                 // Claude can emit its terminal result before background Task
                 // subagents finish. Keep stdin available for their approvals
                 // and continue reading task progress until the native task set
@@ -1521,6 +1551,103 @@ fn claude_account_usage(value: &Value) -> Option<AccountUsageSnapshot> {
         windows,
         credits,
     })
+}
+
+/// Whether a prompt is Claude Code's native `/compact` command.
+fn is_manual_compaction_prompt(prompt: &str) -> bool {
+    let prompt = prompt.trim_start();
+    prompt
+        .strip_prefix("/compact")
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+}
+
+/// Maximum characters of a provider compaction diagnostic carried in events.
+const MAX_COMPACTION_ERROR_CHARS: usize = 512;
+
+/// Translate Claude's `system/status` frames into the compaction lifecycle.
+///
+/// Claude Code reports `status: "compacting"` when a compaction starts (and
+/// repeats it periodically while a long compaction runs). The compaction ends
+/// with a `compact_boundary` on success, or with `status: null` carrying
+/// `compact_result: "failed"` and an optional `compact_error`. A
+/// `compact_result: "success"` precedes the boundary, so it does not close the
+/// compaction by itself.
+fn translate_compaction_status(
+    value: &Value,
+    native: &mut ClaudeNativeState,
+    output: &mut AdapterOutput,
+) {
+    if value.get("status").and_then(Value::as_str) == Some("compacting") {
+        if native.open_compaction.is_none() {
+            let trigger = if native.manual_compaction_turn {
+                CompactionTrigger::Manual
+            } else {
+                CompactionTrigger::Automatic
+            };
+            native.open_compaction = Some(trigger);
+            native.open_compaction_succeeded = false;
+            output.events.push(TurnEvent::CompactionStarted { trigger });
+        }
+        return;
+    }
+    match value.get("compact_result").and_then(Value::as_str) {
+        Some("success") => {
+            if native.open_compaction.is_some() {
+                native.open_compaction_succeeded = true;
+            }
+        }
+        Some("failed") => {
+            let trigger =
+                native
+                    .open_compaction
+                    .take()
+                    .unwrap_or(if native.manual_compaction_turn {
+                        CompactionTrigger::Manual
+                    } else {
+                        CompactionTrigger::Automatic
+                    });
+            native.open_compaction_succeeded = false;
+            let message = value
+                .get("compact_error")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|message| !message.is_empty())
+                .map(|message| message.chars().take(MAX_COMPACTION_ERROR_CHARS).collect());
+            output
+                .events
+                .push(TurnEvent::CompactionFailed { trigger, message });
+        }
+        _ => {}
+    }
+}
+
+/// Close a compaction still open when the turn reaches its terminal result.
+///
+/// Claude does not always follow a successful compaction with a boundary in
+/// the same process (for example when the boundary was already persisted),
+/// and a skipped compaction reports no result at all. Either way the
+/// application must not show a compaction as running after the turn ended.
+fn close_unfinished_compaction(native: &mut ClaudeNativeState, output: &mut AdapterOutput) {
+    let Some(trigger) = native.open_compaction.take() else {
+        return;
+    };
+    if std::mem::take(&mut native.open_compaction_succeeded) {
+        output.events.push(TurnEvent::CompactionCompleted {
+            compaction: ContextCompaction {
+                trigger,
+                pre_tokens: None,
+                post_tokens: None,
+                dropped_tokens: None,
+                cumulative_dropped_tokens: None,
+                duration_ms: None,
+            },
+        });
+    } else {
+        output.events.push(TurnEvent::CompactionFailed {
+            trigger,
+            message: Some("Claude ended the turn before the compaction finished.".to_owned()),
+        });
+    }
 }
 
 fn translate_compaction(value: &Value, state: &mut AdapterState, output: &mut AdapterOutput) {
@@ -2513,6 +2640,179 @@ mod tests {
             })
         ));
         assert!(!format!("{:?}", output.events).contains("secret-provider-id"));
+    }
+
+    fn compaction_events(events: &[TurnEvent]) -> Vec<&TurnEvent> {
+        events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    TurnEvent::CompactionStarted { .. }
+                        | TurnEvent::CompactionCompleted { .. }
+                        | TurnEvent::CompactionFailed { .. }
+                )
+            })
+            .collect()
+    }
+
+    fn parse_all(adapter: &Claude, state: &mut AdapterState, records: &[&str]) -> Vec<TurnEvent> {
+        records
+            .iter()
+            .flat_map(|record| adapter.parse_line(record, state).unwrap().events)
+            .collect()
+    }
+
+    /// Recorded from Claude Code 2.1.283 `--output-format stream-json`: an
+    /// automatic compaction mid-turn reports `status: compacting` (repeated as
+    /// a keepalive), a success result, then the native boundary.
+    #[test]
+    fn reports_automatic_compaction_from_start_status_to_boundary() {
+        let adapter = Claude::default();
+        let mut state = AdapterState::default();
+        adapter
+            .prepare_turn(
+                &TurnRequest::new(Provider::Claude, "/workspace", "Refactor the parser"),
+                &mut state,
+            )
+            .unwrap();
+        let events = parse_all(
+            &adapter,
+            &mut state,
+            &[
+                r#"{"type":"system","subtype":"status","status":"compacting","uuid":"u1","session_id":"s"}"#,
+                r#"{"type":"system","subtype":"status","status":"compacting","uuid":"u2","session_id":"s"}"#,
+                r#"{"type":"system","subtype":"status","status":null,"compact_result":"success","uuid":"u3","session_id":"s"}"#,
+                r#"{"type":"system","subtype":"compact_boundary","session_id":"s","uuid":"u4","compact_metadata":{"trigger":"auto","pre_tokens":180000,"post_tokens":12000}}"#,
+                r#"{"type":"result","subtype":"success","is_error":false,"result":"done","session_id":"s"}"#,
+            ],
+        );
+        let compaction = compaction_events(&events);
+        assert_eq!(compaction.len(), 2, "{compaction:?}");
+        assert!(matches!(
+            compaction[0],
+            TurnEvent::CompactionStarted {
+                trigger: CompactionTrigger::Automatic
+            }
+        ));
+        assert!(matches!(
+            compaction[1],
+            TurnEvent::CompactionCompleted {
+                compaction: ContextCompaction {
+                    trigger: CompactionTrigger::Automatic,
+                    pre_tokens: Some(180_000),
+                    post_tokens: Some(12_000),
+                    dropped_tokens: Some(168_000),
+                    ..
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn reports_a_manual_compact_prompt_as_a_manual_compaction() {
+        let adapter = Claude::default();
+        let mut state = AdapterState::default();
+        adapter
+            .prepare_turn(
+                &TurnRequest::new(Provider::Claude, "/workspace", "/compact keep the plan"),
+                &mut state,
+            )
+            .unwrap();
+        let events = parse_all(
+            &adapter,
+            &mut state,
+            &[
+                r#"{"type":"system","subtype":"status","status":"compacting","session_id":"s"}"#,
+                r#"{"type":"system","subtype":"compact_boundary","session_id":"s","compact_metadata":{"trigger":"manual","pre_tokens":50000}}"#,
+            ],
+        );
+        let compaction = compaction_events(&events);
+        assert!(matches!(
+            compaction[0],
+            TurnEvent::CompactionStarted {
+                trigger: CompactionTrigger::Manual
+            }
+        ));
+        assert!(matches!(
+            compaction[1],
+            TurnEvent::CompactionCompleted {
+                compaction: ContextCompaction {
+                    trigger: CompactionTrigger::Manual,
+                    ..
+                }
+            }
+        ));
+        assert!(!is_manual_compaction_prompt("/compaction-notes please"));
+        assert!(is_manual_compaction_prompt("  /compact"));
+    }
+
+    #[test]
+    fn closes_a_failed_compaction_with_the_provider_diagnostic() {
+        let adapter = Claude::default();
+        let mut state = AdapterState::default();
+        let events = parse_all(
+            &adapter,
+            &mut state,
+            &[
+                r#"{"type":"system","subtype":"status","status":"compacting","session_id":"s"}"#,
+                r#"{"type":"system","subtype":"status","status":null,"compact_result":"failed","compact_error":"Conversation too long to summarize","session_id":"s"}"#,
+                r#"{"type":"result","subtype":"success","is_error":false,"result":"done","session_id":"s"}"#,
+            ],
+        );
+        let compaction = compaction_events(&events);
+        assert_eq!(compaction.len(), 2, "{compaction:?}");
+        assert!(matches!(
+            compaction[1],
+            TurnEvent::CompactionFailed {
+                trigger: CompactionTrigger::Automatic,
+                message: Some(message),
+            } if message == "Conversation too long to summarize"
+        ));
+    }
+
+    #[test]
+    fn never_leaves_a_compaction_open_after_the_terminal_result() {
+        let adapter = Claude::default();
+        let mut state = AdapterState::default();
+        let events = parse_all(
+            &adapter,
+            &mut state,
+            &[
+                r#"{"type":"system","subtype":"status","status":"compacting","session_id":"s"}"#,
+                r#"{"type":"result","subtype":"success","is_error":false,"result":"done","session_id":"s"}"#,
+            ],
+        );
+        let compaction = compaction_events(&events);
+        assert_eq!(compaction.len(), 2, "{compaction:?}");
+        assert!(matches!(compaction[1], TurnEvent::CompactionFailed { .. }));
+
+        let mut state = AdapterState::default();
+        let events = parse_all(
+            &adapter,
+            &mut state,
+            &[
+                r#"{"type":"system","subtype":"status","status":"compacting","session_id":"s"}"#,
+                r#"{"type":"system","subtype":"status","status":null,"compact_result":"success","session_id":"s"}"#,
+                r#"{"type":"result","subtype":"success","is_error":false,"result":"done","session_id":"s"}"#,
+            ],
+        );
+        let compaction = compaction_events(&events);
+        assert!(matches!(
+            compaction[1],
+            TurnEvent::CompactionCompleted {
+                compaction: ContextCompaction {
+                    trigger: CompactionTrigger::Automatic,
+                    pre_tokens: None,
+                    ..
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn advertises_the_compaction_lifecycle() {
+        assert!(Claude::default().turn_capabilities().compaction_lifecycle);
     }
 
     #[test]
