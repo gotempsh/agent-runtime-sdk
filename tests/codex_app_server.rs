@@ -48,6 +48,8 @@ enum Script {
     Crash,
     /// Complete, then emit an old-turn frame while the process is idle.
     DelayedIdleFrame,
+    /// Complete, then send a server request while the process is idle.
+    IdleServerRequest,
 }
 
 #[derive(Clone)]
@@ -59,6 +61,8 @@ struct AppServer {
     arguments: Arc<Mutex<Vec<String>>>,
     spawns: Arc<AtomicUsize>,
     terminations: Arc<AtomicUsize>,
+    /// Background terminals `thread/backgroundTerminals/list` reports.
+    background_terminals: Arc<AtomicUsize>,
 }
 
 impl AppServer {
@@ -69,7 +73,19 @@ impl AppServer {
             arguments: Arc::new(Mutex::new(Vec::new())),
             spawns: Arc::new(AtomicUsize::new(0)),
             terminations: Arc::new(AtomicUsize::new(0)),
+            background_terminals: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    fn set_background_terminals(&self, count: usize) {
+        self.background_terminals.store(count, Ordering::Release);
+    }
+
+    fn method_count(&self, method: &str) -> usize {
+        self.frames()
+            .iter()
+            .filter(|frame| frame.get("method").and_then(Value::as_str) == Some(method))
+            .count()
     }
 
     fn arguments(&self) -> Vec<String> {
@@ -166,7 +182,17 @@ impl ExecutionTransport for AppServer {
         let script = self.script;
         let frames = Arc::clone(&self.frames);
         let terminations = Arc::clone(&self.terminations);
-        tokio::spawn(async move { serve(script, frames, server_input, server_output).await });
+        let background_terminals = Arc::clone(&self.background_terminals);
+        tokio::spawn(async move {
+            serve(
+                script,
+                frames,
+                background_terminals,
+                server_input,
+                server_output,
+            )
+            .await;
+        });
         Ok(TransportProcess::new(
             TransportProcessHandle {
                 transport: "fixture-app-server".to_string(),
@@ -218,6 +244,7 @@ impl TransportProcessControl for Control {
 async fn serve(
     script: Script,
     frames: Arc<Mutex<Vec<Value>>>,
+    background_terminals: Arc<AtomicUsize>,
     input: tokio::io::DuplexStream,
     mut output: tokio::io::DuplexStream,
 ) {
@@ -290,7 +317,42 @@ async fn serve(
                                 "itemId":"late","delta":"STALE"}}),
                     )
                     .await;
+                    send(
+                        &mut output,
+                        json!({"jsonrpc":"2.0","method":"item/commandExecution/outputDelta",
+                            "params":{"threadId":"thread-fixture","turnId":"turn-1",
+                                "itemId":"exec-dev-server","delta":"ready in 120 ms\n"}}),
+                    )
+                    .await;
                 }
+                if script == Script::IdleServerRequest {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    send(
+                        &mut output,
+                        json!({"jsonrpc":"2.0","id":"server-idle",
+                            "method":"item/commandExecution/requestApproval",
+                            "params":{"threadId":"thread-fixture","turnId":"turn-1",
+                                "itemId":"item-9","command":"rm -rf build","startedAtMs":1}}),
+                    )
+                    .await;
+                }
+            }
+            Some("thread/backgroundTerminals/list") => {
+                let terminals = (0..background_terminals.load(Ordering::Acquire))
+                    .map(|index| {
+                        json!({
+                            "itemId": format!("exec-{index}"),
+                            "processId": format!("{}", 4000 + index),
+                            "command": "bun run dev",
+                            "cwd": "/fixture",
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                send(
+                    &mut output,
+                    json!({"jsonrpc":"2.0","id":id,"result":{"data":terminals,"nextCursor":null}}),
+                )
+                .await;
             }
             // `initialize` and `turn/interrupt` need only a bare acknowledgement.
             _ => {
@@ -318,13 +380,15 @@ fn opening_frames(script: Script) -> Vec<Value> {
                     "options":[{"label":"Banana","description":"Yellow"},
                                {"label":"Plantain","description":"Also yellow"}]}]}
         })],
-        Script::AsyncQuestion | Script::DelayedIdleFrame => vec![json!({
-            "jsonrpc":"2.0","id":"server-3","method":"item/tool/requestUserInput",
-            "params":{"threadId":"thread-fixture","turnId":"turn-1","itemId":"item-4",
-                "isBlocking":false,
-                "questions":[{"id":"q2","header":"Theme","question":"Dark or light?",
-                    "options":[{"label":"Dark","description":"Dim"}]}]}
-        })],
+        Script::AsyncQuestion | Script::DelayedIdleFrame | Script::IdleServerRequest => {
+            vec![json!({
+                "jsonrpc":"2.0","id":"server-3","method":"item/tool/requestUserInput",
+                "params":{"threadId":"thread-fixture","turnId":"turn-1","itemId":"item-4",
+                    "isBlocking":false,
+                    "questions":[{"id":"q2","header":"Theme","question":"Dark or light?",
+                        "options":[{"label":"Dark","description":"Dim"}]}]}
+            })]
+        }
         Script::Interrupt | Script::Crash => Vec::new(),
     }
 }
@@ -744,7 +808,7 @@ async fn a_crashed_process_is_replaced_for_the_next_turn() {
 }
 
 #[tokio::test]
-async fn an_idle_frame_retires_the_process_before_the_next_turn() {
+async fn idle_notifications_are_dropped_without_retiring_the_process() {
     let transport = AppServer::new(Script::DelayedIdleFrame);
     let runtime = retained_runtime(transport.clone(), Duration::from_secs(30));
     let (_client, handle) = retained_handle(runtime).await;
@@ -771,8 +835,91 @@ async fn an_idle_frame_retires_the_process_before_the_next_turn() {
         .await
         .unwrap();
     assert!(!second.text.contains("STALE"));
+    assert!(!second.text.contains("ready in"));
+    assert_eq!(transport.spawn_count(), 1);
+    assert_eq!(transport.termination_count(), 0);
+}
+
+#[tokio::test]
+async fn an_idle_server_request_retires_the_process_before_the_next_turn() {
+    let transport = AppServer::new(Script::IdleServerRequest);
+    let runtime = retained_runtime(transport.clone(), Duration::from_secs(30));
+    let (_client, handle) = retained_handle(runtime).await;
+    handle
+        .start_turn(TurnInput::new(
+            InvocationId::new("request-one").unwrap(),
+            "first",
+        ))
+        .await
+        .unwrap()
+        .wait()
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    handle
+        .start_turn(TurnInput::new(
+            InvocationId::new("request-two").unwrap(),
+            "second",
+        ))
+        .await
+        .unwrap()
+        .wait()
+        .await
+        .unwrap();
     assert_eq!(transport.spawn_count(), 2);
     assert!(transport.termination_count() >= 1);
+}
+
+#[tokio::test]
+async fn live_background_terminals_keep_an_idle_process_alive() {
+    let transport = AppServer::new(Script::AsyncQuestion);
+    transport.set_background_terminals(1);
+    let runtime = retained_runtime(transport.clone(), Duration::from_millis(20));
+    let (_client, handle) = retained_handle(runtime).await;
+    handle
+        .start_turn(TurnInput::new(
+            InvocationId::new("terminal-one").unwrap(),
+            "start the dev server",
+        ))
+        .await
+        .unwrap()
+        .wait()
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        transport.method_count("thread/backgroundTerminals/list") >= 2,
+        "each idle expiry must re-check the background terminals"
+    );
+    let probe = transport
+        .method_frame("thread/backgroundTerminals/list")
+        .unwrap();
+    assert_eq!(probe["params"]["threadId"], json!("thread-fixture"));
+    assert_eq!(transport.termination_count(), 0);
+    handle
+        .start_turn(TurnInput::new(
+            InvocationId::new("terminal-two").unwrap(),
+            "is it still up?",
+        ))
+        .await
+        .unwrap()
+        .wait()
+        .await
+        .unwrap();
+    assert_eq!(transport.spawn_count(), 1);
+
+    transport.set_background_terminals(0);
+    for _ in 0..100 {
+        if transport.termination_count() > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        transport.termination_count(),
+        1,
+        "the process expires once its background terminals are gone"
+    );
 }
 
 #[tokio::test]

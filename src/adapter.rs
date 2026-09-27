@@ -217,6 +217,22 @@ pub struct AdapterOutput {
     pub turn_submitted: bool,
 }
 
+/// How a retained process frame read between turns is handled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdleFrame {
+    /// Output from background work the process still owns, such as a running
+    /// terminal session. Dropped without affecting the process.
+    Background,
+    /// Answer to [`AgentAdapter::retained_keepalive_probe`]. `active` keeps the
+    /// process alive for another idle period; otherwise it is terminated.
+    KeepaliveResult {
+        /// Whether the process still owns live background work.
+        active: bool,
+    },
+    /// A frame that cannot be assigned to any turn. Retires the process.
+    Unexpected,
+}
+
 /// Protocol carrier an adapter supplies in place of the provider's own stdio.
 ///
 /// Most provider CLIs speak their protocol over stdout and stdin, so the
@@ -422,6 +438,26 @@ pub trait AgentAdapter: Send + Sync {
     /// Mark parser state as belonging to a retained native process.
     fn mark_retained_turn(&self, state: &mut AdapterState) {
         let _ = state;
+    }
+
+    /// Encode a request asking an idle retained process whether it still
+    /// owns live background work for `session_id`.
+    ///
+    /// Called when the idle timeout elapses. Returning `None` — the default —
+    /// terminates the process on expiry. The response is recognized by
+    /// [`Self::classify_idle_frame`].
+    fn retained_keepalive_probe(&self, session_id: &str) -> Option<Vec<u8>> {
+        let _ = session_id;
+        None
+    }
+
+    /// Classify one frame read from a retained process between turns.
+    ///
+    /// The default treats every frame as [`IdleFrame::Unexpected`], which
+    /// retires the process because the frame cannot be assigned to a turn.
+    fn classify_idle_frame(&self, line: &str) -> IdleFrame {
+        let _ = line;
+        IdleFrame::Unexpected
     }
 
     /// Supply a protocol carrier to use instead of the child's stdout and stdin.

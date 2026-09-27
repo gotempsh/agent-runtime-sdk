@@ -79,6 +79,10 @@ name = "process_lifetime_smoke"
 required-features = ["claude", "codex", "opencode"]
 
 [[example]]
+name = "background_terminal_retention_smoke"
+required-features = ["codex"]
+
+[[example]]
 name = "claude_subagent_smoke"
 required-features = ["claude"]
 

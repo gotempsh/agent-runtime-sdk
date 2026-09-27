@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use super::codex_app_server;
-use crate::adapter::{inspect_executable, resolve_executable, AdapterState};
+use crate::adapter::{inspect_executable, resolve_executable, AdapterState, IdleFrame};
 use crate::error::classify_provider_failure;
 use crate::lifecycle::DeliveryState;
 use crate::{
@@ -1031,6 +1031,20 @@ impl AgentAdapter for Codex {
     fn mark_retained_turn(&self, state: &mut AdapterState) {
         if self.app_server_mode() {
             codex_app_server::mark_retained(state);
+        }
+    }
+
+    fn retained_keepalive_probe(&self, session_id: &str) -> Option<Vec<u8>> {
+        self.app_server_mode()
+            .then(|| codex_app_server::keepalive_probe(session_id))
+            .flatten()
+    }
+
+    fn classify_idle_frame(&self, line: &str) -> IdleFrame {
+        if self.app_server_mode() {
+            codex_app_server::classify_idle_frame(line)
+        } else {
+            IdleFrame::Unexpected
         }
     }
 

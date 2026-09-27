@@ -17,7 +17,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
-use crate::adapter::{AdapterOutput, AdapterState, InteractionRequest};
+use crate::adapter::{AdapterOutput, AdapterState, IdleFrame, InteractionRequest};
 use crate::error::classify_provider_failure;
 use crate::lifecycle::DeliveryState;
 use crate::{
@@ -37,6 +37,8 @@ const ID_FORK: u64 = 3;
 const ID_TURN: u64 = 4;
 /// Written only by [`interrupt`], never awaited by the parser.
 const ID_INTERRUPT: u64 = 5;
+/// Written only by [`keepalive_probe`] between turns.
+const ID_KEEPALIVE: &str = "sdk-idle-keepalive";
 
 /// Reply sent for a question the turn did not wait on. An empty answer set
 /// reads to the model as "the user chose nothing"; this says what actually
@@ -235,6 +237,44 @@ pub(super) fn retained_turn_start(state: &AdapterState) -> Result<Vec<u8>> {
         "thread/start"
     };
     encode(&request(ID_THREAD, method, turn.thread_params))
+}
+
+/// Ask an idle app server whether `thread_id` still runs background terminals.
+///
+/// Background terminals are children of the app server and die with it, so a
+/// retained process that owns one must outlive its idle timeout. The string id
+/// never collides with the numeric ids [`parse_response`] advances on.
+pub(super) fn keepalive_probe(thread_id: &str) -> Option<Vec<u8>> {
+    encode(&json!({
+        "jsonrpc": "2.0",
+        "id": ID_KEEPALIVE,
+        "method": "thread/backgroundTerminals/list",
+        "params": {"threadId": thread_id, "limit": 1},
+    }))
+    .ok()
+}
+
+/// Classify a frame the app server sent while no turn is running.
+///
+/// Notifications carry output and exit status from background terminals and
+/// are harmless. A server request cannot be answered outside a turn.
+pub(super) fn classify_idle_frame(line: &str) -> IdleFrame {
+    let Ok(value) = serde_json::from_str::<Value>(line) else {
+        return IdleFrame::Unexpected;
+    };
+    let has_method = value.get("method").is_some();
+    match value.get("id") {
+        None if has_method => IdleFrame::Background,
+        Some(id) if !has_method && id.as_str() == Some(ID_KEEPALIVE) => {
+            IdleFrame::KeepaliveResult {
+                active: value
+                    .pointer("/result/data")
+                    .and_then(Value::as_array)
+                    .is_some_and(|terminals| !terminals.is_empty()),
+            }
+        }
+        _ => IdleFrame::Unexpected,
+    }
 }
 
 /// Translate one JSON-RPC message from the app server.
