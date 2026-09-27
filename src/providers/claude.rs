@@ -1070,7 +1070,15 @@ impl AgentAdapter for Claude {
                     }
                 }
                 let mut usage = super::usage_from(&value);
-                usage.context_window = context_window_usage(&value, state.result.model.as_deref());
+                // A subagent's message measures the subagent's own context,
+                // not the conversation's, so it never sets occupancy.
+                let subagent = value
+                    .get("parent_tool_use_id")
+                    .is_some_and(|parent| !parent.is_null());
+                if !subagent {
+                    usage.context_window =
+                        context_window_usage(&value, state.result.model.as_deref());
+                }
                 if usage != Usage::default() {
                     super::merge_usage(&mut state.result.usage, &usage);
                     output.events.push(TurnEvent::Usage(usage));
@@ -1398,14 +1406,23 @@ fn context_window_usage(value: &Value, fallback_model: Option<&str>) -> Option<C
 /// Per-message usage carries only a bare model id such as `claude-opus-5-5`,
 /// which says nothing about its window. The result frame reports the actual
 /// `contextWindow` for every model the turn used, subagents included, so the
-/// entry for the conversation's own model is selected.
+/// entry for the conversation's own model is selected. Occupancy measured
+/// against another model is left alone rather than paired with a window that
+/// does not describe it.
 fn reported_context_limit(
     value: &Value,
     occupancy: Option<&ContextWindowUsage>,
-    fallback_model: Option<&str>,
+    conversation_model: Option<&str>,
 ) -> Option<ContextWindowUsage> {
     let occupancy = occupancy?;
-    let model = occupancy.model.as_deref().or(fallback_model)?;
+    let model = conversation_model.or(occupancy.model.as_deref())?;
+    if occupancy
+        .model
+        .as_deref()
+        .is_some_and(|measured| measured != model)
+    {
+        return None;
+    }
     let models = value.get("modelUsage")?.as_object()?;
     let entry = models.get(model).or_else(|| {
         models
@@ -2411,6 +2428,29 @@ mod tests {
         assert_eq!(reported.model.as_deref(), Some("claude-opus-5-5"));
         assert!(reported.estimated);
         assert_eq!(state.result.usage.context_window, Some(reported));
+    }
+
+    #[test]
+    fn a_subagent_message_neither_sets_occupancy_nor_selects_the_limit() {
+        let adapter = Claude::default();
+        let mut state = AdapterState::default();
+        for line in [
+            r#"{"type":"system","subtype":"init","session_id":"s","model":"claude-opus-5-5"}"#,
+            r#"{"type":"assistant","message":{"model":"claude-opus-5-5","content":[],"usage":{"input_tokens":2,"cache_creation_input_tokens":20000,"cache_read_input_tokens":349000,"output_tokens":900}}}"#,
+            r#"{"type":"assistant","parent_tool_use_id":"toolu_agent","message":{"model":"claude-haiku-4-5","content":[],"usage":{"input_tokens":40,"output_tokens":10}}}"#,
+        ] {
+            adapter.parse_line(line, &mut state).unwrap();
+        }
+        adapter
+            .parse_line(
+                r#"{"type":"result","subtype":"success","is_error":false,"result":"ok","modelUsage":{"claude-haiku-4-5":{"contextWindow":200000},"claude-opus-5-5":{"contextWindow":1000000}}}"#,
+                &mut state,
+            )
+            .unwrap();
+        let context = state.result.usage.context_window.unwrap();
+        assert_eq!(context.used_tokens, Some(369_902));
+        assert_eq!(context.limit_tokens, Some(1_000_000));
+        assert_eq!(context.model.as_deref(), Some("claude-opus-5-5"));
     }
 
     #[test]

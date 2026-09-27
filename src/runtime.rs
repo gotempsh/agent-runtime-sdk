@@ -259,6 +259,29 @@ async fn read_bounded_retained_line(
 }
 
 impl RetainedCodexProcess {
+    /// Claim the process for a new turn.
+    ///
+    /// Idle retirement decides under the same I/O lock, so a process is never
+    /// both claimed by a turn and retired by its idle supervisor. `None` means
+    /// the process was already retired and must be replaced.
+    async fn claim(&self) -> Option<u64> {
+        let io = self.io.lock().await;
+        (io.is_some() && self.usable.load(Ordering::Acquire))
+            .then(|| self.generation.fetch_add(1, Ordering::AcqRel) + 1)
+    }
+
+    /// Mark the process unusable unless a turn claimed it after `generation`.
+    ///
+    /// Returns whether the caller now owns terminating it.
+    async fn retire_if_unclaimed(&self, generation: u64) -> bool {
+        let io = self.io.lock().await;
+        if io.is_none() || self.generation.load(Ordering::Acquire) != generation {
+            return false;
+        }
+        self.usable.store(false, Ordering::Release);
+        true
+    }
+
     async fn terminate(&self) -> Result<()> {
         self.usable.store(false, Ordering::Release);
         self.generation.fetch_add(1, Ordering::AcqRel);
@@ -379,6 +402,11 @@ async fn supervise_idle_retained_process(
             return;
         }
         let now = tokio::time::Instant::now();
+        // Checked on every iteration: a terminal that keeps logging must not
+        // hold the process open while its probe goes unanswered.
+        if probe_deadline.is_some_and(|deadline| now >= deadline) {
+            break;
+        }
         let probe = if probe_deadline.is_none() && now >= expires_at {
             let session_id = retained.session_id.lock().await.clone();
             match session_id
@@ -409,11 +437,7 @@ async fn supervise_idle_retained_process(
             read_idle_retained_line(&mut io.reader, max_event_line_bytes).await
         };
         match observed {
-            None => {
-                if probe_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
-                    break;
-                }
-            }
+            None => {}
             Some(Ok(Some(line))) => match adapter.classify_idle_frame(&line) {
                 IdleFrame::Background => {}
                 IdleFrame::KeepaliveResult { active: true } => {
@@ -425,8 +449,7 @@ async fn supervise_idle_retained_process(
             Some(Ok(None) | Err(_)) => break,
         }
     }
-    if retained.generation.load(Ordering::Acquire) == generation {
-        retained.usable.store(false, Ordering::Release);
+    if retained.retire_if_unclaimed(generation).await {
         supervisor.remove_if_same(&runtime_id, &retained).await;
         let _ = retained.terminate().await;
     }
@@ -2931,9 +2954,10 @@ impl AgentRuntime {
                             .to_string(),
                     })
                     .await?;
-                let claim = candidate.generation.fetch_add(1, Ordering::AcqRel) + 1;
-                claimed_generation = Some(claim);
-                let request_id = format!("temps-agent-runtime-health-{claim}");
+                let claim = candidate.claim().await;
+                claimed_generation = claim;
+                let request_id =
+                    format!("temps-agent-runtime-health-{}", claim.unwrap_or_default());
                 let probe = serde_json::to_vec(&serde_json::json!({
                     "type": "control_request",
                     "request_id": request_id,
@@ -2948,7 +2972,7 @@ impl AgentRuntime {
                     .config
                     .initialization_timeout
                     .min(Duration::from_secs(3));
-                let healthy = {
+                let healthy = claim.is_some() && {
                     let mut guard = candidate.io.lock().await;
                     if let Some(io) = guard.as_mut() {
                         let exchange = async {
@@ -3026,13 +3050,20 @@ impl AgentRuntime {
                             .to_string(),
                     })
                     .await?;
-                claimed_generation = Some(candidate.generation.fetch_add(1, Ordering::AcqRel) + 1);
+                claimed_generation = candidate.claim().await;
                 let health_timeout = supervisor
                     .inner
                     .config
                     .initialization_timeout
                     .min(Duration::from_secs(3));
                 let health = tokio::time::timeout(health_timeout, async {
+                    if claimed_generation.is_none() {
+                        return Err(RuntimeError::Protocol {
+                            provider,
+                            message: "the retained OpenCode server was retired while idle"
+                                .to_string(),
+                        });
+                    }
                     let streams = adapter.attach(request, &state).await?.ok_or_else(|| {
                         RuntimeError::Protocol {
                             provider,
@@ -3104,6 +3135,17 @@ impl AgentRuntime {
                             message: "The retained OpenCode server stopped responding before prompt submission; starting a replacement.".to_string(),
                         }).await?;
                 }
+            }
+        } else if let Some(candidate) = existing.clone() {
+            claimed_generation = candidate.claim().await;
+            if claimed_generation.is_none() {
+                // Its idle supervisor retired it after the lookup above.
+                supervisor.remove_if_same(runtime_id, &candidate).await;
+                if available_permit.is_none() {
+                    available_permit = candidate.permit.lock().await.take();
+                }
+                candidate.terminate().await?;
+                existing = None;
             }
         }
         let retained = if let Some(existing) = existing {
@@ -3329,7 +3371,7 @@ impl AgentRuntime {
                 if provider == Provider::OpenCode {
                     tokio::spawn(async move {
                         tokio::time::sleep(idle_timeout).await;
-                        if retained.generation.load(Ordering::Acquire) == generation {
+                        if retained.retire_if_unclaimed(generation).await {
                             supervisor.remove_if_same(&runtime_id, &retained).await;
                             let _ = retained.terminate().await;
                         }

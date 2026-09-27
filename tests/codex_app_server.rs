@@ -9,7 +9,7 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -63,6 +63,8 @@ struct AppServer {
     terminations: Arc<AtomicUsize>,
     /// Background terminals `thread/backgroundTerminals/list` reports.
     background_terminals: Arc<AtomicUsize>,
+    /// When set, the list probe goes unanswered while a terminal keeps logging.
+    ignore_probes: Arc<AtomicBool>,
 }
 
 impl AppServer {
@@ -74,6 +76,7 @@ impl AppServer {
             spawns: Arc::new(AtomicUsize::new(0)),
             terminations: Arc::new(AtomicUsize::new(0)),
             background_terminals: Arc::new(AtomicUsize::new(0)),
+            ignore_probes: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -183,11 +186,13 @@ impl ExecutionTransport for AppServer {
         let frames = Arc::clone(&self.frames);
         let terminations = Arc::clone(&self.terminations);
         let background_terminals = Arc::clone(&self.background_terminals);
+        let ignore_probes = Arc::clone(&self.ignore_probes);
         tokio::spawn(async move {
             serve(
                 script,
                 frames,
                 background_terminals,
+                ignore_probes,
                 server_input,
                 server_output,
             )
@@ -245,6 +250,7 @@ async fn serve(
     script: Script,
     frames: Arc<Mutex<Vec<Value>>>,
     background_terminals: Arc<AtomicUsize>,
+    ignore_probes: Arc<AtomicBool>,
     input: tokio::io::DuplexStream,
     mut output: tokio::io::DuplexStream,
 ) {
@@ -335,6 +341,26 @@ async fn serve(
                                 "itemId":"item-9","command":"rm -rf build","startedAtMs":1}}),
                     )
                     .await;
+                }
+            }
+            Some("thread/backgroundTerminals/list") if ignore_probes.load(Ordering::Acquire) => {
+                // Never answer; keep logging until the SDK drops the stream.
+                for _ in 0..4_000 {
+                    if output
+                        .write_all(
+                            json!({"jsonrpc":"2.0","method":"item/commandExecution/outputDelta",
+                                "params":{"threadId":"thread-fixture","turnId":"turn-1",
+                                    "itemId":"exec-0","delta":"GET / 200\n"}})
+                            .to_string()
+                            .as_bytes(),
+                        )
+                        .await
+                        .and(output.write_all(b"\n").await)
+                        .is_err()
+                    {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
                 }
             }
             Some("thread/backgroundTerminals/list") => {
@@ -868,6 +894,38 @@ async fn an_idle_server_request_retires_the_process_before_the_next_turn() {
         .unwrap();
     assert_eq!(transport.spawn_count(), 2);
     assert!(transport.termination_count() >= 1);
+}
+
+#[tokio::test]
+async fn an_unanswered_probe_retires_the_process_even_while_terminals_log() {
+    let transport = AppServer::new(Script::AsyncQuestion);
+    transport.set_background_terminals(1);
+    transport.ignore_probes.store(true, Ordering::Release);
+    let runtime = retained_runtime(transport.clone(), Duration::from_millis(20));
+    let (_client, handle) = retained_handle(runtime).await;
+    handle
+        .start_turn(TurnInput::new(
+            InvocationId::new("chatty-one").unwrap(),
+            "start the dev server",
+        ))
+        .await
+        .unwrap()
+        .wait()
+        .await
+        .unwrap();
+    // The probe deadline is five seconds; allow generous scheduling slack.
+    for _ in 0..800 {
+        if transport.termination_count() > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(transport.method_count("thread/backgroundTerminals/list"), 1);
+    assert_eq!(
+        transport.termination_count(),
+        1,
+        "background output must not extend an unanswered probe"
+    );
 }
 
 #[tokio::test]
