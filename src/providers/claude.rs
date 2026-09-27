@@ -1257,7 +1257,12 @@ impl AgentAdapter for Claude {
                         .and_then(Value::as_str)
                         .map(str::to_owned);
                 }
-                let usage = super::usage_from(&value);
+                let mut usage = super::usage_from(&value);
+                usage.context_window = reported_context_limit(
+                    &value,
+                    state.result.usage.context_window.as_ref(),
+                    state.result.model.as_deref(),
+                );
                 super::merge_usage(&mut state.result.usage, &usage);
                 if usage != crate::Usage::default() {
                     output.events.push(TurnEvent::Usage(usage));
@@ -1384,6 +1389,34 @@ fn context_window_usage(value: &Value, fallback_model: Option<&str>) -> Option<C
         limit_tokens: model.as_deref().and_then(context_window_from_label),
         model,
         estimated: true,
+    })
+}
+
+/// Completes the turn's last context occupancy with the window Claude Code
+/// reports in `result.modelUsage`.
+///
+/// Per-message usage carries only a bare model id such as `claude-opus-5-5`,
+/// which says nothing about its window. The result frame reports the actual
+/// `contextWindow` for every model the turn used, subagents included, so the
+/// entry for the conversation's own model is selected.
+fn reported_context_limit(
+    value: &Value,
+    occupancy: Option<&ContextWindowUsage>,
+    fallback_model: Option<&str>,
+) -> Option<ContextWindowUsage> {
+    let occupancy = occupancy?;
+    let model = occupancy.model.as_deref().or(fallback_model)?;
+    let models = value.get("modelUsage")?.as_object()?;
+    let entry = models.get(model).or_else(|| {
+        models
+            .values()
+            .find(|entry| entry.get("canonicalModel").and_then(Value::as_str) == Some(model))
+    })?;
+    let limit_tokens = entry.get("contextWindow").and_then(Value::as_u64)?;
+    Some(ContextWindowUsage {
+        limit_tokens: Some(limit_tokens),
+        model: Some(model.to_owned()),
+        ..occupancy.clone()
     })
 }
 
@@ -2335,6 +2368,70 @@ mod tests {
                 .and_then(ContextWindowUsage::remaining_tokens),
             Some(999_540)
         );
+    }
+
+    #[test]
+    fn the_result_frame_reports_the_context_limit_of_a_bare_model_id() {
+        let adapter = Claude::default();
+        let mut state = AdapterState::default();
+        let message = adapter
+            .parse_line(
+                r#"{"type":"assistant","message":{"model":"claude-opus-5-5","content":[],"usage":{"input_tokens":2,"cache_creation_input_tokens":20000,"cache_read_input_tokens":349000,"output_tokens":900}}}"#,
+                &mut state,
+            )
+            .unwrap();
+        assert!(matches!(
+            &message.events[0],
+            TurnEvent::Usage(Usage {
+                context_window: Some(ContextWindowUsage {
+                    limit_tokens: None,
+                    ..
+                }),
+                ..
+            })
+        ));
+
+        let result = adapter
+            .parse_line(
+                r#"{"type":"result","subtype":"success","is_error":false,"result":"ok","usage":{"input_tokens":40,"output_tokens":1800},"modelUsage":{"claude-haiku-4-5":{"contextWindow":200000},"claude-opus-5-5":{"contextWindow":1000000,"canonicalModel":"claude-opus-5-5"}}}"#,
+                &mut state,
+            )
+            .unwrap();
+
+        let reported = result
+            .events
+            .iter()
+            .find_map(|event| match event {
+                TurnEvent::Usage(usage) => usage.context_window.clone(),
+                _ => None,
+            })
+            .expect("the result reports the context window");
+        assert_eq!(reported.used_tokens, Some(369_902));
+        assert_eq!(reported.limit_tokens, Some(1_000_000));
+        assert_eq!(reported.model.as_deref(), Some("claude-opus-5-5"));
+        assert!(reported.estimated);
+        assert_eq!(state.result.usage.context_window, Some(reported));
+    }
+
+    #[test]
+    fn a_result_without_model_usage_keeps_the_last_occupancy() {
+        let adapter = Claude::default();
+        let mut state = AdapterState::default();
+        adapter
+            .parse_line(
+                r#"{"type":"assistant","message":{"model":"claude-opus-5-5","content":[],"usage":{"input_tokens":10,"output_tokens":5}}}"#,
+                &mut state,
+            )
+            .unwrap();
+        adapter
+            .parse_line(
+                r#"{"type":"result","subtype":"success","is_error":false,"result":"ok","usage":{"input_tokens":10,"output_tokens":5}}"#,
+                &mut state,
+            )
+            .unwrap();
+        let context = state.result.usage.context_window.unwrap();
+        assert_eq!(context.used_tokens, Some(15));
+        assert_eq!(context.limit_tokens, None);
     }
 
     #[test]
