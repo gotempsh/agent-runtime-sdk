@@ -5,8 +5,11 @@ use std::{fs, os::unix::fs::PermissionsExt, time::Duration};
 use temps_agent_runtime::{
     lifecycle::{InvocationId, RuntimeFailure, RuntimeId},
     providers::Claude,
-    retained::{InProcessRuntimeClient, RuntimeClient, RuntimeHandle, RuntimeSpec, TurnInput},
-    AgentRuntime, PermissionMode, Provider, ProviderProcessRetention, TurnResult,
+    retained::{
+        CompactionInput, InProcessRuntimeClient, RuntimeClient, RuntimeEvent, RuntimeHandle,
+        RuntimeSpec, TurnHandle, TurnInput,
+    },
+    AgentRuntime, PermissionMode, Provider, ProviderProcessRetention, TurnEvent, TurnResult,
 };
 
 const SCRIPT: &str = r"#!/usr/bin/env python3
@@ -28,6 +31,8 @@ for line in sys.stdin:
   if prompt=='initial-hang':
    while True:time.sleep(1)
   emit({'type':'system','subtype':'init','session_id':'fixture-session'})
+  if prompt=='compact-crash':
+   emit({'type':'system','subtype':'status','status':'compacting','session_id':'fixture-session'});sys.exit(2)
   if prompt=='chatter':
    while True:
     emit({'type':'unknown_noop'});time.sleep(.01)
@@ -101,6 +106,30 @@ impl Fixture {
                 .unwrap()
                 .wait()
                 .await
+        })
+        .await
+        .expect("turn must be bounded")
+    }
+    async fn compaction_events(
+        &self,
+        turn: TurnHandle,
+    ) -> (Vec<TurnEvent>, Result<TurnResult, RuntimeFailure>) {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let (mut stream, completion) = turn.into_parts();
+            let mut observed = Vec::new();
+            while let Some(envelope) = stream.next().await {
+                if let RuntimeEvent::ProviderEvent { event } = envelope.event {
+                    if matches!(
+                        event,
+                        TurnEvent::CompactionStarted { .. }
+                            | TurnEvent::CompactionCompleted { .. }
+                            | TurnEvent::CompactionFailed { .. }
+                    ) {
+                        observed.push(event);
+                    }
+                }
+            }
+            (observed, completion.wait().await)
         })
         .await
         .expect("turn must be bounded")
@@ -233,5 +262,65 @@ async fn claude_noop_frames_do_not_hide_a_stalled_turn() {
     let f = Fixture::new(true, Duration::from_secs(30)).await;
     assert!(f.turn("one", "chatter").await.is_err());
     assert_eq!(f.turn("two", "second").await.unwrap().text, "reply:second");
+    f.dispose().await;
+}
+
+#[tokio::test]
+async fn claude_exiting_mid_compaction_never_leaves_it_open() {
+    for retained in [false, true] {
+        let f = Fixture::new(retained, Duration::from_secs(30)).await;
+        let turn = f
+            .handle
+            .start_turn(TurnInput::new(
+                InvocationId::new("compact-crash").unwrap(),
+                "compact-crash",
+            ))
+            .await
+            .unwrap();
+        let (events, result) = f.compaction_events(turn).await;
+        assert!(result.is_err());
+        assert!(
+            matches!(
+                events.as_slice(),
+                [
+                    TurnEvent::CompactionStarted { .. },
+                    TurnEvent::CompactionFailed {
+                        message: Some(_),
+                        ..
+                    }
+                ]
+            ),
+            "retained={retained}: {events:?}"
+        );
+        f.dispose().await;
+    }
+}
+
+#[tokio::test]
+async fn an_unconfirmed_manual_compaction_is_closed_as_failed() {
+    // The fixture answers `/compact` with an ordinary success result and no
+    // compact boundary, as Claude does when it declines to compact.
+    let f = Fixture::new(false, Duration::from_secs(30)).await;
+    f.turn("seed", "hello").await.unwrap();
+    let turn = f
+        .handle
+        .compact(CompactionInput::new(InvocationId::new("compact").unwrap()))
+        .await
+        .unwrap();
+    let (events, result) = f.compaction_events(turn).await;
+    assert!(result.is_ok());
+    assert!(
+        matches!(
+            events.as_slice(),
+            [
+                TurnEvent::CompactionStarted { .. },
+                TurnEvent::CompactionFailed {
+                    message: Some(message),
+                    ..
+                }
+            ] if message.contains("without confirming")
+        ),
+        "{events:?}"
+    );
     f.dispose().await;
 }

@@ -1168,7 +1168,7 @@ impl RuntimeEntry {
             sequence: AtomicU64::new(0),
             sender: event_sender,
             announced_session_id: std::sync::Mutex::new(None),
-            compaction_open: std::sync::atomic::AtomicBool::new(false),
+            compaction_open: std::sync::Mutex::new(None),
         };
         let entry = Arc::clone(self);
         let task_terminal = Arc::clone(&terminal);
@@ -1212,6 +1212,7 @@ impl RuntimeEntry {
                     task_invocation_id.clone(),
                 )),
             };
+            let _ = sink.close_open_compaction(result.is_ok()).await;
             let terminal_event = match &result {
                 Ok(turn) => RuntimeEvent::InvocationCompleted {
                     result: turn.clone(),
@@ -1541,7 +1542,7 @@ struct ChannelEventSink {
     /// runs, and the provider then reports its own start signal (Claude also
     /// repeats it as a keepalive). Consumers get exactly one start per
     /// compaction.
-    compaction_open: std::sync::atomic::AtomicBool,
+    compaction_open: std::sync::Mutex<Option<CompactionTrigger>>,
 }
 
 #[async_trait]
@@ -1554,13 +1555,21 @@ impl EventSink for ChannelEventSink {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(session_id.clone());
             }
-            TurnEvent::CompactionStarted { .. } => {
-                if self.compaction_open.swap(true, Ordering::AcqRel) {
+            TurnEvent::CompactionStarted { trigger } => {
+                let mut open = self
+                    .compaction_open
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if open.is_some() {
                     return Ok(());
                 }
+                *open = Some(*trigger);
             }
             TurnEvent::CompactionCompleted { .. } | TurnEvent::CompactionFailed { .. } => {
-                self.compaction_open.store(false, Ordering::Release);
+                *self
+                    .compaction_open
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
             }
             _ => {}
         }
@@ -1570,6 +1579,37 @@ impl EventSink for ChannelEventSink {
 }
 
 impl ChannelEventSink {
+    /// Close a compaction the invocation left open.
+    ///
+    /// A manual compaction is announced by the runtime before the provider
+    /// runs. If the provider never reports a boundary or failure (for example
+    /// it declines silently, crashes, or the invocation is cancelled), the
+    /// invocation must not end with the compaction still shown as running.
+    /// Success is only ever confirmed by the provider's own boundary, so an
+    /// unconfirmed compaction is reported as failed.
+    async fn close_open_compaction(&self, succeeded: bool) -> crate::Result<()> {
+        let trigger = self
+            .compaction_open
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let Some(trigger) = trigger else {
+            return Ok(());
+        };
+        let message = if succeeded {
+            "The provider finished without confirming the compaction."
+        } else {
+            "The invocation ended before the compaction finished."
+        };
+        self.emit_runtime(RuntimeEvent::ProviderEvent {
+            event: TurnEvent::CompactionFailed {
+                trigger,
+                message: Some(message.to_owned()),
+            },
+        })
+        .await
+    }
+
     fn announced_session_id(&self) -> Option<String> {
         self.announced_session_id
             .lock()
@@ -2608,6 +2648,14 @@ mod tests {
                 },
                 RuntimeEvent::ProviderEvent {
                     event: TurnEvent::TextDelta { .. }
+                },
+                // The fixture never reports a compact boundary, so the runtime
+                // closes the compaction it announced instead of leaving it open.
+                RuntimeEvent::ProviderEvent {
+                    event: TurnEvent::CompactionFailed {
+                        trigger: CompactionTrigger::Manual,
+                        message: Some(_),
+                    }
                 },
                 RuntimeEvent::InvocationCompleted { .. }
             ]

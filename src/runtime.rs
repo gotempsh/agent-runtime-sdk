@@ -2349,7 +2349,9 @@ impl AgentRuntime {
         interactions: Option<&dyn InteractionHandler>,
     ) -> Result<TurnResult> {
         let mut trace = StartupTrace::new(request.provider, self.startup_observer.clone());
-        let result = self.run_inner(request, events, interactions, &trace).await;
+        let guard = CompactionGuard::new(events);
+        let result = self.run_inner(request, &guard, interactions, &trace).await;
+        guard.close_open_compaction(&result).await;
         trace.finish(&result);
         result
     }
@@ -2375,9 +2377,11 @@ impl AgentRuntime {
             return self.run(request, events, interactions).await;
         }
         let mut trace = StartupTrace::new(request.provider, self.startup_observer.clone());
+        let guard = CompactionGuard::new(events);
         let result = self
-            .run_inner_with_retention(Some(runtime_id), request, events, interactions, &trace)
+            .run_inner_with_retention(Some(runtime_id), request, &guard, interactions, &trace)
             .await;
+        guard.close_open_compaction(&result).await;
         trace.finish(&result);
         result
     }
@@ -4513,6 +4517,75 @@ fn failed_catalog(
             message,
             retryable,
         }),
+    }
+}
+
+/// Forwards a turn's events and remembers whether a compaction is open.
+///
+/// Adapters close the compactions they open when the provider reports its
+/// terminal frame, but a turn can also end without one: the process exits,
+/// the deadline passes, or the application cancels. A turn must never end
+/// with a compaction still open, or applications keep showing it as running.
+struct CompactionGuard<'a> {
+    inner: &'a dyn EventSink,
+    open: Mutex<Option<crate::CompactionTrigger>>,
+}
+
+impl<'a> CompactionGuard<'a> {
+    fn new(inner: &'a dyn EventSink) -> Self {
+        Self {
+            inner,
+            open: Mutex::new(None),
+        }
+    }
+
+    /// Emit `CompactionFailed` for a compaction the turn left open.
+    ///
+    /// A provider that compacted successfully reports its boundary, which
+    /// already closed the compaction; reaching here means no confirmation
+    /// arrived, so the compaction is reported as not having finished.
+    async fn close_open_compaction(&self, result: &Result<TurnResult>) {
+        let trigger = self
+            .open
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let Some(trigger) = trigger else {
+            return;
+        };
+        let message = match result {
+            Ok(_) => "The provider finished without confirming the compaction.",
+            Err(_) => "The turn ended before the compaction finished.",
+        };
+        let _ = self
+            .inner
+            .emit(TurnEvent::CompactionFailed {
+                trigger,
+                message: Some(message.to_owned()),
+            })
+            .await;
+    }
+}
+
+#[async_trait::async_trait]
+impl EventSink for CompactionGuard<'_> {
+    async fn emit(&self, event: TurnEvent) -> Result<()> {
+        {
+            let mut open = self
+                .open
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match &event {
+                TurnEvent::CompactionStarted { trigger } => {
+                    open.get_or_insert(*trigger);
+                }
+                TurnEvent::CompactionCompleted { .. } | TurnEvent::CompactionFailed { .. } => {
+                    *open = None;
+                }
+                _ => {}
+            }
+        }
+        self.inner.emit(event).await
     }
 }
 

@@ -7,7 +7,9 @@ Versioning and Keep a Changelog conventions.
 
 ### Fixed
 
-- OpenCode's compaction summary is no longer streamed as assistant text.
+- OpenCode's compaction summary is no longer streamed as assistant text. Its
+  cost still counts: OpenCode turn cost is now the sum of every assistant
+  message in the turn instead of the last message's cost.
 - Codex resumes and active-writer forks omit historical turns from their replies,
   so long conversations can continue without exceeding the protocol frame limit.
   Saved provider context is preserved.
@@ -47,6 +49,9 @@ Versioning and Keep a Changelog conventions.
   `RuntimeDriverCapabilities::compaction_lifecycle` flags advertise support.
   Retained invocations deliver one start per compaction even when the provider
   repeats its signal.
+  A turn or retained invocation that ends with a compaction still open (the
+  provider exits, is cancelled, or never confirms a manual `/compact`) emits
+  `CompactionFailed`, so no compaction is left running.
 
 - Add opt-in, bounded Codex app-server process reuse for in-process retained
   runtimes, with strict runtime/configuration isolation, cold fallback at pool

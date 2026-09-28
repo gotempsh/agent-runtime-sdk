@@ -63,7 +63,9 @@ Provider-private transcript identifiers are not part of the normalized event.
 
 At most one compaction is open at a time. Every `CompactionStarted` is followed
 by exactly one `CompactionCompleted` or `CompactionFailed` before the turn
-ends; a retained invocation delivers a single start even when the runtime
+ends. When the provider never confirms (it exits, the turn is cancelled, or a
+manual `/compact` finishes without a boundary) the runtime emits
+`CompactionFailed` itself; a retained invocation delivers a single start even when the runtime
 announces a manual compaction and the provider then reports its own start.
 `TurnCapabilities::compaction_lifecycle` and
 `RuntimeDriverCapabilities::compaction_lifecycle` report whether an adapter

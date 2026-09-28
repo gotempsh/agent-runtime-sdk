@@ -89,6 +89,9 @@ pub(super) struct TurnState {
     /// Active-context size of the latest ordinary assistant message, the
     /// pre-compaction size when a compaction starts.
     last_context_tokens: Option<u64>,
+    /// Latest reported cost of each assistant message in this turn,
+    /// including the compaction summary, keyed by message id.
+    message_costs: std::collections::BTreeMap<String, f64>,
 }
 
 /// Role recorded for OpenCode's compaction summary message. Its text is the
@@ -592,12 +595,22 @@ fn event(
                 };
                 turn.roles.insert(id.to_string(), role.to_string());
             }
+            if info.get("role").and_then(Value::as_str) == Some("assistant") {
+                // OpenCode reports cost per assistant message and resends it as
+                // the message grows. The turn's cost is the sum over its
+                // messages, and the compaction summary is billed like any
+                // other model call even though its text stays hidden.
+                if let (Some(id), Some(cost)) = (
+                    info.get("id").and_then(Value::as_str),
+                    info.get("cost").and_then(Value::as_f64),
+                ) {
+                    turn.message_costs.insert(id.to_string(), cost);
+                    state.result.usage.cost_usd = Some(turn.message_costs.values().sum());
+                }
+            }
             if summary {
                 compaction_summary(info, turn, output);
             } else if info.get("role").and_then(Value::as_str) == Some("assistant") {
-                if let Some(cost) = info.get("cost").and_then(Value::as_f64) {
-                    state.result.usage.cost_usd = Some(cost);
-                }
                 if let Some(tokens) = context_tokens(info) {
                     turn.last_context_tokens = Some(tokens);
                 }
@@ -1162,6 +1175,47 @@ mod tests {
                 .turn_capabilities()
                 .compaction_lifecycle
         );
+    }
+
+    #[test]
+    fn the_compaction_summary_cost_is_counted_while_its_text_stays_hidden() {
+        let mut state = running_turn(PermissionMode::Default);
+        let events = feed(
+            &mut state,
+            &[
+                sse(
+                    "message.updated",
+                    json!({"sessionID": "session-1", "info": {
+                        "id": "msg-a1", "sessionID": "session-1", "role": "assistant", "cost": 0.25
+                    }}),
+                ),
+                sse(
+                    "message.updated",
+                    json!({"sessionID": "session-1", "info": {
+                        "id": "msg-a1", "sessionID": "session-1", "role": "assistant", "cost": 0.5
+                    }}),
+                ),
+                sse(
+                    "message.updated",
+                    json!({"sessionID": "session-1", "info": {
+                        "id": "msg-s3", "sessionID": "session-1", "role": "assistant",
+                        "mode": "compaction", "summary": true, "cost": 0.125
+                    }}),
+                ),
+                sse(
+                    "message.part.updated",
+                    json!({"sessionID": "session-1", "part": {
+                        "id": "prt-s1", "messageID": "msg-s3", "sessionID": "session-1",
+                        "type": "text", "text": "## Summary"
+                    }}),
+                ),
+                sse("session.compacted", json!({"sessionID": "session-1"})),
+            ],
+        );
+        assert_eq!(state.result.usage.cost_usd, Some(0.625));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, TurnEvent::TextDelta { .. })));
     }
 
     #[test]

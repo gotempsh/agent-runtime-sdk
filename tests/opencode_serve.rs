@@ -41,6 +41,8 @@ enum Script {
     Permission,
     /// Close the event stream mid-turn, the way a crashing server does.
     Crash,
+    /// Start an automatic compaction, then close the stream before it ends.
+    CompactionCrash,
     /// Stream one delta and then go quiet, so the turn must be cancelled.
     Interrupt,
     /// Pass health, then never answer session setup.
@@ -435,6 +437,19 @@ async fn stream_events(mut socket: TcpStream, script: Script, requests: Arc<Mute
         drop(socket);
         return;
     }
+    if script == Script::CompactionCrash {
+        let _ = send(
+            &mut socket,
+            &json!({"type": "message.part.updated", "properties": {
+                "sessionID": "session-fixture",
+                "part": {"id": "part-compact", "messageID": "message-2",
+                         "sessionID": "session-fixture", "type": "compaction", "auto": true}
+            }}),
+        )
+        .await;
+        drop(socket);
+        return;
+    }
 
     if matches!(
         script,
@@ -581,6 +596,43 @@ fn turn(mode: PermissionMode) -> TurnRequest {
     request.timeout = Duration::from_secs(30);
     request.interaction_timeout = Duration::from_secs(10);
     request
+}
+
+#[tokio::test]
+async fn a_server_that_dies_mid_compaction_never_leaves_it_open() {
+    let server = Server::new(Script::CompactionCrash);
+    let events = Collected::default();
+
+    let result = runtime(&server)
+        .run(turn(PermissionMode::FullAccess), &events, None)
+        .await;
+
+    assert!(result.is_err());
+    let compaction: Vec<TurnEvent> = events
+        .events()
+        .into_iter()
+        .filter(|event| {
+            matches!(
+                event,
+                TurnEvent::CompactionStarted { .. }
+                    | TurnEvent::CompactionCompleted { .. }
+                    | TurnEvent::CompactionFailed { .. }
+            )
+        })
+        .collect();
+    assert!(
+        matches!(
+            compaction.as_slice(),
+            [
+                TurnEvent::CompactionStarted { .. },
+                TurnEvent::CompactionFailed {
+                    message: Some(_),
+                    ..
+                }
+            ]
+        ),
+        "{compaction:?}"
+    );
 }
 
 #[tokio::test]

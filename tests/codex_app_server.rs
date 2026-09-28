@@ -46,6 +46,8 @@ enum Script {
     Interrupt,
     /// Exit after accepting a turn, before a terminal notification.
     Crash,
+    /// Start an automatic compaction, then exit before it completes.
+    CompactionCrash,
     /// Complete, then emit an old-turn frame while the process is idle.
     DelayedIdleFrame,
     /// Complete, then send a server request while the process is idle.
@@ -298,6 +300,16 @@ async fn serve(
                 if script == Script::Crash {
                     return;
                 }
+                if script == Script::CompactionCrash {
+                    send(
+                        &mut output,
+                        json!({"jsonrpc":"2.0","method":"item/started",
+                            "params":{"threadId":"thread-fixture","turnId":"turn-1",
+                                "item":{"type":"contextCompaction","id":"compact-1"}}}),
+                    )
+                    .await;
+                    return;
+                }
                 send(
                     &mut output,
                     json!({"jsonrpc":"2.0","method":"item/agentMessage/delta",
@@ -415,7 +427,7 @@ fn opening_frames(script: Script) -> Vec<Value> {
                         "options":[{"label":"Dark","description":"Dim"}]}]}
             })]
         }
-        Script::Interrupt | Script::Crash => Vec::new(),
+        Script::Interrupt | Script::Crash | Script::CompactionCrash => Vec::new(),
     }
 }
 
@@ -811,6 +823,82 @@ async fn a_timed_out_turn_is_never_reused() {
         );
     }
     assert_eq!(transport.spawn_count(), 2);
+}
+
+fn compaction_events(events: &[TurnEvent]) -> Vec<TurnEvent> {
+    events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                TurnEvent::CompactionStarted { .. }
+                    | TurnEvent::CompactionCompleted { .. }
+                    | TurnEvent::CompactionFailed { .. }
+            )
+        })
+        .cloned()
+        .collect()
+}
+
+#[tokio::test]
+async fn a_process_that_dies_mid_compaction_never_leaves_it_open() {
+    let events = Collector::default();
+    let result = runtime(AppServer::new(Script::CompactionCrash))
+        .run(request(), &events, None)
+        .await;
+    // The one-shot transport reports this clean exit as a finished turn; the
+    // compaction it left open must still be closed rather than dropped.
+    assert!(result.is_ok_and(|turn| turn.text.is_empty()));
+    let compaction = compaction_events(&events.events());
+    assert!(
+        matches!(
+            compaction.as_slice(),
+            [
+                TurnEvent::CompactionStarted { .. },
+                TurnEvent::CompactionFailed {
+                    message: Some(_),
+                    ..
+                }
+            ]
+        ),
+        "{compaction:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_retained_process_that_dies_mid_compaction_never_leaves_it_open() {
+    let runtime = retained_runtime(
+        AppServer::new(Script::CompactionCrash),
+        Duration::from_secs(30),
+    );
+    let (_client, handle) = retained_handle(runtime).await;
+    let (mut stream, completion) = handle
+        .start_turn(TurnInput::new(
+            InvocationId::new("compaction-crash").unwrap(),
+            "compact",
+        ))
+        .await
+        .unwrap()
+        .into_parts();
+    let mut observed = Vec::new();
+    while let Some(envelope) = stream.next().await {
+        if let temps_agent_runtime::retained::RuntimeEvent::ProviderEvent { event } = envelope.event
+        {
+            observed.push(event);
+        }
+    }
+    assert!(completion.wait().await.is_err());
+    let compaction = compaction_events(&observed);
+    assert!(
+        matches!(
+            compaction.as_slice(),
+            [
+                TurnEvent::CompactionStarted { .. },
+                TurnEvent::CompactionFailed { .. }
+            ]
+        ),
+        "{compaction:?}"
+    );
 }
 
 #[tokio::test]
