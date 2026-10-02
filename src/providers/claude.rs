@@ -2452,7 +2452,11 @@ mod tests {
                 ("ultracode", "Ultra code"),
             ]
         );
-        assert!(catalog.models[1].reasoning_efforts.is_empty());
+        assert!(
+            catalog.models[1].reasoning_efforts.is_empty(),
+            "{:?}",
+            catalog.models[1].reasoning_efforts
+        );
         assert!(catalog.models.iter().all(|model| model.id != "default"));
     }
 
@@ -2569,11 +2573,8 @@ mod tests {
             adapter.parse_line(delta, &mut state).unwrap().events.len(),
             1
         );
-        assert!(adapter
-            .parse_line(assistant, &mut state)
-            .unwrap()
-            .events
-            .is_empty());
+        let events = adapter.parse_line(assistant, &mut state).unwrap().events;
+        assert!(events.is_empty(), "{events:?}");
         assert_eq!(state.result.text, "hi");
     }
 
@@ -3080,7 +3081,7 @@ mod tests {
             )
             .unwrap();
 
-        assert!(output.events.is_empty());
+        assert!(output.events.is_empty(), "{:?}", output.events);
         assert_eq!(state.result.session_id.as_deref(), Some("session-123"));
     }
 
@@ -3459,8 +3460,8 @@ mod tests {
             .unwrap();
 
         assert!(output.terminal);
-        assert!(output.events.is_empty());
-        assert!(state.result.text.is_empty());
+        assert!(output.events.is_empty(), "{:?}", output.events);
+        assert!(state.result.text.is_empty(), "{:?}", state.result.text);
         let failure = state.terminal_failure.unwrap();
         assert_eq!(
             failure.kind,
@@ -3486,7 +3487,7 @@ mod tests {
             .expect("Claude result parses");
 
         assert!(output.terminal);
-        assert!(output.events.is_empty());
+        assert!(output.events.is_empty(), "{:?}", output.events);
         let failure = state.terminal_failure.expect("terminal failure");
         assert_eq!(
             failure.diagnostic,

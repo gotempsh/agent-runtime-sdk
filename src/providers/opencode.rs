@@ -630,7 +630,7 @@ mod tests {
             .unwrap();
 
         assert!(output.terminal);
-        assert!(output.events.is_empty());
+        assert!(output.events.is_empty(), "{:?}", output.events);
         let failure = state.terminal_failure.unwrap();
         assert_eq!(
             failure.kind,
@@ -725,17 +725,11 @@ mod tests {
                 title: Some("My session".into())
             }]
         );
-        assert!(adapter
-            .parse_line(line, &mut state)
-            .unwrap()
-            .events
-            .is_empty());
+        let events = adapter.parse_line(line, &mut state).unwrap().events;
+        assert!(events.is_empty(), "{events:?}");
         let mut resumed = AdapterState::default();
         resumed.result.session_id = Some("session-1".into());
-        assert!(adapter
-            .parse_line(line, &mut resumed)
-            .unwrap()
-            .events
-            .is_empty());
+        let events = adapter.parse_line(line, &mut resumed).unwrap().events;
+        assert!(events.is_empty(), "{events:?}");
     }
 }

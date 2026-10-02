@@ -5833,7 +5833,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            assert!(result.text.is_empty());
+            assert!(result.text.is_empty(), "{:?}", result.text);
             let recorded = samples.samples.lock().unwrap();
             let terminal = recorded.last().unwrap();
             assert_eq!(terminal.stage, StartupStage::Succeeded);

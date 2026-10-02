@@ -1187,7 +1187,7 @@ mod tests {
         let mut state = AdapterState::default();
         let output = parse_line(&question_frame(true).to_string(), &mut state).unwrap();
 
-        assert!(output.writes.is_empty());
+        assert!(output.writes.is_empty(), "{:?}", output.writes);
         assert!(matches!(
             output.interaction,
             Some(InteractionRequest::Question { ref request, .. }) if request.id == "server-9"
@@ -1237,7 +1237,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(output.events.is_empty());
+        assert!(output.events.is_empty(), "{:?}", output.events);
         assert_eq!(state.result.text, "Done");
         assert!(state.saw_text_delta);
     }
@@ -1417,7 +1417,7 @@ mod tests {
 
         let output = parse_line(&token_usage_frame("thread-other", 999), &mut state).unwrap();
 
-        assert!(output.events.is_empty());
+        assert!(output.events.is_empty(), "{:?}", output.events);
         assert_eq!(state.result.usage, Usage::default());
     }
 

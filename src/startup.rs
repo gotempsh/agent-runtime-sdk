@@ -193,6 +193,8 @@ impl Drop for EventDeliveryTimer<'_> {
     fn drop(&mut self) {
         if let Some(started) = self.started {
             let nanos = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            // `try_update` replaces this in Rust 1.99, above the 1.88 MSRV.
+            #[allow(deprecated)]
             let _ = self.trace.event_delivery_nanos.fetch_update(
                 Ordering::Relaxed,
                 Ordering::Relaxed,

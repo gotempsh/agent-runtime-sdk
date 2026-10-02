@@ -1159,7 +1159,7 @@ mod tests {
                 .any(|event| matches!(event, TurnEvent::TextDelta { .. })),
             "the compaction summary is harness-internal, not assistant output: {events:?}"
         );
-        assert!(state.result.text.is_empty());
+        assert!(state.result.text.is_empty(), "{:?}", state.result.text);
     }
 
     #[test]
@@ -1550,7 +1550,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(output.events.is_empty());
+        assert!(output.events.is_empty(), "{:?}", output.events);
         assert_eq!(state.result.text, "");
     }
 

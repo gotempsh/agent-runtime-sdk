@@ -414,8 +414,16 @@ mod tests {
             r#"{"BackendState":"NeedsLogin","Self":{"HostName":"my-mac.local","DNSName":"","TailscaleIPs":null},"Peer":null}"#,
         )
         .unwrap();
-        assert!(status.route_table().host_names.is_empty());
-        assert!(status.route_table().dns_names.is_empty());
+        assert!(
+            status.route_table().host_names.is_empty(),
+            "{:?}",
+            status.route_table().host_names
+        );
+        assert!(
+            status.route_table().dns_names.is_empty(),
+            "{:?}",
+            status.route_table().dns_names
+        );
     }
 
     #[test]

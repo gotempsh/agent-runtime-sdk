@@ -1721,7 +1721,7 @@ mod tests {
             .unwrap();
 
         assert!(output.terminal);
-        assert!(output.events.is_empty());
+        assert!(output.events.is_empty(), "{:?}", output.events);
         let failure = state.terminal_failure.unwrap();
         assert_eq!(failure.kind, crate::ProviderProcessErrorKind::RateLimited);
         assert_eq!(failure.delivery, DeliveryState::Accepted);
@@ -1858,7 +1858,7 @@ mod tests {
             )
             .unwrap();
 
-        assert!(output.events.is_empty());
+        assert!(output.events.is_empty(), "{:?}", output.events);
         assert_eq!(state.result.session_id.as_deref(), Some("thread-123"));
     }
 
