@@ -41,7 +41,7 @@ features.
 | Custom mode | yes | yes, native approval policy | yes, configured agent |
 | Live approvals | yes | app-server mode only (`exec` is configured non-interactively) | `Serve` mode only (`run` is non-interactive) |
 | Live user questions | yes | app-server mode only, blocking and async | no; OpenCode has no question channel |
-| Cooperative interrupt on cancellation | retained process only (`interrupt` control request; background tasks keep running) | app-server mode only (`turn/interrupt`) | `Serve` mode only (`session/abort`) |
+| Cooperative interrupt on cancellation | retained process only (`interrupt` control request; keeps the process and background shells; Claude stops background subagents unless it had already answered) | app-server mode only (`turn/interrupt`) | `Serve` mode only (`session/abort`) |
 | Messages into a running turn | retained process only | no | no |
 | Structured launch context | system prompt, exact tools, stdio/HTTP MCP, strict MCP | additive stdio/HTTP MCP | `Serve`: system prompt and tools as a prompt prefix, stdio/HTTP MCP; `Run`: rejected |
 | Native image attachments | no; described as prompt paths | yes (`--image`, `localImage` input) | no; described as prompt paths |

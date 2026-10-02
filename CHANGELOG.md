@@ -19,12 +19,15 @@ Versioning and Keep a Changelog conventions.
 
 ### Fixed
 
-- Interrupting a retained Claude turn no longer kills its background work. The
-  interrupt is now cooperative: Claude's `interrupt` control request stops the
-  foreground reply, its tools and any queued messages, and the process is kept.
-  Background subagents and shells keep running, and their output, Claude's
-  answers to them and their approval requests are buffered (bounded) for the
-  next turn. An unconfirmed interrupt still retires the process after three
+- Interrupting a retained Claude turn no longer kills its process. The
+  interrupt is now cooperative: Claude's `interrupt` control request (with
+  `cancel_queued`) stops the foreground reply, its tools and any queued
+  messages, and the process is kept. Background shells keep running. Claude
+  itself stops background subagents when it is interrupted mid-work, reported
+  as `Stopped` task activity. A turn that has already answered is ended without
+  sending Claude anything, so all of its background work keeps running. Output,
+  Claude's answers and approval requests from the surviving work are buffered
+  (bounded) for the next turn. An unconfirmed interrupt still retires the process after three
   seconds. Adapter hooks `retained_interrupt_settled` and
   `retained_background_work` default to the previous behavior.
 - A retained Claude turn now ends on the completion of the commands it sent,

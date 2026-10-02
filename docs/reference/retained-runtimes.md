@@ -77,7 +77,11 @@ no request that writes into a running invocation. Executors implement `RuntimeTu
 adapters implement `AgentAdapter::encode_user_message`.
 
 Interrupting a retained Claude invocation is cooperative: it stops foreground
-work and queued messages, then keeps the process. A process with background
+work and queued messages, then keeps the process. If Claude is still working in
+the foreground, the stop is Claude's own `interrupt` request, which also ends
+its background subagents (reported as `Stopped` task activity) but not its
+background shells. If Claude has already answered, nothing is sent to Claude
+and all background work keeps running. A process with background
 work stays parked, and its output and approval requests are buffered for the
 next invocation (at most 1,024 events and 16 approvals). The oldest events are
 dropped first, except the request events of held approvals. Approvals beyond

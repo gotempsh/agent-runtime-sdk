@@ -469,11 +469,17 @@ fn user_message_frame(text: &str, uuid: Option<&str>) -> Result<Vec<u8>> {
     })
 }
 
+/// Claude's stop request.
+///
+/// `cancel_queued` (the `interrupt_cancel_queued_v1` capability) cancels the
+/// messages queued behind the turn atomically with the abort, so none of them
+/// starts afterwards. A CLI without that capability treats the request as a
+/// plain interrupt; the turn then stops each queued message as it starts.
 fn interrupt_frame() -> Option<Vec<u8>> {
     serde_json::to_vec(&json!({
         "type": "control_request",
         "request_id": INTERRUPT_REQUEST_ID,
-        "request": { "subtype": "interrupt" }
+        "request": { "subtype": "interrupt", "cancel_queued": true }
     }))
     .ok()
 }
@@ -3810,6 +3816,7 @@ mod tests {
         let interrupt: Value =
             serde_json::from_slice(&adapter.interrupt_request(&state).unwrap()).unwrap();
         assert_eq!(interrupt["request"]["subtype"], "interrupt");
+        assert_eq!(interrupt["request"]["cancel_queued"], true);
         adapter
             .parse_line(
                 &format!(
@@ -3837,6 +3844,42 @@ mod tests {
         adapter
             .parse_line(&lifecycle(&queued, "cancelled"), &mut state)
             .unwrap();
+        assert_eq!(adapter.retained_interrupt_settled(&state), Some(true));
+    }
+
+    #[test]
+    fn claude_cancelling_queued_messages_with_the_stop_settles_the_turn() {
+        let adapter = Claude::default();
+        let (mut state, prompt) = retained_turn_with_prompt(&adapter);
+        adapter
+            .parse_line(&lifecycle(&prompt, "started"), &mut state)
+            .unwrap();
+        let queued = adapter
+            .encode_user_message("queued", &mut state)
+            .unwrap()
+            .unwrap();
+        let queued: Value = serde_json::from_slice(&queued).unwrap();
+        let queued = queued["uuid"].as_str().unwrap().to_string();
+        adapter
+            .parse_line(&lifecycle(&queued, "queued"), &mut state)
+            .unwrap();
+        adapter.interrupt_request(&state).unwrap();
+
+        // `interrupt_cancel_queued_v1`: the queued message is cancelled with
+        // the abort and never starts, so nothing has to be stopped again.
+        let mut writes = Vec::new();
+        for line in [
+            lifecycle(&queued, "cancelled"),
+            format!(
+                r#"{{"type":"control_response","response":{{"subtype":"success","request_id":"{INTERRUPT_REQUEST_ID}","response":{{"still_queued":[],"cancelled":["{queued}"]}}}}}}"#
+            ),
+            r#"{"type":"result","subtype":"error_during_execution","is_error":true,"result":""}"#
+                .to_string(),
+            lifecycle(&prompt, "cancelled"),
+        ] {
+            writes.extend(adapter.parse_line(&line, &mut state).unwrap().writes);
+        }
+        assert_eq!(writes, Vec::<Vec<u8>>::new());
         assert_eq!(adapter.retained_interrupt_settled(&state), Some(true));
     }
 

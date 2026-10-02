@@ -77,7 +77,13 @@ def foreground(uuid):
   if INTERRUPT.is_set():
    log('work-stopped')
    emit({'type':'system','subtype':'task_notification','task_id':'fg-1','status':'stopped'})
-   result('',error=True);lifecycle(uuid,'cancelled');return
+   result('',error=True);lifecycle(uuid,'cancelled')
+   # Like Claude, the stopped exchange reaches the transcript just after
+   # the turn is reported over.
+   time.sleep(.05)
+   emit({'type':'user','message':{'role':'user','content':[{'type':'tool_result','tool_use_id':'toolu_fg','is_error':True,'content':'Tool use rejected.'}]}})
+   emit({'type':'user','message':{'role':'user','content':[{'type':'text','text':'[Request interrupted by user for tool use]'}]}})
+   return
   time.sleep(.02)
  log('work-finished')
  emit({'type':'system','subtype':'task_notification','task_id':'fg-1','status':'completed'})

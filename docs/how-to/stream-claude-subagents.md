@@ -94,12 +94,25 @@ with the conversation before sending it again.
 
 ### Interrupt only foreground work
 
-On a retained Claude runtime, `TurnHandle::interrupt` is cooperative. The SDK
-sends Claude's `interrupt` control request, which stops the reply being
-written, its foreground tools and any messages still queued behind it. The
-turn ends `Cancelled`, but the process and its background subagents and
-background shells keep running. Until the next turn arrives the SDK keeps
-reading the process: their events, Claude's answers to their completion, and
+On a retained Claude runtime, `TurnHandle::interrupt` is cooperative. The turn
+ends `Cancelled` and the Claude process is kept. What else stops depends on
+what Claude is doing:
+
+- **Claude is still working in the foreground.** The SDK sends Claude's
+  `interrupt` control request with `cancel_queued`. It stops the reply being
+  written, its foreground tools and any messages queued behind them. Claude
+  treats this as a stop of the whole session's work, so it also stops
+  *background subagents*; each one is reported as a `TaskActivity` with kind
+  `Stopped`. Background shells keep running.
+- **Claude has answered and only background work is running.** The SDK sends
+  Claude nothing; it just ends the turn. Background subagents and shells keep
+  running.
+
+So interrupt only when the user asks to stop. To say something else while
+background subagents work, send a message into the turn or start a new turn
+instead; neither stops anything.
+
+Until the next turn arrives the SDK keeps reading the process: their events, Claude's answers to their completion, and
 any approval they request are held (bounded) and delivered at the start of
 the next turn. A request event stays in the buffer for as long as its approval
 is held. Requests beyond the bound are denied and reported as a warning on the
@@ -146,10 +159,11 @@ To check the hand-off against an installed Claude CLI, run
 `cargo run --example claude_background_handoff_smoke -- haiku`. It launches a
 background subagent, sends a second prompt while it works, and passes once the
 subagent finishes and its completion reaches the second turn.
-`cargo run --example claude_live_messages_smoke -- haiku` checks the other two
-paths: a message sent during a foreground command is answered by the same
-turn, and an interrupt stops a foreground command while a background shell
-keeps running and its completion reaches a later turn.
+`cargo run --example claude_live_messages_smoke -- haiku [scenario...]` checks
+messages and interrupts end to end: messages answered by the running turn,
+queued messages stopped with it, the same Claude process kept across an
+interrupt, background shells and answered-turn subagents surviving it, and a
+background approval held until the next turn.
 
 ## Persist and replay
 

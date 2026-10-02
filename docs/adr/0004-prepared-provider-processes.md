@@ -56,7 +56,7 @@ the connection and terminate its process tree before it can be reused. The one
 exception is a cancellation the provider confirms cooperatively: a retained
 Claude process acknowledges its `interrupt` control request and reports every
 command of the turn as ended, so its stream is at a known boundary and it is
-kept, together with any background work it is running.
+kept, together with whatever background work Claude itself did not stop.
 
 ## Configuration and credentials
 

@@ -317,6 +317,8 @@ const TURN_MESSAGE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Upper bound for an interrupted retained turn to unwind cooperatively
 /// before its process is terminated instead.
 const INTERRUPT_SETTLE_TIMEOUT: Duration = Duration::from_secs(3);
+/// Silence that marks the end of what Claude writes for a stopped exchange.
+const INTERRUPT_QUIET: Duration = Duration::from_millis(300);
 
 impl RetainedHandoff {
     fn take_request(&self) -> Option<oneshot::Sender<bool>> {
@@ -522,12 +524,16 @@ async fn read_idle_retained_line(
     reader: &mut BufReader<crate::TransportReader>,
     limit: usize,
 ) -> Option<std::io::Result<Option<String>>> {
-    match tokio::time::timeout(
-        IDLE_FRAME_WAIT,
-        tokio::io::AsyncBufReadExt::fill_buf(reader),
-    )
-    .await
-    {
+    read_retained_line_within(reader, limit, IDLE_FRAME_WAIT).await
+}
+
+/// Like [`read_idle_retained_line`], waiting up to `wait` for a frame to begin.
+async fn read_retained_line_within(
+    reader: &mut BufReader<crate::TransportReader>,
+    limit: usize,
+    wait: Duration,
+) -> Option<std::io::Result<Option<String>>> {
+    match tokio::time::timeout(wait, tokio::io::AsyncBufReadExt::fill_buf(reader)).await {
         Err(_) => None,
         Ok(Err(error)) => Some(Err(error)),
         Ok(Ok(_)) => Some(
@@ -702,6 +708,38 @@ async fn serve_messages_until<T>(
             }
         }
     }
+}
+
+/// Parse one frame of an exchange being stopped: emit its events and refuse
+/// any approval or question, which the stopped turn can no longer answer.
+///
+/// Returns `false` when the process can no longer be trusted.
+async fn apply_interrupted_frame(
+    adapter: &dyn AgentAdapter,
+    provider: Provider,
+    events: &dyn EventSink,
+    io: &mut RetainedCodexIo,
+    state: &mut AdapterState,
+    line: &str,
+) -> bool {
+    let Ok(output) = adapter.parse_line(line, state) else {
+        return false;
+    };
+    for event in output.events {
+        if events.emit(event).await.is_err() {
+            return false;
+        }
+    }
+    let mut writes = output.writes;
+    if let Some(interaction) = output.interaction {
+        match decline_interaction(adapter, interaction, "The turn was interrupted") {
+            Ok(response) => writes.extend(response),
+            Err(_) => return false,
+        }
+    }
+    write_provider_frames(provider, Some(&mut io.stdin), &writes, "interrupt write")
+        .await
+        .is_ok()
 }
 
 /// Encode a refusal for an approval or question no one can answer.
@@ -4481,36 +4519,48 @@ impl AgentRuntime {
         if !delivered || adapter.retained_interrupt_settled(&state).is_none() {
             return Err(RuntimeError::Cancelled { provider });
         }
+        let max_event_line_bytes = self.max_event_line_bytes;
         let settled = tokio::time::timeout(INTERRUPT_SETTLE_TIMEOUT, async {
             while adapter.retained_interrupt_settled(&state) != Some(true) {
                 let Ok(Some(line)) =
-                    read_bounded_retained_line(&mut io.reader, self.max_event_line_bytes).await
+                    read_bounded_retained_line(&mut io.reader, max_event_line_bytes).await
                 else {
                     return false;
                 };
-                let Ok(output) = adapter.parse_line(&line, &mut state) else {
-                    return false;
-                };
-                for event in output.events {
-                    if events.emit(event).await.is_err() {
-                        return false;
-                    }
-                }
-                let mut writes = output.writes;
-                if let Some(interaction) = output.interaction {
-                    match decline_interaction(adapter, interaction, "The turn was interrupted") {
-                        Ok(response) => writes.extend(response),
-                        Err(_) => return false,
-                    }
-                }
-                if write_provider_frames(provider, Some(&mut io.stdin), &writes, "interrupt write")
-                    .await
-                    .is_err()
+                if !apply_interrupted_frame(adapter, provider, events, io, &mut state, &line).await
                 {
                     return false;
                 }
             }
-            true
+            // Claude may write the stopped exchange to its transcript (the
+            // stopped tools' results, the interruption marker) just after it
+            // reports the turn ended. A parked process reads on regardless,
+            // but an idle one treats any output as unexpected, so take it
+            // here until the stream goes quiet.
+            if adapter.retained_background_work(&state) {
+                return true;
+            }
+            loop {
+                match read_retained_line_within(
+                    &mut io.reader,
+                    max_event_line_bytes,
+                    INTERRUPT_QUIET,
+                )
+                .await
+                {
+                    None => return true,
+                    Some(Ok(Some(line))) => {
+                        if !apply_interrupted_frame(
+                            adapter, provider, events, io, &mut state, &line,
+                        )
+                        .await
+                        {
+                            return false;
+                        }
+                    }
+                    Some(Ok(None) | Err(_)) => return false,
+                }
+            }
         })
         .await
         .unwrap_or(false);
