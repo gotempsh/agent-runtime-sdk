@@ -3,22 +3,43 @@
 
 use std::{fs, os::unix::fs::PermissionsExt, time::Duration};
 use temps_agent_runtime::{
-    lifecycle::{InvocationId, RuntimeFailure, RuntimeId},
+    lifecycle::{InvocationId, RuntimeFailure, RuntimeFailureKind, RuntimeId},
     providers::Claude,
     retained::{
         CompactionInput, InProcessRuntimeClient, RuntimeClient, RuntimeEvent, RuntimeHandle,
         RuntimeSpec, TurnHandle, TurnInput,
     },
-    AgentRuntime, PermissionMode, Provider, ProviderProcessRetention, TurnEvent, TurnResult,
+    AgentRuntime, AgentTaskActivityKind, PermissionMode, Provider, ProviderProcessRetention,
+    TurnEvent, TurnResult,
 };
+use tokio::task::JoinHandle;
 
 const SCRIPT: &str = r"#!/usr/bin/env python3
-import json,os,sys,time
+import json,os,sys,threading,time
 LOG=LOG_PATH
+RELEASE=RELEASE_PATH
+LOCK=threading.Lock()
 def log(kind, **data):
  with open(LOG,'a') as f:f.write(json.dumps(dict(kind=kind,pid=os.getpid(),**data))+'\n')
 def emit(frame):
- print(json.dumps(frame),flush=True)
+ with LOCK:print(json.dumps(frame),flush=True)
+def result(text):
+ emit({'type':'result','subtype':'success','session_id':'fixture-session','result':text,'is_error':False,'num_turns':1,'total_cost_usd':0,'usage':{'input_tokens':1,'output_tokens':1}})
+def subagent(follow_up):
+ # A background subagent, as Claude reports one: progress and nested tool
+ # calls until it finishes, then a notification that wakes the parent agent.
+ log('bg-start')
+ while not os.path.exists(RELEASE):
+  emit({'type':'system','subtype':'task_progress','task_id':'bg-1','description':'Waiting'})
+  emit({'type':'assistant','parent_tool_use_id':'toolu_bg','message':{'content':[{'type':'tool_use','id':'toolu_poll','name':'Bash','input':{'command':'true'}}]}})
+  time.sleep(.02)
+ emit({'type':'system','subtype':'background_tasks_changed','tasks':[]})
+ emit({'type':'system','subtype':'task_notification','task_id':'bg-1','status':'completed','summary':'background done'})
+ log('bg-finished')
+ if follow_up:
+  emit({'type':'system','subtype':'init','session_id':'fixture-session'})
+  emit({'type':'assistant','parent_tool_use_id':None,'message':{'content':[{'type':'text','text':'FOLLOWUP'}]}})
+  result('FOLLOWUP')
 log('spawn')
 for line in sys.stdin:
  frame=json.loads(line)
@@ -38,23 +59,66 @@ for line in sys.stdin:
     emit({'type':'unknown_noop'});time.sleep(.01)
   if prompt=='hang':
    while True:time.sleep(1)
-  emit({'type':'result','subtype':'success','session_id':'fixture-session','result':'reply:'+prompt,'is_error':False,'num_turns':1,'total_cost_usd':0,'usage':{'input_tokens':1,'output_tokens':1}})
+  if prompt in('spawn-bg','spawn-bg-silent'):
+   emit({'type':'system','subtype':'task_started','task_id':'bg-1','tool_use_id':'toolu_bg','description':'Background work','subagent_type':'general-purpose','task_type':'local_agent','is_backgrounded':True})
+   emit({'type':'system','subtype':'background_tasks_changed','tasks':[{'task_id':'bg-1','task_type':'local_agent','description':'Background work'}]})
+   emit({'type':'assistant','parent_tool_use_id':None,'message':{'content':[{'type':'text','text':'LAUNCHED'}]}})
+   result('LAUNCHED')
+   threading.Thread(target=subagent,args=(prompt=='spawn-bg',),daemon=True).start()
+   continue
+  result('reply:'+prompt)
 ";
 
 struct Fixture {
     _dir: tempfile::TempDir,
     log: std::path::PathBuf,
+    release: std::path::PathBuf,
     client: InProcessRuntimeClient,
     handle: RuntimeHandle,
+}
+
+/// A started turn whose events are drained concurrently, as an application
+/// does; an unread event stream would apply backpressure to the provider.
+struct Running {
+    events: JoinHandle<Vec<TurnEvent>>,
+    completion: JoinHandle<Result<TurnResult, RuntimeFailure>>,
+}
+impl Running {
+    fn new(turn: TurnHandle) -> Self {
+        let (mut stream, completion) = turn.into_parts();
+        Self {
+            events: tokio::spawn(async move {
+                let mut events = Vec::new();
+                while let Some(envelope) = stream.next().await {
+                    if let RuntimeEvent::ProviderEvent { event } = envelope.event {
+                        events.push(event);
+                    }
+                }
+                events
+            }),
+            completion: tokio::spawn(completion.wait()),
+        }
+    }
+    async fn finish(self) -> (Vec<TurnEvent>, Result<TurnResult, RuntimeFailure>) {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let result = self.completion.await.unwrap();
+            (self.events.await.unwrap(), result)
+        })
+        .await
+        .expect("turn must be bounded")
+    }
 }
 impl Fixture {
     async fn new(enabled: bool, idle_timeout: Duration) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let executable = dir.path().join("claude-fixture");
         let log = dir.path().join("events.jsonl");
+        let release = dir.path().join("release");
         fs::write(
             &executable,
-            SCRIPT.replace("LOG_PATH", &serde_json::to_string(&log).unwrap()),
+            SCRIPT
+                .replace("LOG_PATH", &serde_json::to_string(&log).unwrap())
+                .replace("RELEASE_PATH", &serde_json::to_string(&release).unwrap()),
         )
         .unwrap();
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
@@ -80,9 +144,43 @@ impl Fixture {
         Self {
             _dir: dir,
             log,
+            release,
             client,
             handle,
         }
+    }
+    fn input(id: &str, prompt: &str) -> TurnInput {
+        TurnInput::new(InvocationId::new(id).unwrap(), prompt)
+    }
+    /// Let the fixture's background subagent finish.
+    fn release_background(&self) {
+        fs::write(&self.release, b"done").unwrap();
+    }
+    fn logged(&self, kind: &str) -> usize {
+        self.events().iter().filter(|v| v["kind"] == kind).count()
+    }
+    async fn wait_for_log(&self, kind: &str) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while self.logged(kind) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("fixture never logged {kind}: {:?}", self.events()));
+    }
+    /// Start a turn, retrying briefly while the runtime reports busy, as an
+    /// application following `RetryAdvice::After` does.
+    async fn start_retrying(&self, id: &str, prompt: &str) -> TurnHandle {
+        for _ in 0..100 {
+            match self.handle.start_turn(Self::input(id, prompt)).await {
+                Ok(turn) => return turn,
+                Err(failure) if failure.kind == RuntimeFailureKind::RuntimeBusy => {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Err(failure) => panic!("turn {id} failed to start: {failure:?}"),
+            }
+        }
+        panic!("runtime stayed busy for turn {id}");
     }
     fn events(&self) -> Vec<serde_json::Value> {
         fs::read_to_string(&self.log)
@@ -322,5 +420,152 @@ async fn an_unconfirmed_manual_compaction_is_closed_as_failed() {
         ),
         "{events:?}"
     );
+    f.dispose().await;
+}
+
+#[tokio::test]
+async fn claude_background_subagent_survives_a_new_turn() {
+    let f = Fixture::new(true, Duration::from_secs(30)).await;
+    let first = Running::new(
+        f.handle
+            .start_turn(Fixture::input("one", "spawn-bg"))
+            .await
+            .unwrap(),
+    );
+    f.wait_for_log("bg-start").await;
+
+    // The first turn has answered and only its background subagent is still
+    // working, so a new prompt takes over the live process instead of
+    // requiring that turn to be interrupted.
+    let second = Running::new(f.start_retrying("two", "second").await);
+    let (_, first_result) = first.finish().await;
+    assert_eq!(first_result.unwrap().text, "LAUNCHED");
+    f.wait_for_log("prompt").await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !second.completion.is_finished(),
+        "inherited background work keeps the new turn open"
+    );
+    assert_eq!(f.logged("bg-finished"), 0, "the subagent is still running");
+
+    f.release_background();
+    let (events, second_result) = second.finish().await;
+    let text = second_result.unwrap().text;
+    assert!(text.contains("reply:second"), "{text}");
+    assert!(
+        text.contains("FOLLOWUP"),
+        "the parent's answer to the notification reaches the turn: {text}"
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        TurnEvent::ToolCall { task_id, .. } if task_id.as_deref() == Some("bg-1")
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        TurnEvent::TaskActivity { activity }
+            if activity.task_id == "bg-1" && activity.kind == AgentTaskActivityKind::Completed
+    )));
+    assert_eq!(f.logged("bg-finished"), 1);
+    assert_eq!(
+        f.events()
+            .iter()
+            .filter(|v| v["prompt"] == "second")
+            .count(),
+        1
+    );
+    assert_eq!(
+        f.logged("probe"),
+        0,
+        "a handed-off process is not probed while background output is queued"
+    );
+
+    assert_eq!(f.turn("three", "third").await.unwrap().text, "reply:third");
+    assert_eq!(f.spawns().len(), 1, "{:?}", f.events());
+    f.dispose().await;
+}
+
+#[tokio::test]
+async fn claude_follow_up_after_background_work_belongs_to_its_turn() {
+    let f = Fixture::new(true, Duration::from_secs(30)).await;
+    let turn = Running::new(
+        f.handle
+            .start_turn(Fixture::input("one", "spawn-bg"))
+            .await
+            .unwrap(),
+    );
+    f.wait_for_log("bg-start").await;
+    f.release_background();
+    let (_, result) = turn.finish().await;
+    let text = result.unwrap().text;
+    assert!(
+        text.contains("LAUNCHED") && text.contains("FOLLOWUP"),
+        "{text}"
+    );
+    // The follow-up was read by its turn rather than by the idle supervisor,
+    // which would have retired the process as unassignable output.
+    assert_eq!(f.turn("two", "second").await.unwrap().text, "reply:second");
+    assert_eq!(f.spawns().len(), 1, "{:?}", f.events());
+    f.dispose().await;
+}
+
+#[tokio::test]
+async fn claude_unanswered_background_drain_completes_after_a_quiet_grace() {
+    let f = Fixture::new(true, Duration::from_secs(30)).await;
+    let turn = Running::new(
+        f.handle
+            .start_turn(Fixture::input("one", "spawn-bg-silent"))
+            .await
+            .unwrap(),
+    );
+    f.wait_for_log("bg-start").await;
+    f.release_background();
+    let (_, result) = turn.finish().await;
+    assert_eq!(result.unwrap().text, "LAUNCHED");
+    assert_eq!(f.turn("two", "second").await.unwrap().text, "reply:second");
+    assert_eq!(f.spawns().len(), 1, "{:?}", f.events());
+    f.dispose().await;
+}
+
+#[tokio::test]
+async fn claude_turn_still_answering_keeps_rejecting_overlap() {
+    let f = Fixture::new(true, Duration::from_secs(30)).await;
+    let first = f
+        .handle
+        .start_turn(Fixture::input("one", "hang"))
+        .await
+        .unwrap();
+    f.wait_for_log("prompt").await;
+    let error = f
+        .handle
+        .start_turn(Fixture::input("two", "second"))
+        .await
+        .expect_err("a turn that has not answered cannot hand off");
+    assert_eq!(error.kind, RuntimeFailureKind::RuntimeBusy);
+    first.interrupt().await;
+    assert!(f.events().iter().all(|v| v["prompt"] != "second"));
+    f.dispose().await;
+}
+
+#[tokio::test]
+async fn claude_background_work_without_retention_keeps_rejecting_overlap() {
+    let f = Fixture::new(false, Duration::from_secs(30)).await;
+    let first = Running::new(
+        f.handle
+            .start_turn(Fixture::input("one", "spawn-bg"))
+            .await
+            .unwrap(),
+    );
+    f.wait_for_log("bg-start").await;
+    let error = f
+        .handle
+        .start_turn(Fixture::input("two", "second"))
+        .await
+        .expect_err("a one-shot process exits with its turn and cannot be handed off");
+    assert_eq!(error.kind, RuntimeFailureKind::RuntimeBusy);
+    f.release_background();
+    let (_, result) = first.finish().await;
+    // One-shot behavior is unchanged; whether this fixture prints its
+    // follow-up before stdin closes is a race outside this test's scope.
+    assert!(result.unwrap().text.starts_with("LAUNCHED"));
     f.dispose().await;
 }

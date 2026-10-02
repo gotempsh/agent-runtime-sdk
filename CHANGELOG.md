@@ -7,6 +7,18 @@ Versioning and Keep a Changelog conventions.
 
 ### Fixed
 
+- Claude background subagents survive a new prompt on a retained process.
+  A retained Claude turn that has answered and is only running background
+  work now hands its live process to the next turn instead of rejecting it as
+  `RuntimeBusy`, so applications no longer have to interrupt the turn (killing
+  the subagents) to deliver a follow-up message. The next turn inherits the
+  running tasks and receives their events and Claude's answer to their
+  completion. A retained turn also no longer ends the moment its background
+  work drains: it waits for Claude's follow-up answer (bounded by a short quiet
+  grace), which previously reached the idle process and retired it.
+  `RuntimeTurnExecutor::request_retained_handoff` and the
+  `AgentAdapter::retained_handoff_ready`, `inherit_retained_handoff` and
+  `retained_completion_grace` hooks are additive with no-op defaults.
 - OpenCode's compaction summary is no longer streamed as assistant text. Its
   cost still counts: OpenCode turn cost is now the sum of every assistant
   message in the turn instead of the last message's cost.

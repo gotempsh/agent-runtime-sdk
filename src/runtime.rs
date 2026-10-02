@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{oneshot, Mutex as AsyncMutex, Notify, OwnedSemaphorePermit, Semaphore};
 
 use crate::adapter::{AdapterState, AgentAdapter, CommandSpec, IdleFrame, InteractionRequest};
 use crate::error::classify_provider_failure;
@@ -209,7 +209,70 @@ struct RetainedCodexProcess {
     process_hint: Option<u64>,
     session_id: AsyncMutex<Option<String>>,
     permit: AsyncMutex<Option<OwnedSemaphorePermit>>,
+    handoff: RetainedHandoff,
 }
+
+/// Hand-off of a live process from an active turn to the next one.
+///
+/// The active turn publishes whether it could yield; a requester parks a
+/// reply channel and wakes it; the active turn answers and, on `true`,
+/// completes while leaving its parser state behind for the next claim.
+#[derive(Default)]
+struct RetainedHandoff {
+    ready: AtomicBool,
+    wake: Notify,
+    request: Mutex<Option<oneshot::Sender<bool>>>,
+    /// Parser state of the turn that yielded, until the next turn claims it.
+    inherited: Mutex<Option<AdapterState>>,
+}
+
+impl RetainedHandoff {
+    fn take_request(&self) -> Option<oneshot::Sender<bool>> {
+        self.request
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+
+    fn take_inherited(&self) -> Option<AdapterState> {
+        self.inherited
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+
+    fn pending(&self) -> bool {
+        self.inherited
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
+    }
+
+    /// Answer a parked request from the active turn's read loop.
+    ///
+    /// Returns whether the turn must now yield. A requester that already
+    /// gave up dropped its receiver, so the send fails and the turn goes on.
+    fn answer(&self, adapter: &dyn AgentAdapter, state: &AdapterState) -> bool {
+        let Some(reply) = self.take_request() else {
+            return false;
+        };
+        let accepted = adapter.retained_handoff_ready(state);
+        reply.send(accepted).is_ok() && accepted
+    }
+}
+
+/// How a retained turn released its process.
+enum RetainedTurnEnd {
+    /// The turn reached its terminal frame.
+    Completed(TurnResult),
+    /// The turn yielded its live process to the next turn.
+    HandedOff(TurnResult, Box<AdapterState>),
+}
+
+/// Upper bound for an active turn to accept or decline a hand-off. The read
+/// loop answers immediately unless it is blocked on an approval or on event
+/// backpressure, in which case the requester sees an ordinary busy runtime.
+const HANDOFF_DECISION_TIMEOUT: Duration = Duration::from_secs(2);
 
 struct RetainedCodexIo {
     process: crate::TransportProcess,
@@ -489,6 +552,33 @@ async fn write_provider_frames(
             stream,
             source,
         })
+}
+
+/// Close a retained turn that reached its terminal frame or quiet completion.
+async fn finish_retained_turn(
+    provider: Provider,
+    request: &TurnRequest,
+    events: &dyn EventSink,
+    mut state: AdapterState,
+) -> Result<TurnResult> {
+    if let Some(failure) = state.terminal_failure.take() {
+        return Err(RuntimeError::ProcessFailed {
+            provider,
+            kind: failure.kind,
+            exit_code: None,
+            stderr: redact_secrets(&failure.diagnostic, &request.environment),
+            provider_code: failure.provider_code,
+            delivery: failure.delivery,
+        });
+    }
+    if state.result.text.is_empty() {
+        events
+            .emit(TurnEvent::Warning {
+                message: format!("{provider} completed without a text response"),
+            })
+            .await?;
+    }
+    Ok(state.result)
 }
 
 /// Stop a running provider, preferring its own cooperative interrupt.
@@ -2386,6 +2476,54 @@ impl AgentRuntime {
         result
     }
 
+    /// Ask the active turn of `runtime_id` to hand its live process to the
+    /// next turn. Returns `true` once that turn committed to completing.
+    pub(crate) async fn request_retained_handoff(
+        &self,
+        runtime_id: &crate::lifecycle::RuntimeId,
+    ) -> bool {
+        let Some(supervisor) = &self.codex_process_retention else {
+            return false;
+        };
+        let Some(process) = supervisor
+            .inner
+            .processes
+            .lock()
+            .await
+            .get(runtime_id)
+            .cloned()
+        else {
+            return false;
+        };
+        let handoff = &process.handoff;
+        if !process.usable.load(Ordering::Acquire)
+            || !handoff.ready.load(Ordering::Acquire)
+            || handoff.pending()
+        {
+            return false;
+        }
+        let (reply, mut decision) = oneshot::channel();
+        {
+            let mut slot = handoff
+                .request
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if slot.is_some() {
+                return false;
+            }
+            *slot = Some(reply);
+        }
+        handoff.wake.notify_one();
+        if let Ok(accepted) = tokio::time::timeout(HANDOFF_DECISION_TIMEOUT, &mut decision).await {
+            return accepted.unwrap_or(false);
+        }
+        drop(handoff.take_request());
+        // Closing first makes a concurrent acceptance fail its send, unless it
+        // already landed, which then must be honored.
+        decision.close();
+        decision.try_recv().unwrap_or(false)
+    }
+
     pub(crate) async fn dispose_retained_process(
         &self,
         runtime_id: &crate::lifecycle::RuntimeId,
@@ -2949,8 +3087,18 @@ impl AgentRuntime {
         let mut prefetched_line = None;
         let mut preflight_events = Vec::new();
         let mut claimed_generation = None;
+        let mut inherited_state = None;
         if provider == Provider::Claude {
             if let Some(candidate) = existing.clone() {
+                let claim = candidate.claim().await;
+                claimed_generation = claim;
+                // A process handed off by the previous turn was streaming
+                // background work until a moment ago, and that output may
+                // already be queued ahead of any probe response. It is live
+                // by construction, so it skips the probe.
+                inherited_state = claim.and_then(|_| candidate.handoff.take_inherited());
+            }
+            if let Some(candidate) = existing.clone().filter(|_| inherited_state.is_none()) {
                 events
                     .emit(TurnEvent::ProviderProcessStatus {
                         status: crate::ProviderProcessStatus::Checking,
@@ -2958,8 +3106,7 @@ impl AgentRuntime {
                             .to_string(),
                     })
                     .await?;
-                let claim = candidate.claim().await;
-                claimed_generation = claim;
+                let claim = claimed_generation;
                 let request_id =
                     format!("temps-agent-runtime-health-{}", claim.unwrap_or_default());
                 let probe = serde_json::to_vec(&serde_json::json!({
@@ -3285,6 +3432,7 @@ impl AgentRuntime {
                 process_hint: adapter.retained_process_hint(&state),
                 session_id: AsyncMutex::new(request.session_id.clone()),
                 permit: AsyncMutex::new(Some(permit)),
+                handoff: RetainedHandoff::default(),
             });
             supervisor
                 .inner
@@ -3309,6 +3457,9 @@ impl AgentRuntime {
             message: format!("retained {provider} process is no longer available"),
         })?;
         let reused = generation > 1;
+        if let Some(previous) = inherited_state.take() {
+            adapter.inherit_retained_handoff(previous, &mut state);
+        }
         if reused {
             if provider == Provider::OpenCode {
                 if let Some((writer, reader)) = prepared_protocol_streams.take() {
@@ -3358,14 +3509,41 @@ impl AgentRuntime {
                 interactions,
                 trace,
                 io,
+                &retained.handoff,
                 supervisor.inner.config,
                 state,
                 prefetched_line,
             )
             .await;
         drop(io_guard);
+        retained.handoff.ready.store(false, Ordering::Release);
         match result {
-            Ok(result) => {
+            Ok(RetainedTurnEnd::HandedOff(result, carried)) => {
+                *retained.session_id.lock().await = result.session_id.clone();
+                *retained
+                    .handoff
+                    .inherited
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(*carried);
+                cleanup.disarm();
+                // The next turn claims the process within moments. If it
+                // never does (it failed before claiming, or gave up waiting),
+                // nothing reads the process and its background work can no
+                // longer be observed, so it is retired.
+                let runtime_id = runtime_id.clone();
+                let retained = Arc::clone(&retained);
+                let supervisor = supervisor.clone();
+                let claim_deadline = supervisor.inner.config.idle_timeout;
+                tokio::spawn(async move {
+                    tokio::time::sleep(claim_deadline).await;
+                    if retained.retire_if_unclaimed(generation).await {
+                        supervisor.remove_if_same(&runtime_id, &retained).await;
+                        let _ = retained.terminate().await;
+                    }
+                });
+                Ok(result)
+            }
+            Ok(RetainedTurnEnd::Completed(result)) => {
                 *retained.session_id.lock().await = result.session_id.clone();
                 cleanup.disarm();
                 let runtime_id = runtime_id.clone();
@@ -3407,10 +3585,11 @@ impl AgentRuntime {
         interactions: &dyn InteractionHandler,
         trace: &StartupTrace,
         io: &mut RetainedCodexIo,
+        handoff: &RetainedHandoff,
         retention: ProviderProcessRetention,
         mut state: AdapterState,
         mut prefetched_line: Option<String>,
-    ) -> Result<TurnResult> {
+    ) -> Result<RetainedTurnEnd> {
         let provider = request.provider;
         let mut first_output = true;
         let mut saw_semantic_activity = false;
@@ -3426,9 +3605,56 @@ impl AgentRuntime {
                     .active_inactivity_timeout
                     .unwrap_or(request.timeout)
             };
+            let deadline = last_semantic_activity + inactivity_timeout;
             let line = if let Some(line) = prefetched_line.take() {
                 Some(line)
             } else {
+                let handoff_ready = adapter.retained_handoff_ready(&state);
+                handoff.ready.store(handoff_ready, Ordering::Release);
+                // Anchored to semantic activity like the inactivity deadline,
+                // so frames that carry nothing cannot postpone it. While armed
+                // it replaces that deadline: it is the shorter bound on a
+                // turn whose work is already done.
+                let quiet_completion = adapter
+                    .retained_completion_grace(&state)
+                    .map(|grace| last_semantic_activity + grace);
+                // Wait for the next frame to begin without consuming it, so a
+                // hand-off or a quiet completion never splits a frame that
+                // the process (and the next turn) still owns.
+                tokio::select! {
+                    _ = request.cancellation.cancelled() => {
+                        if let Some(interrupt) = adapter.interrupt_request(&state) {
+                            let _ = write_provider_frames(provider, Some(&mut io.stdin), &[interrupt], "interrupt").await;
+                        }
+                        return Err(RuntimeError::Cancelled { provider });
+                    }
+                    available = io.reader.fill_buf() => {
+                        available.map(|_| ()).map_err(|source| RuntimeError::ProcessIo {
+                            provider,
+                            stream: "stdout read",
+                            source,
+                        })?;
+                    }
+                    _ = tokio::time::sleep_until(deadline), if quiet_completion.is_none() => {
+                        return Err(RuntimeError::Timeout {
+                            provider,
+                            seconds: inactivity_timeout.as_secs(),
+                        });
+                    }
+                    () = handoff.wake.notified() => {
+                        if handoff.answer(adapter, &state) {
+                            handoff.ready.store(false, Ordering::Release);
+                            let result = std::mem::take(&mut state.result);
+                            return Ok(RetainedTurnEnd::HandedOff(result, Box::new(state)));
+                        }
+                        continue;
+                    }
+                    () = tokio::time::sleep_until(quiet_completion.unwrap_or(deadline)), if quiet_completion.is_some() => {
+                        return finish_retained_turn(provider, request, events, state)
+                            .await
+                            .map(RetainedTurnEnd::Completed);
+                    }
+                }
                 tokio::select! {
                     _ = request.cancellation.cancelled() => {
                         if let Some(interrupt) = adapter.interrupt_request(&state) {
@@ -3441,7 +3667,7 @@ impl AgentRuntime {
                         stream: "stdout read",
                         source,
                     })?,
-                    _ = tokio::time::sleep_until(last_semantic_activity + inactivity_timeout) => {
+                    _ = tokio::time::sleep_until(deadline) => {
                         return Err(RuntimeError::Timeout {
                             provider,
                             seconds: inactivity_timeout.as_secs(),
@@ -3548,24 +3774,9 @@ impl AgentRuntime {
                 }
             }
             if output.terminal {
-                if let Some(failure) = state.terminal_failure.take() {
-                    return Err(RuntimeError::ProcessFailed {
-                        provider,
-                        kind: failure.kind,
-                        exit_code: None,
-                        stderr: redact_secrets(&failure.diagnostic, &request.environment),
-                        provider_code: failure.provider_code,
-                        delivery: failure.delivery,
-                    });
-                }
-                if state.result.text.is_empty() {
-                    events
-                        .emit(TurnEvent::Warning {
-                            message: format!("{provider} completed without a text response"),
-                        })
-                        .await?;
-                }
-                return Ok(state.result);
+                return finish_retained_turn(provider, request, events, state)
+                    .await
+                    .map(RetainedTurnEnd::Completed);
             }
         }
     }

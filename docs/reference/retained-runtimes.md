@@ -57,6 +57,13 @@ the SDK never automatically replays a prompt after delivery is possible. Codex
 correlates native turn IDs, OpenCode requires the active session ID, and Claude
 retires a connection that emits ambiguous idle output.
 
+A runtime admits one invocation at a time. A second `start_turn` normally fails
+with `RuntimeBusy`; the exception is a retained Claude turn that has answered
+and is only running background subagents, which hands its live process to the
+new turn so that work keeps running. See
+[Stream Claude native subagents](../how-to/stream-claude-subagents.md#send-a-new-prompt-while-subagents-keep-working).
+Executors opt in through `RuntimeTurnExecutor::request_retained_handoff`.
+
 Use `RuntimeHandle::configuration_impact` before presenting a live setting
 change. The compatibility driver applies per-turn model, reasoning, permission,
 harness, launch-context, environment, and timeout changes live. Provider,

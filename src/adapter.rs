@@ -440,6 +440,40 @@ pub trait AgentAdapter: Send + Sync {
         let _ = state;
     }
 
+    /// Whether an active retained turn may hand its live process to the next
+    /// turn instead of rejecting that turn as busy.
+    ///
+    /// Return `true` only once the turn's own answer is complete and the
+    /// process is just running background work (such as Claude background
+    /// subagents) that continues across a new prompt. The runtime then
+    /// completes this turn and the next turn submits its prompt to the same
+    /// process, inheriting state through [`Self::inherit_retained_handoff`].
+    /// The default never hands off.
+    fn retained_handoff_ready(&self, state: &AdapterState) -> bool {
+        let _ = state;
+        false
+    }
+
+    /// Seed a turn that took over a live process from `previous`.
+    ///
+    /// Called after [`Self::prepare_turn`] and [`Self::mark_retained_turn`],
+    /// before the new prompt is written. Background work the previous turn
+    /// started keeps emitting frames that the new turn must recognize.
+    fn inherit_retained_handoff(&self, previous: AdapterState, next: &mut AdapterState) {
+        let _ = (previous, next);
+    }
+
+    /// Quiet period after which an open retained turn completes successfully.
+    ///
+    /// `Some` means the turn's work is done unless the provider produces more
+    /// output within the returned duration; any frame re-evaluates it. Claude
+    /// uses this for the follow-up answer it gives once background work
+    /// drains. The default `None` waits for a terminal frame.
+    fn retained_completion_grace(&self, state: &AdapterState) -> Option<std::time::Duration> {
+        let _ = state;
+        None
+    }
+
     /// Encode a request asking an idle retained process whether it still
     /// owns live background work for `session_id`.
     ///

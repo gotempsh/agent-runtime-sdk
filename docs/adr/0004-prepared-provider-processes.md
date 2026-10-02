@@ -38,6 +38,10 @@ they implement the lifecycle contract.
 3. On a successful turn, keep the provider connection and continue draining its
    bounded event stream. Idle tool/background events belong to the runtime and
    must not be attached to the next invocation.
+   Exception: a Claude turn that has answered while its background subagents
+   run hands the live process to the next invocation instead of going idle.
+   That invocation explicitly inherits the task set, so subagent events it
+   receives carry their original task IDs rather than being misattributed.
 4. Dispose or expire the idle process, confirming process-tree teardown. Preserve
    session identity so later work can explicitly resume from provider persistence.
 

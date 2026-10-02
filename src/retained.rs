@@ -479,6 +479,17 @@ pub trait RuntimeTurnExecutor: Send + Sync {
     async fn dispose_retained(&self, _runtime_id: &RuntimeId) -> crate::Result<()> {
         Ok(())
     }
+
+    /// Ask the active invocation of `runtime_id` to hand its live provider
+    /// process to the next invocation instead of rejecting it as busy.
+    ///
+    /// Returns `true` once the active invocation committed to completing
+    /// promptly, leaving background work it started (such as Claude
+    /// background subagents) running for the next invocation. The default
+    /// never hands off, so a busy runtime stays busy.
+    async fn request_retained_handoff(&self, _runtime_id: &RuntimeId) -> bool {
+        false
+    }
 }
 
 #[async_trait]
@@ -543,6 +554,10 @@ impl RuntimeTurnExecutor for AgentRuntime {
 
     async fn dispose_retained(&self, runtime_id: &RuntimeId) -> crate::Result<()> {
         self.dispose_retained_process(runtime_id).await
+    }
+
+    async fn request_retained_handoff(&self, runtime_id: &RuntimeId) -> bool {
+        AgentRuntime::request_retained_handoff(self, runtime_id).await
     }
 }
 
@@ -1097,7 +1112,8 @@ impl RuntimeEntry {
 
         let cancellation = CancellationToken::new();
         let terminal = Arc::new(CompletionSignal::new());
-        let provider_session_id = {
+        let mut handoff_attempted = false;
+        let provider_session_id = loop {
             let mut state = self.state.lock().await;
             if self.disposed.load(Ordering::Acquire) {
                 return Err(lifecycle_failure(
@@ -1120,6 +1136,26 @@ impl RuntimeEntry {
                 ));
             }
             if let Some(active) = &state.active {
+                // An active turn that already answered and is only running
+                // background work can yield its live process to this turn,
+                // so that work survives instead of being interrupted.
+                if !handoff_attempted && input.invocation_kind == RuntimeInvocationKind::Turn {
+                    handoff_attempted = true;
+                    let previous = Arc::clone(&active.terminal);
+                    drop(state);
+                    if self
+                        .executor
+                        .request_retained_handoff(&self.spec.runtime_id)
+                        .await
+                    {
+                        let _ = tokio::time::timeout(
+                            INTERRUPT_CONFIRMATION_TIMEOUT,
+                            previous.wait_for_completion(),
+                        )
+                        .await;
+                    }
+                    continue;
+                }
                 return Err(lifecycle_failure(
                     Some(self.spec.runtime_id.clone()),
                     Some(input.invocation_id),
@@ -1153,7 +1189,7 @@ impl RuntimeEntry {
                     state.recent_invocations.remove(&expired);
                 }
             }
-            state.provider_session_id.clone()
+            break state.provider_session_id.clone();
         };
 
         let request = self.build_request(&input, provider_session_id, cancellation.clone());
@@ -2483,6 +2519,181 @@ mod tests {
         assert_eq!(first.interrupt().await, InterruptOutcome::Interrupted);
         let result = first.wait().await.expect_err("interrupted turn must fail");
         assert_eq!(result.kind, RuntimeFailureKind::Cancelled);
+    }
+
+    /// The first turn answers, announces a session, then keeps running (as a
+    /// Claude turn does while background subagents work) until it is asked
+    /// to hand off. Later turns finish immediately and echo the session they
+    /// were asked to resume.
+    struct HandoffExecutor {
+        accept: bool,
+        handoff_requests: AtomicU64,
+        released: Notify,
+        requested_sessions: StdMutex<Vec<Option<String>>>,
+    }
+
+    impl HandoffExecutor {
+        fn new(accept: bool) -> Self {
+            Self {
+                accept,
+                handoff_requests: AtomicU64::new(0),
+                released: Notify::new(),
+                requested_sessions: StdMutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl RuntimeTurnExecutor for HandoffExecutor {
+        fn capabilities(&self, _provider: Provider) -> RuntimeDriverCapabilities {
+            RuntimeDriverCapabilities {
+                retained_process: true,
+                session_resume: true,
+                manual_compaction: true,
+                ..RuntimeDriverCapabilities::default()
+            }
+        }
+
+        fn configuration_impact(&self, _key: RuntimeConfigurationKey) -> ConfigurationImpact {
+            ConfigurationImpact::Live
+        }
+
+        async fn execute(
+            &self,
+            request: TurnRequest,
+            events: &dyn EventSink,
+            _interactions: Option<&dyn InteractionHandler>,
+        ) -> crate::Result<TurnResult> {
+            let first = {
+                let mut sessions = self
+                    .requested_sessions
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                sessions.push(request.session_id.clone());
+                sessions.len() == 1
+            };
+            if !first {
+                return Ok(TurnResult {
+                    session_id: request.session_id,
+                    text: "second".into(),
+                    ..TurnResult::default()
+                });
+            }
+            events
+                .emit(TurnEvent::SessionStarted {
+                    session_id: "handoff-session".into(),
+                    title: None,
+                })
+                .await?;
+            tokio::select! {
+                () = self.released.notified() => Ok(TurnResult {
+                    session_id: Some("handoff-session".into()),
+                    text: "first".into(),
+                    ..TurnResult::default()
+                }),
+                () = request.cancellation.cancelled() => Err(RuntimeError::Cancelled {
+                    provider: request.provider,
+                }),
+            }
+        }
+
+        async fn request_retained_handoff(&self, _runtime_id: &RuntimeId) -> bool {
+            self.handoff_requests.fetch_add(1, Ordering::AcqRel);
+            if self.accept {
+                self.released.notify_one();
+            }
+            self.accept
+        }
+    }
+
+    #[tokio::test]
+    async fn a_yielding_turn_hands_its_runtime_to_the_next_turn() {
+        let executor = Arc::new(HandoffExecutor::new(true));
+        let client = InProcessRuntimeClient::from_executor(executor.clone());
+        let handle = client
+            .acquire(runtime_spec("runtime-handoff"))
+            .await
+            .expect("acquire runtime");
+        let mut first = handle
+            .start_turn(turn_input("turn-background", "start background work"))
+            .await
+            .expect("start first turn");
+        // The session is announced before the turn starts waiting.
+        while let Some(envelope) = first.next_event().await {
+            if matches!(
+                envelope.event,
+                RuntimeEvent::ProviderEvent {
+                    event: TurnEvent::SessionStarted { .. }
+                }
+            ) {
+                break;
+            }
+        }
+        let second = handle
+            .start_turn(turn_input("turn-follow-up", "follow up"))
+            .await
+            .expect("an answered turn yields instead of rejecting the next one");
+        assert_eq!(
+            first.wait().await.expect("first turn completes").text,
+            "first"
+        );
+        assert_eq!(
+            second.wait().await.expect("second turn completes").text,
+            "second"
+        );
+        assert_eq!(executor.handoff_requests.load(Ordering::Acquire), 1);
+        assert_eq!(
+            *executor
+                .requested_sessions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            vec![None, Some("handoff-session".to_string())],
+            "the next turn resumes the session the yielding turn reported"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_turn_that_cannot_yield_keeps_the_runtime_busy() {
+        let executor = Arc::new(HandoffExecutor::new(false));
+        let client = InProcessRuntimeClient::from_executor(executor.clone());
+        let handle = client
+            .acquire(runtime_spec("runtime-handoff-declined"))
+            .await
+            .expect("acquire runtime");
+        let first = handle
+            .start_turn(turn_input("turn-working", "still answering"))
+            .await
+            .expect("start first turn");
+        let error = handle
+            .start_turn(turn_input("turn-rejected", "overlap"))
+            .await
+            .expect_err("a turn that declines the hand-off stays busy");
+        assert_eq!(error.kind, RuntimeFailureKind::RuntimeBusy);
+        assert_eq!(error.delivery, DeliveryState::NotSent);
+        assert_eq!(executor.handoff_requests.load(Ordering::Acquire), 1);
+        assert_eq!(first.interrupt().await, InterruptOutcome::Interrupted);
+    }
+
+    #[tokio::test]
+    async fn manual_compaction_never_takes_over_an_active_turn() {
+        let executor = Arc::new(HandoffExecutor::new(true));
+        let client = InProcessRuntimeClient::from_executor(executor.clone());
+        let mut spec = runtime_spec("runtime-handoff-compaction");
+        spec.provider_session_id = Some("existing-session".into());
+        let handle = client.acquire(spec).await.expect("acquire runtime");
+        let first = handle
+            .start_turn(turn_input("turn-background", "start background work"))
+            .await
+            .expect("start first turn");
+        let error = handle
+            .compact(CompactionInput::new(
+                InvocationId::new("compaction").expect("valid invocation identifier"),
+            ))
+            .await
+            .expect_err("compaction waits for the active turn");
+        assert_eq!(error.kind, RuntimeFailureKind::RuntimeBusy);
+        assert_eq!(executor.handoff_requests.load(Ordering::Acquire), 0);
+        assert_eq!(first.interrupt().await, InterruptOutcome::Interrupted);
     }
 
     #[tokio::test]

@@ -87,6 +87,10 @@ name = "claude_subagent_smoke"
 required-features = ["claude"]
 
 [[example]]
+name = "claude_background_handoff_smoke"
+required-features = ["claude"]
+
+[[example]]
 name = "agent_relay_claude_live"
 required-features = ["claude"]
 
