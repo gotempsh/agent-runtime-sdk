@@ -36,6 +36,9 @@ const MAX_WORKFLOW_LOGS: usize = 10;
 /// Bound for each workflow text field (labels, previews, log lines). Every
 /// update carries the whole workflow, so these stay short.
 const MAX_WORKFLOW_TEXT_CHARS: usize = 240;
+/// A workflow tick that only moves counters (tokens, tool calls, latest
+/// tool) is re-emitted once per this many ticks; any other change at once.
+const WORKFLOW_COUNTER_TICKS: u32 = 5;
 /// How long a retained turn waits for Claude's follow-up answer after its
 /// background tasks drain. Claude starts it immediately after the task
 /// notification, so this only bounds a notification it does not answer.
@@ -405,6 +408,9 @@ struct ClaudeNativeState {
     lifecycle_seen: bool,
     /// Claude acknowledged the runtime's native interrupt.
     interrupting: bool,
+    /// Workflow ticks since each workflow task's snapshot was last emitted.
+    #[serde(default)]
+    workflow_quiet_ticks: BTreeMap<String, u32>,
 }
 
 impl ClaudeNativeState {
@@ -2274,6 +2280,25 @@ fn parse_workflow_agent(entry: &Value) -> Option<AgentWorkflowAgent> {
     })
 }
 
+/// Whether two workflow snapshots differ only in counters a viewer can
+/// afford to see a few ticks late: tokens, tool calls, durations and the
+/// latest tool.
+fn workflow_counters_only(previous: &AgentWorkflow, next: &AgentWorkflow) -> bool {
+    let without_counters = |workflow: &AgentWorkflow| {
+        let mut workflow = workflow.clone();
+        for agent in &mut workflow.agents {
+            agent.tokens = None;
+            agent.tool_calls = None;
+            agent.duration_ms = None;
+            agent.last_progress_at_ms = None;
+            agent.last_tool_name = None;
+            agent.last_tool_summary = None;
+        }
+        workflow
+    };
+    previous != next && without_counters(previous) == without_counters(next)
+}
+
 /// Agents that are new or changed state between two workflow snapshots.
 fn changed_workflow_agents(
     previous: &AgentWorkflow,
@@ -2585,9 +2610,21 @@ fn translate_system_task(
             if task.kind == "workflow" {
                 // Every tick carries the whole workflow: replace it, and
                 // record only agents that changed state, not each tick.
+                let mut emit = true;
                 if let Some(entries) = workflow_progress {
                     let previous = task.workflow.take().unwrap_or_default();
                     let next = parse_workflow(entries, &previous);
+                    let quiet = native
+                        .workflow_quiet_ticks
+                        .entry(task_id.to_string())
+                        .or_default();
+                    if workflow_counters_only(&previous, &next) {
+                        *quiet += 1;
+                        emit = *quiet >= WORKFLOW_COUNTER_TICKS;
+                    }
+                    if emit {
+                        *quiet = 0;
+                    }
                     for agent in changed_workflow_agents(&previous, &next) {
                         output.events.push(TurnEvent::TaskActivity {
                             activity: AgentTaskActivity {
@@ -2607,7 +2644,9 @@ fn translate_system_task(
                     task.workflow = Some(next);
                 }
                 native.tasks.insert(task_id.to_string(), task);
-                emit_tasks(native, output);
+                if emit {
+                    emit_tasks(native, output);
+                }
                 return;
             }
             native.tasks.insert(task_id.to_string(), task);
@@ -4145,6 +4184,38 @@ mod tests {
         for (label, state, _) in &changes {
             assert!(seen.insert((label.clone(), *state as u8)), "{changes:?}");
         }
+    }
+
+    #[test]
+    fn counter_only_workflow_ticks_are_emitted_every_few_ticks() {
+        let adapter = Claude::default();
+        let mut state = AdapterState::default();
+        let tick = |tokens: u64, workflow_state: &str| {
+            json!({"type": "system", "subtype": "task_progress", "task_id": "wf-1",
+            "workflow_progress": [
+                {"type": "workflow_agent", "index": 1, "label": "a", "state": workflow_state,
+                 "startedAt": 1, "tokens": tokens}
+            ]})
+            .to_string()
+        };
+        let snapshots = |state: &mut AdapterState, line: String| {
+            adapter
+                .parse_line(&line, state)
+                .unwrap()
+                .events
+                .iter()
+                .filter(|event| matches!(event, TurnEvent::TasksChanged { .. }))
+                .count()
+        };
+        assert_eq!(snapshots(&mut state, tick(1, "start")), 1);
+        let emitted: usize = (2..=u64::from(WORKFLOW_COUNTER_TICKS) * 2 + 1)
+            .map(|tokens| snapshots(&mut state, tick(tokens, "start")))
+            .sum();
+        assert_eq!(emitted, 2);
+        // A state change is emitted at once, carrying the latest counters.
+        assert_eq!(snapshots(&mut state, tick(99, "done")), 1);
+        let task = take_native_state(&mut state).tasks.remove("wf-1").unwrap();
+        assert_eq!(task.workflow.unwrap().agents[0].tokens, Some(99));
     }
 
     #[test]

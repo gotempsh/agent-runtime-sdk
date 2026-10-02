@@ -10,7 +10,8 @@ Versioning and Keep a Changelog conventions.
 - Structured Claude workflows. A `workflow` task's `AgentTask::workflow`
   carries the run's phases, agents (label, phase, state, model, tokens, tool
   calls, timings, latest tool, prompt and result previews) and recent logs,
-  parsed from Claude's `workflow_progress` and replaced on every update, plus
+  parsed from Claude's `workflow_progress` and replaced on every update (a
+  tick that only moves counters is re-emitted every fifth tick), plus
   the run's name, identifier and transcript directory from the `Workflow`
   tool's result. Its `TaskActivity` now records agent state changes, with the
   changed agent in the new `AgentTaskActivity::workflow_agent`, instead of one

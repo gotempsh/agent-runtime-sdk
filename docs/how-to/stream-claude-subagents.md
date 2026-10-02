@@ -54,7 +54,8 @@ A run of Claude Code's `Workflow` tool is a task with kind `workflow`. Its
 - recent script `logs`, and `omitted_agents` beyond the bound of 100 agents.
 
 Render it as a live card rather than a log: phases as sections, one row per
-agent. For a workflow task, `TaskActivity` records only agent state changes;
+agent. A tick that only moves counters (tokens, tool calls, durations, latest
+tool) is re-emitted every fifth tick; any other change is emitted at once. For a workflow task, `TaskActivity` records only agent state changes;
 `activity.workflow_agent` is the agent that changed, and `summary` reads such
 as `scan:read completed`. Per-tick progress updates only the snapshot.
 
