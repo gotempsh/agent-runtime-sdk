@@ -55,7 +55,9 @@ A run of Claude Code's `Workflow` tool is a task with kind `workflow`. Its
 
 Render it as a live card rather than a log: phases as sections, one row per
 agent. A tick that only moves counters (tokens, tool calls, durations, latest
-tool) is re-emitted every fifth tick; any other change is emitted at once. For a workflow task, `TaskActivity` records only agent state changes;
+tool) is re-emitted at most every fifth tick, and a tick that changes nothing is
+not re-emitted; any other change is emitted at once. For a workflow task,
+`TaskActivity` records only agent state changes;
 `activity.workflow_agent` is the agent that changed, and `summary` reads such
 as `scan:read completed`. Per-tick progress updates only the snapshot.
 
@@ -79,6 +81,10 @@ provider-reported value cannot point outside the transcript directory. The
 transcript grows while the agent runs; read it again to refresh, and a line
 still being written is skipped. Keep reading local to the host that runs
 Claude: the transcript directory is a path on that host.
+
+Entries are not redacted. Tool inputs and outputs are returned as Claude
+recorded them, so they can contain secrets a tool read or printed. Filter what
+you store or log, as you would for live `ToolCall` events.
 
 ## Preserve ordering around background completion
 

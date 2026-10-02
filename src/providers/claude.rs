@@ -411,6 +411,10 @@ struct ClaudeNativeState {
     /// Workflow ticks since each workflow task's snapshot was last emitted.
     #[serde(default)]
     workflow_quiet_ticks: BTreeMap<String, u32>,
+    /// Workflow tasks whose counters changed since their snapshot was last
+    /// emitted.
+    #[serde(default)]
+    workflow_unsent: BTreeSet<String>,
 }
 
 impl ClaudeNativeState {
@@ -551,8 +555,12 @@ pub struct Claude {
 impl Claude {
     /// Rebuild the activity recorded in a Claude transcript, such as a
     /// workflow agent's (see [`AgentWorkflow::agent_transcript_path`]), as
-    /// the events a live turn would have emitted: assistant text and tool
-    /// calls with their results, bounded and redacted the same way.
+    /// the events a live turn would have emitted: assistant text, reasoning
+    /// and tool calls with their results, bounded the same way.
+    ///
+    /// Tool inputs and outputs are returned as Claude recorded them, which
+    /// can include secrets a tool read or printed; filter what you store or
+    /// log.
     ///
     /// `transcript` is the JSONL file's contents. A transcript is written
     /// while the agent runs, so a line that is not complete JSON is skipped
@@ -584,7 +592,20 @@ impl Claude {
                 .and_then(Value::as_str)
                 .filter(|timestamp| timestamp.len() <= 64)
                 .map(str::to_owned);
-            for event in output.events {
+            // A live turn streams reasoning as deltas; a transcript records
+            // it only as `thinking` blocks, which may be redacted to "".
+            let reasoning = frame
+                .pointer("/message/content")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(|block| block.get("type").and_then(Value::as_str) == Some("thinking"))
+                .filter_map(|block| block.get("thinking").and_then(Value::as_str))
+                .filter(|text| !text.is_empty())
+                .map(|text| TurnEvent::ReasoningDelta {
+                    text: text.to_owned(),
+                });
+            for event in reasoning.chain(output.events) {
                 if !matches!(
                     event,
                     TurnEvent::TextDelta { .. }
@@ -2296,7 +2317,7 @@ fn workflow_counters_only(previous: &AgentWorkflow, next: &AgentWorkflow) -> boo
         }
         workflow
     };
-    previous != next && without_counters(previous) == without_counters(next)
+    without_counters(previous) == without_counters(next)
 }
 
 /// Agents that are new or changed state between two workflow snapshots.
@@ -2599,6 +2620,14 @@ fn translate_system_task(
             } else {
                 task.kind = task_kind(Some(&task.kind), agent_type.as_deref());
             }
+            let mut changed = native.tasks.get(task_id).is_none_or(|known| {
+                known.kind != task.kind
+                    || description
+                        .as_ref()
+                        .is_some_and(|description| *description != known.description)
+                    || known.agent_type != agent_type
+                    || (summary.is_some() && known.summary != summary)
+            });
             if let Some(description) = &description {
                 task.description.clone_from(description);
             }
@@ -2610,20 +2639,18 @@ fn translate_system_task(
             if task.kind == "workflow" {
                 // Every tick carries the whole workflow: replace it, and
                 // record only agents that changed state, not each tick.
-                let mut emit = true;
+                // A tick that only moves counters, or changes nothing, is
+                // sent at most every few ticks.
+                let mut counters_changed = false;
                 if let Some(entries) = workflow_progress {
                     let previous = task.workflow.take().unwrap_or_default();
                     let next = parse_workflow(entries, &previous);
-                    let quiet = native
-                        .workflow_quiet_ticks
-                        .entry(task_id.to_string())
-                        .or_default();
-                    if workflow_counters_only(&previous, &next) {
-                        *quiet += 1;
-                        emit = *quiet >= WORKFLOW_COUNTER_TICKS;
-                    }
-                    if emit {
-                        *quiet = 0;
+                    if previous != next {
+                        if workflow_counters_only(&previous, &next) {
+                            counters_changed = true;
+                        } else {
+                            changed = true;
+                        }
                     }
                     for agent in changed_workflow_agents(&previous, &next) {
                         output.events.push(TurnEvent::TaskActivity {
@@ -2644,7 +2671,20 @@ fn translate_system_task(
                     task.workflow = Some(next);
                 }
                 native.tasks.insert(task_id.to_string(), task);
+                if counters_changed {
+                    native.workflow_unsent.insert(task_id.to_string());
+                }
+                let quiet = native
+                    .workflow_quiet_ticks
+                    .entry(task_id.to_string())
+                    .or_default();
+                *quiet += 1;
+                let emit = changed
+                    || (*quiet >= WORKFLOW_COUNTER_TICKS
+                        && native.workflow_unsent.contains(task_id));
                 if emit {
+                    *quiet = 0;
+                    native.workflow_unsent.remove(task_id);
                     emit_tasks(native, output);
                 }
                 return;
@@ -4219,6 +4259,37 @@ mod tests {
     }
 
     #[test]
+    fn workflow_ticks_that_change_nothing_are_not_emitted() {
+        let adapter = Claude::default();
+        let mut state = AdapterState::default();
+        let tick = json!({"type": "system", "subtype": "task_progress", "task_id": "wf-1",
+        "workflow_progress": [
+            {"type": "workflow_agent", "index": 1, "label": "a", "state": "start",
+             "startedAt": 1, "tokens": 5}
+        ]})
+        .to_string();
+        let bare =
+            json!({"type": "system", "subtype": "task_progress", "task_id": "wf-1"}).to_string();
+        let snapshots = |state: &mut AdapterState, line: &str| {
+            adapter
+                .parse_line(line, state)
+                .unwrap()
+                .events
+                .iter()
+                .filter(|event| matches!(event, TurnEvent::TasksChanged { .. }))
+                .count()
+        };
+        assert_eq!(snapshots(&mut state, &tick), 1);
+        let emitted: usize = (0..WORKFLOW_COUNTER_TICKS * 3)
+            .map(|n| snapshots(&mut state, if n % 2 == 0 { &tick } else { &bare }))
+            .sum();
+        assert_eq!(emitted, 0);
+        let task = take_native_state(&mut state).tasks.remove("wf-1").unwrap();
+        assert_eq!(task.kind, "workflow");
+        assert_eq!(task.workflow.unwrap().agents.len(), 1);
+    }
+
+    #[test]
     fn workflow_agent_states_are_normalized() {
         let parse = |entry: Value| parse_workflow_agent(&entry).unwrap().state;
         assert_eq!(
@@ -4323,6 +4394,38 @@ mod tests {
         assert_eq!(
             Claude::default().transcript_activity(WORKFLOW_AGENT_TRANSCRIPT, 0),
             Vec::<AgentTranscriptEntry>::new()
+        );
+    }
+
+    #[test]
+    fn a_transcript_replays_recorded_reasoning() {
+        let transcript = [
+            json!({"type": "assistant", "timestamp": "2026-01-01T00:00:00Z", "message": {
+            "role": "assistant", "content": [
+                {"type": "thinking", "thinking": "Check the notes first.", "signature": "s"},
+                {"type": "text", "text": "Done."}
+            ]}}),
+            json!({"type": "assistant", "message": {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "", "signature": "redacted"}
+            ]}}),
+        ]
+        .map(|line| line.to_string())
+        .join("\n");
+        let events: Vec<_> = Claude::default()
+            .transcript_activity(&transcript, 10)
+            .into_iter()
+            .map(|entry| entry.event)
+            .collect();
+        assert_eq!(
+            events,
+            [
+                TurnEvent::ReasoningDelta {
+                    text: "Check the notes first.".into()
+                },
+                TurnEvent::TextDelta {
+                    text: "Done.".into()
+                },
+            ]
         );
     }
 

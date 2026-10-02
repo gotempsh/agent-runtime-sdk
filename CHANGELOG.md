@@ -16,8 +16,9 @@ Versioning and Keep a Changelog conventions.
   tool's result. Its `TaskActivity` now records agent state changes, with the
   changed agent in the new `AgentTaskActivity::workflow_agent`, instead of one
   `Progress` per tick. `AgentWorkflow::agent_transcript_path` and
-  `Claude::transcript_activity` rebuild a workflow agent's own text and tool
-  calls from its transcript. `AgentTask` and `AgentTaskActivity` gain fields,
+  `Claude::transcript_activity` rebuild a workflow agent's own text, reasoning
+  and tool calls from its transcript; ticks that only move counters are sent
+  at most every fifth tick. `AgentTask` and `AgentTaskActivity` gain fields,
   so code that builds them literally must set `workflow` and `workflow_agent`;
   stored values without them still deserialize.
 
