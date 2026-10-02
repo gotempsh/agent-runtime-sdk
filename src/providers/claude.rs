@@ -880,9 +880,22 @@ impl AgentAdapter for Claude {
     fn inherit_retained_handoff(&self, mut previous: AdapterState, next: &mut AdapterState) {
         let previous = take_native_state(&mut previous);
         let mut native = take_native_state(next);
-        native.tasks = previous.tasks;
+        // Only live work crosses the hand-off. Finished tasks stay with the
+        // turn that reported them; carrying them would let a chain of
+        // hand-offs fill the bounded task table and hide new subagents.
+        native.tasks = previous
+            .tasks
+            .into_iter()
+            .filter(|(task_id, _)| previous.background_task_ids.contains(task_id))
+            .collect();
+        native.tool_use_to_task = previous
+            .tool_use_to_task
+            .into_iter()
+            .filter(|(_, task_id)| previous.background_task_ids.contains(task_id))
+            .collect();
         native.background_task_ids = previous.background_task_ids;
-        native.tool_use_to_task = previous.tool_use_to_task;
+        // Names are dropped once a tool reports its result, so these are the
+        // calls still in flight, whose results may reach the next turn.
         native.tool_names = previous.tool_names;
         native.effective_permission_mode = previous.effective_permission_mode;
         native.permission_mode_before_plan = previous.permission_mode_before_plan;
@@ -1194,10 +1207,11 @@ impl AgentAdapter for Claude {
                         let failed = block.get("is_error").and_then(Value::as_bool) == Some(true);
                         let text =
                             tool_result_text(block.get("content"), value.get("tool_use_result"));
+                        // Each call reports one result; forgetting it keeps
+                        // the map to calls still in flight.
                         let tool_name = native
                             .tool_names
-                            .get(tool_use_id)
-                            .cloned()
+                            .remove(tool_use_id)
                             .unwrap_or_else(|| "tool".to_string());
                         output.events.push(TurnEvent::ToolCall {
                             id: Some(tool_use_id.to_string()),
@@ -3365,6 +3379,72 @@ mod tests {
                 if activity.task_id == "agent-bg-1"
                     && activity.kind == AgentTaskActivityKind::Completed
         ));
+    }
+
+    #[test]
+    fn a_chain_of_handoffs_never_fills_the_task_table() {
+        let adapter = Claude::default();
+        let mut state = retained_state(&adapter);
+        for line in [BACKGROUND_STARTED, PARENT_RESULT] {
+            adapter.parse_line(line, &mut state).unwrap();
+        }
+        // A long-running subagent keeps every turn open while each turn
+        // starts and finishes another one, then hands off.
+        for turn in 0..(MAX_NATIVE_TASKS * 2) {
+            let mut next = retained_state(&adapter);
+            adapter.inherit_retained_handoff(state, &mut next);
+            state = next;
+            let task_id = format!("short-{turn}");
+            let started = adapter
+                .parse_line(
+                    &format!(
+                        r#"{{"type":"system","subtype":"task_started","task_id":"{task_id}","tool_use_id":"toolu_{task_id}","description":"Short task","task_type":"local_agent","is_backgrounded":true}}"#
+                    ),
+                    &mut state,
+                )
+                .unwrap();
+            assert!(
+                started.events.iter().any(|event| matches!(
+                    event,
+                    TurnEvent::TaskActivity { activity } if activity.task_id == task_id
+                )),
+                "turn {turn} stopped tracking new subagents"
+            );
+            adapter
+                .parse_line(
+                    &format!(
+                        r#"{{"type":"assistant","parent_tool_use_id":"toolu_{task_id}","message":{{"content":[{{"type":"tool_use","id":"toolu_call_{task_id}","name":"Bash","input":{{}}}}]}}}}"#
+                    ),
+                    &mut state,
+                )
+                .unwrap();
+            adapter
+                .parse_line(
+                    &format!(
+                        r#"{{"type":"user","parent_tool_use_id":"toolu_{task_id}","message":{{"content":[{{"type":"tool_result","tool_use_id":"toolu_call_{task_id}","content":"ok"}}]}}}}"#
+                    ),
+                    &mut state,
+                )
+                .unwrap();
+            adapter
+                .parse_line(
+                    &format!(
+                        r#"{{"type":"system","subtype":"task_notification","task_id":"{task_id}","status":"completed"}}"#
+                    ),
+                    &mut state,
+                )
+                .unwrap();
+            adapter.parse_line(PARENT_RESULT, &mut state).unwrap();
+        }
+        let native = peek_native_state(&state).unwrap();
+        assert!(native.tasks.len() <= 2, "{:?}", native.tasks.keys());
+        assert!(native.tool_use_to_task.len() <= 2);
+        assert!(
+            native.tool_names.is_empty() || native.tool_names.len() <= 1,
+            "answered tool calls are forgotten: {:?}",
+            native.tool_names
+        );
+        assert!(native.background_task_ids.contains("agent-bg-1"));
     }
 
     #[test]

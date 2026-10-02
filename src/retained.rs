@@ -1016,6 +1016,11 @@ struct ActiveTurn {
     invocation_id: InvocationId,
     cancellation: CancellationToken,
     terminal: Arc<CompletionSignal>,
+    /// Completed once the executor returned, before the terminal event is
+    /// delivered. A turn that handed its process off holds nothing after
+    /// this point, so the next turn may be admitted without waiting for the
+    /// application to read the previous turn's events.
+    released: Arc<CompletionSignal>,
 }
 
 impl RuntimeEntry {
@@ -1112,7 +1117,9 @@ impl RuntimeEntry {
 
         let cancellation = CancellationToken::new();
         let terminal = Arc::new(CompletionSignal::new());
+        let released = Arc::new(CompletionSignal::new());
         let mut handoff_attempted = false;
+        let mut handoff_accepted = false;
         let provider_session_id = loop {
             let mut state = self.state.lock().await;
             if self.disposed.load(Ordering::Acquire) {
@@ -1135,19 +1142,27 @@ impl RuntimeEntry {
                     "the invocation identifier was already accepted by this runtime",
                 ));
             }
-            if let Some(active) = &state.active {
+            // The previous turn handed its process to this one and its executor
+            // returned; it may still be delivering its terminal event, which
+            // must not hold up the process it no longer owns.
+            let handed_off = handoff_accepted
+                && state
+                    .active
+                    .as_ref()
+                    .is_some_and(|active| active.released.is_complete());
+            if let Some(active) = state.active.as_ref().filter(|_| !handed_off) {
                 // An active turn that already answered and is only running
                 // background work can yield its live process to this turn,
                 // so that work survives instead of being interrupted.
                 if !handoff_attempted && input.invocation_kind == RuntimeInvocationKind::Turn {
                     handoff_attempted = true;
-                    let previous = Arc::clone(&active.terminal);
+                    let previous = Arc::clone(&active.released);
                     drop(state);
-                    if self
+                    handoff_accepted = self
                         .executor
                         .request_retained_handoff(&self.spec.runtime_id)
-                        .await
-                    {
+                        .await;
+                    if handoff_accepted {
                         let _ = tokio::time::timeout(
                             INTERRUPT_CONFIRMATION_TIMEOUT,
                             previous.wait_for_completion(),
@@ -1179,6 +1194,7 @@ impl RuntimeEntry {
                 invocation_id: input.invocation_id.clone(),
                 cancellation: cancellation.clone(),
                 terminal: Arc::clone(&terminal),
+                released: Arc::clone(&released),
             });
             state.recent_invocations.insert(input.invocation_id.clone());
             state
@@ -1208,6 +1224,7 @@ impl RuntimeEntry {
         };
         let entry = Arc::clone(self);
         let task_terminal = Arc::clone(&terminal);
+        let task_released = Arc::clone(&released);
         let task_invocation_id = invocation_id.clone();
         let invocation_kind = input.invocation_kind;
         tokio::spawn(async move {
@@ -1248,6 +1265,30 @@ impl RuntimeEntry {
                     task_invocation_id.clone(),
                 )),
             };
+            // A provider session exists as soon as the provider announces it,
+            // not only once the turn succeeds. An interrupted or failed turn
+            // still leaves that session on disk with the conversation so far;
+            // forgetting it would make the next turn start a fresh session
+            // with no history. Record it before releasing the runtime, so a
+            // turn admitted through a hand-off resumes it.
+            let session_id = result
+                .as_ref()
+                .ok()
+                .and_then(|turn| turn.session_id.clone())
+                .or_else(|| sink.announced_session_id());
+            {
+                let mut state = entry.state.lock().await;
+                let owns = state
+                    .active
+                    .as_ref()
+                    .is_some_and(|active| active.invocation_id == task_invocation_id);
+                if owns {
+                    if let Some(session_id) = session_id {
+                        state.provider_session_id = Some(session_id);
+                    }
+                }
+            }
+            task_released.complete(CompletionKind::Finished);
             let _ = sink.close_open_compaction(result.is_ok()).await;
             let terminal_event = match &result {
                 Ok(turn) => RuntimeEvent::InvocationCompleted {
@@ -1274,28 +1315,15 @@ impl RuntimeEntry {
             } else {
                 CompletionKind::Finished
             };
+            let mut state = entry.state.lock().await;
+            // A turn admitted through a hand-off already owns the runtime;
+            // this late completion must not overwrite its status.
+            if state
+                .active
+                .as_ref()
+                .is_some_and(|active| active.invocation_id == task_invocation_id)
             {
-                let mut state = entry.state.lock().await;
-                if state
-                    .active
-                    .as_ref()
-                    .is_some_and(|active| active.invocation_id == task_invocation_id)
-                {
-                    state.active = None;
-                }
-                // A provider session exists as soon as the provider announces
-                // it, not only once the turn succeeds. An interrupted or
-                // failed turn still leaves that session on disk with the
-                // conversation so far; forgetting it would make the next
-                // turn start a fresh session with no history.
-                let session_id = result
-                    .as_ref()
-                    .ok()
-                    .and_then(|turn| turn.session_id.clone())
-                    .or_else(|| sink.announced_session_id());
-                if let Some(session_id) = session_id {
-                    state.provider_session_id = Some(session_id);
-                }
+                state.active = None;
                 match &result {
                     Ok(_) => state.detail = None,
                     Err(failure) => state.detail = Some(failure.message.clone()),
@@ -1316,6 +1344,7 @@ impl RuntimeEntry {
                     RuntimeStatus::Ready
                 };
             }
+            drop(state);
             task_terminal.complete(completion_kind);
             let _ = completion_sender.send(result);
         });
@@ -1704,6 +1733,10 @@ impl CompletionSignal {
             Ordering::Release,
         );
         self.notify.notify_waiters();
+    }
+
+    fn is_complete(&self) -> bool {
+        self.state.load(Ordering::Acquire) != Self::RUNNING
     }
 
     async fn wait_for_completion(&self) -> CompletionKind {
@@ -2527,6 +2560,8 @@ mod tests {
     /// were asked to resume.
     struct HandoffExecutor {
         accept: bool,
+        /// Events the first turn emits before it waits, to fill its channel.
+        filler_events: usize,
         handoff_requests: AtomicU64,
         released: Notify,
         requested_sessions: StdMutex<Vec<Option<String>>>,
@@ -2536,6 +2571,7 @@ mod tests {
         fn new(accept: bool) -> Self {
             Self {
                 accept,
+                filler_events: 0,
                 handoff_requests: AtomicU64::new(0),
                 released: Notify::new(),
                 requested_sessions: StdMutex::new(Vec::new()),
@@ -2585,6 +2621,13 @@ mod tests {
                     title: None,
                 })
                 .await?;
+            for _ in 0..self.filler_events {
+                events
+                    .emit(TurnEvent::TextDelta {
+                        text: "background progress".into(),
+                    })
+                    .await?;
+            }
             tokio::select! {
                 () = self.released.notified() => Ok(TurnResult {
                     session_id: Some("handoff-session".into()),
@@ -2650,6 +2693,66 @@ mod tests {
             vec![None, Some("handoff-session".to_string())],
             "the next turn resumes the session the yielding turn reported"
         );
+    }
+
+    #[tokio::test]
+    async fn an_accepted_handoff_does_not_wait_for_the_previous_turn_to_be_read() {
+        // The application has not read the first turn's events, so its
+        // channel is full and its terminal event cannot be delivered yet.
+        // `InvocationStarted` and `SessionStarted` take two slots.
+        let mut executor = HandoffExecutor::new(true);
+        executor.filler_events = EVENT_CHANNEL_CAPACITY - 2;
+        let executor = Arc::new(executor);
+        let client = InProcessRuntimeClient::from_executor(executor.clone());
+        let handle = client
+            .acquire(runtime_spec("runtime-handoff-backpressure"))
+            .await
+            .expect("acquire runtime");
+        let first = handle
+            .start_turn(turn_input("turn-unread", "start background work"))
+            .await
+            .expect("start first turn");
+        let second = tokio::time::timeout(
+            Duration::from_secs(2),
+            handle.start_turn(turn_input("turn-follow-up", "follow up")),
+        )
+        .await
+        .expect("admission does not wait for the unread terminal event")
+        .expect("an accepted hand-off admits the next turn");
+        assert_eq!(executor.handoff_requests.load(Ordering::Acquire), 1);
+        assert_eq!(
+            second.wait().await.expect("second turn completes").text,
+            "second"
+        );
+        assert_eq!(
+            executor
+                .requested_sessions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .last()
+                .cloned()
+                .flatten()
+                .as_deref(),
+            Some("handoff-session")
+        );
+        assert_eq!(handle.health().await.status, RuntimeStatus::Ready);
+
+        // The first turn's stream still ends with its own terminal event,
+        // and its late completion leaves the runtime's state alone.
+        let (mut stream, completion) = first.into_parts();
+        let mut last = None;
+        while let Some(envelope) = stream.next().await {
+            last = Some(envelope.event);
+        }
+        assert!(matches!(
+            last,
+            Some(RuntimeEvent::InvocationCompleted { ref result }) if result.text == "first"
+        ));
+        assert_eq!(
+            completion.wait().await.expect("first completes").text,
+            "first"
+        );
+        assert_eq!(handle.health().await.status, RuntimeStatus::Ready);
     }
 
     #[tokio::test]
