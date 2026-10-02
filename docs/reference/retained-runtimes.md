@@ -50,7 +50,8 @@ runtime that reaches capacity runs through the ordinary one-process turn path;
 existing retained runtimes remain warm and usable without waiting for an idle
 slot.
 Crash, failed health checks, cancellation, timeout, dropped turn futures, and
-disposal retire the process tree. Before submitting a later prompt, Claude uses
+disposal retire the process tree, except that a confirmed cooperative Claude
+interrupt keeps it (see below). Before submitting a later prompt, Claude uses
 a bounded read-only control probe and OpenCode checks its loopback health endpoint
 through a fresh per-turn bridge. A pre-submission failure may start a replacement;
 the SDK never automatically replays a prompt after delivery is possible. Codex
@@ -63,6 +64,22 @@ and is only running background subagents, which hands its live process to the
 new turn so that work keeps running. See
 [Stream Claude native subagents](../how-to/stream-claude-subagents.md#send-a-new-prompt-while-subagents-keep-working).
 Executors opt in through `RuntimeTurnExecutor::request_retained_handoff`.
+
+When `RuntimeDriverCapabilities::live_messages` is set, `TurnHandle::send_message`
+(or a cloned `TurnHandle::message_handle`) delivers further user input into the
+active invocation, which answers it before completing. A message is accepted
+only while that invocation still owns the process; afterwards it fails with
+`InvalidRequest` and `DeliveryState::NotSent`, so the application can start a
+new turn with it. Executors implement `RuntimeTurnExecutor::send_retained_message`;
+adapters implement `AgentAdapter::encode_user_message`.
+
+Interrupting a retained Claude invocation is cooperative: it stops foreground
+work and queued messages, then keeps the process. A process with background
+work stays parked, and its output and approval requests are buffered for the
+next invocation (at most 1,024 events and 16 approvals; overflow is reported as
+a warning on that invocation). Adapters opt in through
+`AgentAdapter::retained_interrupt_settled` and `retained_background_work`. An
+interrupt that is not confirmed within three seconds retires the process.
 
 Use `RuntimeHandle::configuration_impact` before presenting a live setting
 change. The compatibility driver applies per-turn model, reasoning, permission,

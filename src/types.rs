@@ -72,6 +72,12 @@ pub struct TurnCapabilities {
     /// when it ends, so an application can show an in-progress state instead
     /// of only a completed boundary.
     pub compaction_lifecycle: bool,
+    /// On a retained process, the adapter can deliver another user message
+    /// into a turn that is still running ([`crate::retained::TurnHandle::send_message`])
+    /// and stops only the turn's foreground work on interruption, leaving
+    /// background tasks running for the next turn.
+    #[serde(default)]
+    pub live_messages: bool,
 }
 
 impl fmt::Debug for LaunchContext {

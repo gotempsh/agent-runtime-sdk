@@ -474,6 +474,35 @@ pub trait AgentAdapter: Send + Sync {
         None
     }
 
+    /// Encode another user message for a turn that is still running.
+    ///
+    /// The adapter records the message as belonging to the turn, so the turn
+    /// ends only once the provider has answered it too. `Ok(None)` — the
+    /// default — means the provider cannot accept input mid-turn.
+    fn encode_user_message(&self, text: &str, state: &mut AdapterState) -> Result<Option<Vec<u8>>> {
+        let _ = (text, state);
+        Ok(None)
+    }
+
+    /// Whether a retained turn that was sent [`Self::interrupt_request`] has
+    /// finished unwinding, so its process can be kept instead of terminated.
+    ///
+    /// `None` — the default — means the adapter does not keep a process
+    /// across interruption: the runtime terminates it as soon as the turn is
+    /// cancelled. `Some(false)` keeps reading, bounded by a short deadline.
+    fn retained_interrupt_settled(&self, state: &AdapterState) -> Option<bool> {
+        let _ = state;
+        None
+    }
+
+    /// Whether the process still runs background work started by earlier
+    /// turns. A retained process doing so is kept alive between turns, its
+    /// output buffered for the next turn, instead of expiring when idle.
+    fn retained_background_work(&self, state: &AdapterState) -> bool {
+        let _ = state;
+        false
+    }
+
     /// Encode a request asking an idle retained process whether it still
     /// owns live background work for `session_id`.
     ///

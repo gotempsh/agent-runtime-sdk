@@ -30,6 +30,10 @@ const MAX_TASK_FIELD_CHARS: usize = 4_000;
 /// background tasks drain. Claude starts it immediately after the task
 /// notification, so this only bounds a notification it does not answer.
 const FOLLOW_UP_GRACE: Duration = Duration::from_secs(3);
+/// Request ID of the native interrupt the runtime sends to a retained turn.
+const INTERRUPT_REQUEST_ID: &str = "temps-agent-runtime-interrupt";
+/// Upper bound on user messages one turn may submit, its prompt included.
+const MAX_TURN_MESSAGES: usize = 32;
 
 // This helper runs on the selected execution host. It reads Claude Code's
 // existing OAuth credential without modifying it and prints only normalized
@@ -383,6 +387,95 @@ struct ClaudeNativeState {
     /// Every background task finished after the result; Claude normally
     /// answers each notification with a follow-up turn that may still start.
     awaiting_follow_up: bool,
+    /// Lifecycle of each user message this turn submitted, keyed by the
+    /// message UUID Claude echoes in `command_lifecycle` frames.
+    own_commands: BTreeMap<String, String>,
+    /// The CLI reports `command_lifecycle`, so turn completion can wait for
+    /// this turn's own messages instead of trusting the first `result`.
+    lifecycle_seen: bool,
+    /// Claude acknowledged the runtime's native interrupt.
+    interrupting: bool,
+}
+
+impl ClaudeNativeState {
+    /// Every message this turn submitted has finished (answered or cancelled).
+    ///
+    /// A message written but not yet reported (`pending`) is unfinished: a
+    /// reply Claude was already composing can arrive before it is queued.
+    fn own_commands_done(&self) -> bool {
+        !self.lifecycle_seen
+            || self
+                .own_commands
+                .values()
+                .all(|state| !matches!(state.as_str(), "pending" | "queued" | "started"))
+    }
+
+    /// This turn's own exchange is over: Claude has answered every message the
+    /// turn submitted and is not composing an answer of its own.
+    fn answered(&self) -> bool {
+        self.result_seen && !self.follow_up_active && self.own_commands_done()
+    }
+}
+
+/// Generate a random RFC 4122 version 4 UUID for a submitted user message.
+///
+/// Claude stores it as the transcript message ID, so it must be unique; it
+/// need not be unpredictable.
+fn new_message_uuid() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    let mut bytes = [0_u8; 16];
+    for (half, chunk) in bytes.chunks_mut(8).enumerate() {
+        let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+        hasher.write_u64(sequence);
+        hasher.write_u128(now);
+        hasher.write_usize(half);
+        chunk.copy_from_slice(&hasher.finish().to_le_bytes());
+    }
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
+}
+
+/// Encode one stream-JSON user message carrying `uuid` for lifecycle tracking.
+fn user_message_frame(text: &str, uuid: Option<&str>) -> Result<Vec<u8>> {
+    let mut frame = json!({
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": [{"type": "text", "text": text}]
+        },
+        "parent_tool_use_id": null
+    });
+    if let Some(uuid) = uuid {
+        frame["uuid"] = Value::String(uuid.to_string());
+    }
+    serde_json::to_vec(&frame).map_err(|error| RuntimeError::Protocol {
+        provider: Provider::Claude,
+        message: format!("could not encode user message: {error}"),
+    })
+}
+
+fn interrupt_frame() -> Option<Vec<u8>> {
+    serde_json::to_vec(&json!({
+        "type": "control_request",
+        "request_id": INTERRUPT_REQUEST_ID,
+        "request": { "subtype": "interrupt" }
+    }))
+    .ok()
 }
 
 fn claude_permission_mode(value: &str) -> PermissionMode {
@@ -853,8 +946,69 @@ impl AgentAdapter for Claude {
     fn prepare_turn(&self, request: &TurnRequest, state: &mut AdapterState) -> Result<()> {
         let mut native = take_native_state(state);
         native.manual_compaction_turn = is_manual_compaction_prompt(&request.prompt);
+        native
+            .own_commands
+            .insert(new_message_uuid(), "pending".to_string());
         put_native_state(state, native);
         Ok(())
+    }
+
+    fn command_for_turn(&self, request: &TurnRequest, state: &AdapterState) -> Result<CommandSpec> {
+        let mut spec = self.command(request)?;
+        // The prompt carries the UUID `prepare_turn` registered, so the
+        // `command_lifecycle` frames for it are recognized as this turn's.
+        let uuid =
+            peek_native_state(state).and_then(|native| native.own_commands.keys().next().cloned());
+        if let Some(uuid) = uuid {
+            spec.initial_stdin = Some(user_message_frame(&request.prompt, Some(&uuid))?);
+        }
+        Ok(spec)
+    }
+
+    fn encode_user_message(&self, text: &str, state: &mut AdapterState) -> Result<Option<Vec<u8>>> {
+        let mut native = take_native_state(state);
+        let outcome = if !native.retained_turn {
+            // A one-shot process closes stdin once it answers, so there is no
+            // channel to deliver a later message on.
+            Ok(None)
+        } else if native.own_commands.len() >= MAX_TURN_MESSAGES {
+            Err(RuntimeError::InvalidRequest {
+                field: "message",
+                message: format!("a turn accepts at most {MAX_TURN_MESSAGES} user messages"),
+            })
+        } else {
+            let uuid = new_message_uuid();
+            native
+                .own_commands
+                .insert(uuid.clone(), "pending".to_string());
+            user_message_frame(text, Some(&uuid)).map(Some)
+        };
+        put_native_state(state, native);
+        outcome
+    }
+
+    fn interrupt_request(&self, state: &AdapterState) -> Option<Vec<u8>> {
+        // A one-shot process is terminated with its turn; only a retained
+        // process survives to unwind cooperatively.
+        peek_native_state(state)
+            .is_some_and(|native| native.retained_turn)
+            .then(interrupt_frame)
+            .flatten()
+    }
+
+    fn retained_interrupt_settled(&self, state: &AdapterState) -> Option<bool> {
+        let native = peek_native_state(state)?;
+        // Answered, including every message the turn submitted (an
+        // interrupted one ends `cancelled`): nothing of this turn still runs.
+        native.retained_turn.then(|| native.answered())
+    }
+
+    fn retained_background_work(&self, state: &AdapterState) -> bool {
+        peek_native_state(state).is_some_and(|native| {
+            !native.background_task_ids.is_empty()
+                || native.follow_up_active
+                || native.awaiting_follow_up
+        })
     }
 
     fn mark_retained_turn(&self, state: &mut AdapterState) {
@@ -870,8 +1024,7 @@ impl AgentAdapter for Claude {
         state.terminal_failure.is_none()
             && peek_native_state(state).is_some_and(|native| {
                 native.retained_turn
-                    && native.result_seen
-                    && !native.follow_up_active
+                    && native.answered()
                     && !native.awaiting_follow_up
                     && !native.background_task_ids.is_empty()
             })
@@ -899,6 +1052,7 @@ impl AgentAdapter for Claude {
         native.tool_names = previous.tool_names;
         native.effective_permission_mode = previous.effective_permission_mode;
         native.permission_mode_before_plan = previous.permission_mode_before_plan;
+        native.lifecycle_seen = previous.lifecycle_seen;
         put_native_state(next, native);
     }
 
@@ -908,6 +1062,7 @@ impl AgentAdapter for Claude {
                 native.retained_turn
                     && native.awaiting_follow_up
                     && native.background_task_ids.is_empty()
+                    && native.own_commands_done()
             })
             .then_some(FOLLOW_UP_GRACE)
     }
@@ -918,6 +1073,7 @@ impl AgentAdapter for Claude {
             // compacting and `compact_boundary` (or a failed compact result)
             // when it ends, for automatic and manual compaction alike.
             compaction_lifecycle: true,
+            live_messages: true,
             ..TurnCapabilities::default()
         }
     }
@@ -1308,8 +1464,11 @@ impl AgentAdapter for Claude {
                 // Claude can emit its terminal result before background Task
                 // subagents finish. Keep stdin available for their approvals
                 // and continue reading task progress until the native task set
-                // clears and the provider exits.
-                output.terminal = native.background_task_ids.is_empty();
+                // clears and the provider exits. A retained turn also waits for
+                // every message it submitted: a message sent mid-turn may be
+                // answered by this result or by a later exchange.
+                output.terminal = native.background_task_ids.is_empty()
+                    && (!native.retained_turn || native.own_commands_done());
                 let failed = value.get("is_error").and_then(Value::as_bool) == Some(true);
                 state.result.status = if failed {
                     let diagnostic = value
@@ -1384,6 +1543,47 @@ impl AgentAdapter for Claude {
                 super::merge_usage(&mut state.result.usage, &usage);
                 if usage != crate::Usage::default() {
                     output.events.push(TurnEvent::Usage(usage));
+                }
+            }
+            "command_lifecycle" => {
+                let command = value.get("command_uuid").and_then(Value::as_str);
+                let lifecycle = value.get("state").and_then(Value::as_str);
+                if let (Some(command), Some(lifecycle)) = (command, lifecycle) {
+                    native.lifecycle_seen = true;
+                    if let Some(tracked) = native.own_commands.get_mut(command) {
+                        *tracked = bounded(lifecycle);
+                        // Stopping a turn stops every message it submitted,
+                        // including ones Claude had queued behind the
+                        // interrupted exchange.
+                        if native.interrupting && lifecycle == "started" {
+                            output.writes.extend(interrupt_frame());
+                        }
+                    } else if lifecycle == "started" && native.result_seen {
+                        // A command this turn did not submit: Claude answering
+                        // a task notification on its own. Its exchange ends
+                        // with a result that belongs to this turn.
+                        native.follow_up_active = true;
+                        native.awaiting_follow_up = false;
+                    }
+                    // A turn whose last own message just finished ends here,
+                    // unless Claude may still answer drained background work.
+                    if native.retained_turn
+                        && !native.interrupting
+                        && !native.awaiting_follow_up
+                        && native.answered()
+                        && native.background_task_ids.is_empty()
+                    {
+                        output.terminal = true;
+                    }
+                }
+            }
+            "control_response" => {
+                if value
+                    .pointer("/response/request_id")
+                    .and_then(Value::as_str)
+                    == Some(INTERRUPT_REQUEST_ID)
+                {
+                    native.interrupting = true;
                 }
             }
             "rate_limit_event" => {
@@ -3446,6 +3646,251 @@ mod tests {
             native.tool_names
         );
         assert!(native.background_task_ids.contains("agent-bg-1"));
+    }
+
+    fn own_uuids(state: &AdapterState) -> Vec<String> {
+        peek_native_state(state)
+            .unwrap()
+            .own_commands
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    fn lifecycle(uuid: &str, state: &str) -> String {
+        format!(r#"{{"type":"command_lifecycle","command_uuid":"{uuid}","state":"{state}"}}"#)
+    }
+
+    /// A retained turn prepared like the runtime does, with its prompt UUID.
+    fn retained_turn_with_prompt(adapter: &Claude) -> (AdapterState, String) {
+        let mut state = AdapterState::default();
+        adapter
+            .prepare_turn(
+                &TurnRequest::new(Provider::Claude, ".", "build it"),
+                &mut state,
+            )
+            .unwrap();
+        adapter.mark_retained_turn(&mut state);
+        let prompt = own_uuids(&state).remove(0);
+        (state, prompt)
+    }
+
+    #[test]
+    fn message_uuids_are_unique_version_four_uuids() {
+        let first = new_message_uuid();
+        assert_ne!(first, new_message_uuid());
+        let parts: Vec<_> = first.split('-').map(str::len).collect();
+        assert_eq!(parts, [8, 4, 4, 4, 12], "{first}");
+        assert!(first.chars().all(|c| c == '-' || c.is_ascii_hexdigit()));
+        assert_eq!(&first[14..15], "4");
+        assert!(matches!(&first[19..20], "8" | "9" | "a" | "b"), "{first}");
+    }
+
+    #[test]
+    fn the_prompt_carries_the_uuid_its_turn_tracks() {
+        let adapter = Claude::default();
+        let (state, prompt) = retained_turn_with_prompt(&adapter);
+        let request = TurnRequest::new(Provider::Claude, ".", "build it");
+        let spec = adapter.command_for_turn(&request, &state).unwrap();
+        let frame: Value = serde_json::from_slice(spec.initial_stdin.as_deref().unwrap()).unwrap();
+        assert_eq!(frame["uuid"], prompt.as_str());
+        assert_eq!(frame["message"]["content"][0]["text"], "build it");
+    }
+
+    #[test]
+    fn a_message_folded_into_the_running_reply_is_answered_by_its_turn() {
+        let adapter = Claude::default();
+        let (mut state, prompt) = retained_turn_with_prompt(&adapter);
+        for line in [lifecycle(&prompt, "queued"), lifecycle(&prompt, "started")] {
+            adapter.parse_line(&line, &mut state).unwrap();
+        }
+        let frame = adapter
+            .encode_user_message("also run the tests", &mut state)
+            .unwrap()
+            .expect("a retained turn accepts messages");
+        let frame: Value = serde_json::from_slice(&frame).unwrap();
+        let message = frame["uuid"].as_str().unwrap().to_string();
+        assert_eq!(frame["message"]["content"][0]["text"], "also run the tests");
+
+        // Claude folds the queued message into the running exchange: one
+        // result, then the prompt's own completion.
+        for line in [
+            lifecycle(&message, "queued"),
+            lifecycle(&message, "started"),
+            lifecycle(&message, "completed"),
+            PARENT_RESULT.to_string(),
+        ] {
+            assert!(
+                !adapter.parse_line(&line, &mut state).unwrap().terminal,
+                "{line}"
+            );
+        }
+        assert!(
+            adapter
+                .parse_line(&lifecycle(&prompt, "completed"), &mut state)
+                .unwrap()
+                .terminal
+        );
+    }
+
+    #[test]
+    fn a_reply_before_a_message_is_queued_does_not_end_the_turn() {
+        let adapter = Claude::default();
+        let (mut state, prompt) = retained_turn_with_prompt(&adapter);
+        for line in [
+            lifecycle(&prompt, "queued"),
+            lifecycle(&prompt, "started"),
+            PARENT_RESULT.to_string(),
+            lifecycle(&prompt, "completed"),
+        ] {
+            adapter.parse_line(&line, &mut state).unwrap();
+        }
+        // Written, but Claude has not reported it yet when another result
+        // (for example its answer to a finished task) arrives.
+        adapter.encode_user_message("next", &mut state).unwrap();
+        assert!(
+            !adapter
+                .parse_line(PARENT_RESULT, &mut state)
+                .unwrap()
+                .terminal
+        );
+        assert!(!adapter.retained_handoff_ready(&state));
+    }
+
+    #[test]
+    fn claudes_own_command_after_the_answer_is_a_follow_up() {
+        let adapter = Claude::default();
+        let (mut state, prompt) = retained_turn_with_prompt(&adapter);
+        for line in [
+            lifecycle(&prompt, "started"),
+            BACKGROUND_STARTED.to_string(),
+            PARENT_RESULT.to_string(),
+            lifecycle(&prompt, "completed"),
+            BACKGROUND_FINISHED.to_string(),
+        ] {
+            assert!(
+                !adapter.parse_line(&line, &mut state).unwrap().terminal,
+                "{line}"
+            );
+        }
+        // Claude answers the notification under a command UUID of its own.
+        assert!(
+            !adapter
+                .parse_line(&lifecycle("notification-1", "started"), &mut state)
+                .unwrap()
+                .terminal
+        );
+        assert_eq!(adapter.retained_completion_grace(&state), None);
+        assert!(
+            adapter
+                .parse_line(FOLLOW_UP_RESULT, &mut state)
+                .unwrap()
+                .terminal
+        );
+    }
+
+    #[test]
+    fn interruption_stops_queued_messages_and_settles_once_they_end() {
+        let adapter = Claude::default();
+        let (mut state, prompt) = retained_turn_with_prompt(&adapter);
+        adapter
+            .parse_line(&lifecycle(&prompt, "started"), &mut state)
+            .unwrap();
+        let queued = adapter
+            .encode_user_message("queued", &mut state)
+            .unwrap()
+            .unwrap();
+        let queued: Value = serde_json::from_slice(&queued).unwrap();
+        let queued = queued["uuid"].as_str().unwrap().to_string();
+        adapter
+            .parse_line(&lifecycle(&queued, "queued"), &mut state)
+            .unwrap();
+
+        assert_eq!(adapter.retained_interrupt_settled(&state), Some(false));
+        let interrupt: Value =
+            serde_json::from_slice(&adapter.interrupt_request(&state).unwrap()).unwrap();
+        assert_eq!(interrupt["request"]["subtype"], "interrupt");
+        adapter
+            .parse_line(
+                &format!(
+                    r#"{{"type":"control_response","response":{{"subtype":"success","request_id":"{}","response":{{"still_queued":["{queued}"]}}}}}}"#,
+                    interrupt["request_id"].as_str().unwrap()
+                ),
+                &mut state,
+            )
+            .unwrap();
+        for line in [
+            r#"{"type":"result","subtype":"error_during_execution","is_error":true,"result":""}"#
+                .to_string(),
+            lifecycle(&prompt, "cancelled"),
+        ] {
+            adapter.parse_line(&line, &mut state).unwrap();
+        }
+        assert_eq!(adapter.retained_interrupt_settled(&state), Some(false));
+        // Claude starts the queued message; the turn stops it too.
+        let started = adapter
+            .parse_line(&lifecycle(&queued, "started"), &mut state)
+            .unwrap();
+        assert_eq!(started.writes.len(), 1);
+        let again: Value = serde_json::from_slice(&started.writes[0]).unwrap();
+        assert_eq!(again["request"]["subtype"], "interrupt");
+        adapter
+            .parse_line(&lifecycle(&queued, "cancelled"), &mut state)
+            .unwrap();
+        assert_eq!(adapter.retained_interrupt_settled(&state), Some(true));
+    }
+
+    #[test]
+    fn an_answered_turn_settles_without_an_interrupt() {
+        let adapter = Claude::default();
+        let (mut state, prompt) = retained_turn_with_prompt(&adapter);
+        for line in [
+            lifecycle(&prompt, "started"),
+            BACKGROUND_STARTED.to_string(),
+            PARENT_RESULT.to_string(),
+            lifecycle(&prompt, "completed"),
+        ] {
+            adapter.parse_line(&line, &mut state).unwrap();
+        }
+        assert_eq!(adapter.retained_interrupt_settled(&state), Some(true));
+        assert!(adapter.retained_background_work(&state));
+    }
+
+    #[test]
+    fn one_shot_turns_keep_hard_cancellation_and_reject_messages() {
+        let adapter = Claude::default();
+        let mut state = AdapterState::default();
+        adapter
+            .prepare_turn(
+                &TurnRequest::new(Provider::Claude, ".", "build it"),
+                &mut state,
+            )
+            .unwrap();
+        assert!(adapter.interrupt_request(&state).is_none());
+        assert_eq!(adapter.retained_interrupt_settled(&state), None);
+        assert!(adapter
+            .encode_user_message("later", &mut state)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn a_turn_bounds_the_messages_it_accepts() {
+        let adapter = Claude::default();
+        let (mut state, _) = retained_turn_with_prompt(&adapter);
+        for _ in 1..MAX_TURN_MESSAGES {
+            adapter
+                .encode_user_message("more", &mut state)
+                .unwrap()
+                .unwrap();
+        }
+        assert!(matches!(
+            adapter.encode_user_message("one too many", &mut state),
+            Err(RuntimeError::InvalidRequest {
+                field: "message",
+                ..
+            })
+        ));
     }
 
     #[test]

@@ -52,7 +52,11 @@ submission preserves accepted/possibly-sent semantics and never replays a prompt
 Retention has bounded turn concurrency, separate global process capacity and idle
 expiration. Capacity exhaustion falls back to the ordinary cold-turn path.
 Cancellation, timeout, dropped futures, disposal and ambiguous idle output poison
-the connection and terminate its process tree before it can be reused.
+the connection and terminate its process tree before it can be reused. The one
+exception is a cancellation the provider confirms cooperatively: a retained
+Claude process acknowledges its `interrupt` control request and reports every
+command of the turn as ended, so its stream is at a known boundary and it is
+kept, together with any background work it is running.
 
 ## Configuration and credentials
 

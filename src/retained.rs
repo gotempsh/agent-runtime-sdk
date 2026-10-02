@@ -354,6 +354,11 @@ pub struct RuntimeDriverCapabilities {
     /// completed or failed event when it ends.
     #[serde(default)]
     pub compaction_lifecycle: bool,
+    /// [`TurnHandle::send_message`] delivers user messages into a running
+    /// turn, and interrupting a turn stops only its own work, keeping the
+    /// provider process and any background tasks it runs.
+    #[serde(default)]
+    pub live_messages: bool,
 }
 
 /// Runtime setting whose update impact is being inspected.
@@ -429,6 +434,19 @@ pub enum RuntimeEvent {
     },
 }
 
+/// What a running invocation did with a message sent into it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum MessageDelivery {
+    /// The message was written to the provider as part of the running turn.
+    Delivered,
+    /// No turn is running on the runtime's provider process right now.
+    NotAccepting,
+    /// The provider or driver cannot accept input while a turn runs.
+    Unsupported,
+}
+
 /// Outcome of disposing a retained runtime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -490,6 +508,19 @@ pub trait RuntimeTurnExecutor: Send + Sync {
     async fn request_retained_handoff(&self, _runtime_id: &RuntimeId) -> bool {
         false
     }
+
+    /// Deliver a user message into the invocation currently running on the
+    /// retained runtime `runtime_id`.
+    ///
+    /// The default cannot accept input mid-turn.
+    async fn send_retained_message(
+        &self,
+        _runtime_id: &RuntimeId,
+        _provider: Provider,
+        _text: String,
+    ) -> crate::Result<MessageDelivery> {
+        Ok(MessageDelivery::Unsupported)
+    }
 }
 
 #[async_trait]
@@ -513,6 +544,11 @@ impl RuntimeTurnExecutor for AgentRuntime {
             compaction_lifecycle: self
                 .turn_capabilities(provider)
                 .is_ok_and(|capabilities| capabilities.compaction_lifecycle),
+            // Input mid-turn needs a provider process that outlives one turn.
+            live_messages: self.process_retention_enabled(provider)
+                && self
+                    .turn_capabilities(provider)
+                    .is_ok_and(|capabilities| capabilities.live_messages),
         }
     }
 
@@ -558,6 +594,15 @@ impl RuntimeTurnExecutor for AgentRuntime {
 
     async fn request_retained_handoff(&self, runtime_id: &RuntimeId) -> bool {
         AgentRuntime::request_retained_handoff(self, runtime_id).await
+    }
+
+    async fn send_retained_message(
+        &self,
+        runtime_id: &RuntimeId,
+        provider: Provider,
+        text: String,
+    ) -> crate::Result<MessageDelivery> {
+        AgentRuntime::send_retained_message(self, runtime_id, provider, text).await
     }
 }
 
@@ -880,6 +925,151 @@ pub struct TurnHandle {
     events: TurnEventStream,
     completion: TurnCompletion,
     interrupt: TurnInterruptHandle,
+    messages: TurnMessageHandle,
+}
+
+/// Cloneable capability to send more user input into a running invocation.
+#[derive(Clone)]
+pub struct TurnMessageHandle {
+    backend: Arc<dyn TurnMessageBackend>,
+}
+
+#[async_trait]
+pub(crate) trait TurnMessageBackend: Send + Sync {
+    async fn send(&self, text: String) -> RetainedRuntimeResult<()>;
+}
+
+impl TurnMessageHandle {
+    pub(crate) fn from_backend(backend: Arc<dyn TurnMessageBackend>) -> Self {
+        Self { backend }
+    }
+
+    /// Delivers another user message into the running invocation.
+    ///
+    /// The provider answers it as part of the same invocation: its reply
+    /// arrives on that invocation's event stream, and the invocation
+    /// completes only once the message has been answered. Interrupting the
+    /// invocation stops queued messages too.
+    ///
+    /// Fails with `CapabilityUnavailable` unless
+    /// [`RuntimeDriverCapabilities::live_messages`] is set, and with
+    /// `InvalidRequest` once the invocation no longer runs; start a new turn
+    /// then. Both carry [`DeliveryState::NotSent`].
+    pub async fn send(&self, text: impl Into<String>) -> RetainedRuntimeResult<()> {
+        self.backend.send(text.into()).await
+    }
+}
+
+/// Message capability of a runtime client that cannot deliver input mid-turn.
+pub(crate) struct UnsupportedTurnMessages {
+    pub(crate) runtime_id: RuntimeId,
+    pub(crate) invocation_id: InvocationId,
+}
+
+#[async_trait]
+impl TurnMessageBackend for UnsupportedTurnMessages {
+    async fn send(&self, _text: String) -> RetainedRuntimeResult<()> {
+        Err(lifecycle_failure(
+            Some(self.runtime_id.clone()),
+            Some(self.invocation_id.clone()),
+            RuntimeFailureKind::CapabilityUnavailable,
+            RetryAdvice::Never,
+            DeliveryState::NotSent,
+            "this runtime client cannot deliver messages into a running invocation",
+        ))
+    }
+}
+
+struct InProcessTurnMessages {
+    entry: Arc<RuntimeEntry>,
+    invocation_id: InvocationId,
+}
+
+#[async_trait]
+impl TurnMessageBackend for InProcessTurnMessages {
+    async fn send(&self, text: String) -> RetainedRuntimeResult<()> {
+        let entry = &self.entry;
+        let failure = |kind, delivery, message: String| {
+            lifecycle_failure(
+                Some(entry.spec.runtime_id.clone()),
+                Some(self.invocation_id.clone()),
+                kind,
+                RetryAdvice::Never,
+                delivery,
+                message,
+            )
+        };
+        if text.trim().is_empty() || text.contains('\0') {
+            return Err(failure(
+                RuntimeFailureKind::InvalidRequest,
+                DeliveryState::NotSent,
+                "a message must contain text and cannot contain NUL bytes".into(),
+            ));
+        }
+        if !entry
+            .executor
+            .capabilities(entry.spec.provider)
+            .live_messages
+        {
+            return Err(failure(
+                RuntimeFailureKind::CapabilityUnavailable,
+                DeliveryState::NotSent,
+                format!(
+                    "{} on this runtime cannot accept messages while a turn runs",
+                    entry.spec.provider
+                ),
+            ));
+        }
+        let finished = || {
+            failure(
+                RuntimeFailureKind::InvalidRequest,
+                DeliveryState::NotSent,
+                format!(
+                    "invocation {} is no longer running; start a new turn instead",
+                    self.invocation_id
+                ),
+            )
+        };
+        // Held while delivering: no other invocation can be admitted and take
+        // over the provider process meanwhile, so the message reaches this
+        // invocation or none.
+        let state = entry.state.lock().await;
+        if entry.disposed.load(Ordering::Acquire) {
+            return Err(failure(
+                RuntimeFailureKind::RuntimeDisposed,
+                DeliveryState::NotSent,
+                "the retained runtime has been disposed".into(),
+            ));
+        }
+        let running = state.active.as_ref().is_some_and(|active| {
+            active.invocation_id == self.invocation_id && !active.released.is_complete()
+        });
+        if !running {
+            return Err(finished());
+        }
+        let delivery = entry
+            .executor
+            .send_retained_message(&entry.spec.runtime_id, entry.spec.provider, text)
+            .await;
+        drop(state);
+        match delivery {
+            Ok(MessageDelivery::Delivered) => Ok(()),
+            Ok(MessageDelivery::NotAccepting) => Err(finished()),
+            Ok(MessageDelivery::Unsupported) => Err(failure(
+                RuntimeFailureKind::CapabilityUnavailable,
+                DeliveryState::NotSent,
+                format!(
+                    "{} cannot accept messages while a turn runs",
+                    entry.spec.provider
+                ),
+            )),
+            Err(error) => Err(runtime_error_to_failure(
+                error,
+                entry.spec.runtime_id.clone(),
+                self.invocation_id.clone(),
+            )),
+        }
+    }
 }
 
 /// Cloneable interruption capability independent from event/completion receivers.
@@ -950,6 +1140,7 @@ impl TurnHandle {
         event_receiver: mpsc::Receiver<EventEnvelope>,
         completion_receiver: oneshot::Receiver<RetainedRuntimeResult<TurnResult>>,
         interrupt: TurnInterruptHandle,
+        messages: TurnMessageHandle,
     ) -> Self {
         Self {
             events: TurnEventStream {
@@ -963,6 +1154,7 @@ impl TurnHandle {
             runtime_id,
             invocation_id,
             interrupt,
+            messages,
         }
     }
 
@@ -979,6 +1171,18 @@ impl TurnHandle {
     /// Returns a cloneable interruption capability for a supervising host.
     pub fn interrupt_handle(&self) -> TurnInterruptHandle {
         self.interrupt.clone()
+    }
+
+    /// Returns a cloneable capability to send messages into this invocation.
+    pub fn message_handle(&self) -> TurnMessageHandle {
+        self.messages.clone()
+    }
+
+    /// Delivers another user message into this running invocation.
+    ///
+    /// See [`TurnMessageHandle::send`].
+    pub async fn send_message(&self, text: impl Into<String>) -> RetainedRuntimeResult<()> {
+        self.messages.send(text).await
     }
 
     /// Drains remaining events and waits for the terminal result.
@@ -1354,12 +1558,17 @@ impl RuntimeEntry {
             terminal,
             disposed: Arc::clone(&self.disposed),
         }));
+        let messages = TurnMessageHandle::from_backend(Arc::new(InProcessTurnMessages {
+            entry: Arc::clone(self),
+            invocation_id: invocation_id.clone(),
+        }));
         Ok(TurnHandle::from_channels(
             runtime_id,
             invocation_id,
             event_receiver,
             completion_receiver,
             interrupt,
+            messages,
         ))
     }
 
@@ -2132,6 +2341,7 @@ mod tests {
                 context_window_usage: true,
                 native_image_attachments: true,
                 compaction_lifecycle: true,
+                live_messages: false,
             }
         }
 
@@ -2552,6 +2762,174 @@ mod tests {
         assert_eq!(first.interrupt().await, InterruptOutcome::Interrupted);
         let result = first.wait().await.expect_err("interrupted turn must fail");
         assert_eq!(result.kind, RuntimeFailureKind::Cancelled);
+    }
+
+    /// Keeps its first turn running until `finish` is notified, accepting
+    /// messages into it with the configured delivery outcome.
+    struct MessageExecutor {
+        delivery: MessageDelivery,
+        messages: StdMutex<Vec<String>>,
+        finish: Notify,
+    }
+
+    impl MessageExecutor {
+        fn new(delivery: MessageDelivery) -> Self {
+            Self {
+                delivery,
+                messages: StdMutex::new(Vec::new()),
+                finish: Notify::new(),
+            }
+        }
+
+        fn messages(&self) -> Vec<String> {
+            self.messages
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+    }
+
+    #[async_trait]
+    impl RuntimeTurnExecutor for MessageExecutor {
+        fn capabilities(&self, _provider: Provider) -> RuntimeDriverCapabilities {
+            RuntimeDriverCapabilities {
+                retained_process: true,
+                session_resume: true,
+                live_messages: true,
+                ..RuntimeDriverCapabilities::default()
+            }
+        }
+
+        fn configuration_impact(&self, _key: RuntimeConfigurationKey) -> ConfigurationImpact {
+            ConfigurationImpact::Live
+        }
+
+        async fn execute(
+            &self,
+            request: TurnRequest,
+            _events: &dyn EventSink,
+            _interactions: Option<&dyn InteractionHandler>,
+        ) -> crate::Result<TurnResult> {
+            tokio::select! {
+                () = request.cancellation.cancelled() => {
+                    return Err(RuntimeError::Cancelled { provider: request.provider });
+                }
+                () = self.finish.notified() => {}
+            }
+            Ok(TurnResult {
+                status: RunStatus::Succeeded,
+                text: self.messages().join("\n"),
+                reasoning: None,
+                session_id: Some("session-1".to_owned()),
+                session_title: None,
+                model: None,
+                usage: Usage::default(),
+            })
+        }
+
+        async fn send_retained_message(
+            &self,
+            _runtime_id: &RuntimeId,
+            _provider: Provider,
+            text: String,
+        ) -> crate::Result<MessageDelivery> {
+            if self.delivery == MessageDelivery::Delivered {
+                self.messages
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(text);
+            }
+            Ok(self.delivery)
+        }
+    }
+
+    #[tokio::test]
+    async fn messages_reach_the_running_turn_and_stop_once_it_ends() {
+        let executor = Arc::new(MessageExecutor::new(MessageDelivery::Delivered));
+        let client = InProcessRuntimeClient::from_executor(executor.clone());
+        let handle = client
+            .acquire(runtime_spec("runtime-messages"))
+            .await
+            .expect("acquire runtime");
+        let turn = handle
+            .start_turn(turn_input("turn-messages", "build it"))
+            .await
+            .expect("start turn");
+        let messages = turn.message_handle();
+
+        turn.send_message("also run the tests")
+            .await
+            .expect("deliver");
+        messages
+            .send("and lint")
+            .await
+            .expect("deliver from a clone");
+        executor.finish.notify_one();
+        let result = turn.wait().await.expect("turn completes");
+        assert_eq!(result.text, "also run the tests\nand lint");
+
+        let error = messages
+            .send("too late")
+            .await
+            .expect_err("a finished turn takes no messages");
+        assert_eq!(error.kind, RuntimeFailureKind::InvalidRequest);
+        assert_eq!(error.delivery, DeliveryState::NotSent);
+        assert_eq!(executor.messages().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_message_needs_text() {
+        let executor = Arc::new(MessageExecutor::new(MessageDelivery::Delivered));
+        let client = InProcessRuntimeClient::from_executor(executor.clone());
+        let handle = client
+            .acquire(runtime_spec("runtime-empty-message"))
+            .await
+            .expect("acquire runtime");
+        let turn = handle
+            .start_turn(turn_input("turn-empty-message", "build it"))
+            .await
+            .expect("start turn");
+        for text in ["", "   ", "nul\0byte"] {
+            let error = turn.send_message(text).await.expect_err("rejected");
+            assert_eq!(error.kind, RuntimeFailureKind::InvalidRequest, "{text:?}");
+        }
+        assert_eq!(executor.messages(), Vec::<String>::new());
+        assert_eq!(turn.interrupt().await, InterruptOutcome::Interrupted);
+    }
+
+    #[tokio::test]
+    async fn a_turn_the_provider_already_finished_rejects_messages() {
+        let executor = Arc::new(MessageExecutor::new(MessageDelivery::NotAccepting));
+        let client = InProcessRuntimeClient::from_executor(executor.clone());
+        let handle = client
+            .acquire(runtime_spec("runtime-not-accepting"))
+            .await
+            .expect("acquire runtime");
+        let turn = handle
+            .start_turn(turn_input("turn-not-accepting", "build it"))
+            .await
+            .expect("start turn");
+        let error = turn.send_message("more").await.expect_err("not accepted");
+        assert_eq!(error.kind, RuntimeFailureKind::InvalidRequest);
+        assert_eq!(error.delivery, DeliveryState::NotSent);
+        assert_eq!(turn.interrupt().await, InterruptOutcome::Interrupted);
+    }
+
+    #[tokio::test]
+    async fn runtimes_without_live_messages_reject_them_up_front() {
+        let client = InProcessRuntimeClient::from_executor(Arc::new(BlockingExecutor));
+        let handle = client
+            .acquire(runtime_spec("runtime-no-messages"))
+            .await
+            .expect("acquire runtime");
+        let turn = handle
+            .start_turn(turn_input("turn-no-messages", "wait"))
+            .await
+            .expect("start turn");
+        let error = turn.send_message("more").await.expect_err("unsupported");
+        assert_eq!(error.kind, RuntimeFailureKind::CapabilityUnavailable);
+        assert_eq!(error.delivery, DeliveryState::NotSent);
+        assert_eq!(turn.interrupt().await, InterruptOutcome::Interrupted);
     }
 
     /// The first turn answers, announces a session, then keeps running (as a

@@ -20,7 +20,8 @@ use crate::protocol::{
 use crate::retained::{
     DisposeOutcome, RetainedRuntimeResult, RuntimeClient, RuntimeConfigurationKey,
     RuntimeDriverCapabilities, RuntimeHandle, RuntimeHandleBackend, RuntimeSpec, TurnHandle,
-    TurnInput, TurnInterruptBackend, TurnInterruptHandle,
+    TurnInput, TurnInterruptBackend, TurnInterruptHandle, TurnMessageHandle,
+    UnsupportedTurnMessages,
 };
 use crate::{InteractionHandler, Provider, SecretString, TurnEvent, TurnResult};
 
@@ -975,12 +976,19 @@ impl RuntimeHandleBackend for RemoteRuntimeBackend {
                                     runtime_id: self.runtime_id.clone(),
                                     invocation_id: invocation_id.clone(),
                                 });
+                            let messages = TurnMessageHandle::from_backend(Arc::new(
+                                UnsupportedTurnMessages {
+                                    runtime_id: self.runtime_id.clone(),
+                                    invocation_id: invocation_id.clone(),
+                                },
+                            ));
                             return Ok(TurnHandle::from_channels(
                                 self.runtime_id.clone(),
                                 invocation_id,
                                 event_receiver,
                                 completion_receiver,
                                 TurnInterruptHandle::from_backend(interrupt),
+                                messages,
                             ));
                         }
                     }
@@ -994,12 +1002,17 @@ impl RuntimeHandleBackend for RemoteRuntimeBackend {
             runtime_id: self.runtime_id.clone(),
             invocation_id: invocation_id.clone(),
         });
+        let messages = TurnMessageHandle::from_backend(Arc::new(UnsupportedTurnMessages {
+            runtime_id: self.runtime_id.clone(),
+            invocation_id: invocation_id.clone(),
+        }));
         Ok(TurnHandle::from_channels(
             self.runtime_id.clone(),
             invocation_id,
             event_receiver,
             completion_receiver,
             TurnInterruptHandle::from_backend(interrupt),
+            messages,
         ))
     }
 }

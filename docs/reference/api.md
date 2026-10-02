@@ -41,7 +41,8 @@ features.
 | Custom mode | yes | yes, native approval policy | yes, configured agent |
 | Live approvals | yes | app-server mode only (`exec` is configured non-interactively) | `Serve` mode only (`run` is non-interactive) |
 | Live user questions | yes | app-server mode only, blocking and async | no; OpenCode has no question channel |
-| Cooperative interrupt on cancellation | no | app-server mode only (`turn/interrupt`) | `Serve` mode only (`session/abort`) |
+| Cooperative interrupt on cancellation | retained process only (`interrupt` control request; background tasks keep running) | app-server mode only (`turn/interrupt`) | `Serve` mode only (`session/abort`) |
+| Messages into a running turn | retained process only | no | no |
 | Structured launch context | system prompt, exact tools, stdio/HTTP MCP, strict MCP | additive stdio/HTTP MCP | `Serve`: system prompt and tools as a prompt prefix, stdio/HTTP MCP; `Run`: rejected |
 | Native image attachments | no; described as prompt paths | yes (`--image`, `localImage` input) | no; described as prompt paths |
 | Prompt kept out of argv | yes | yes | no; current `run` CLI uses message args |
@@ -199,8 +200,10 @@ values. The same context type is accepted by `fetch_account_usage_with`.
 support without starting a turn.
 `launch_context_capabilities(provider)` reports field-level support for system
 instructions, tool restrictions, stdio/HTTP MCP, and strict MCP isolation.
-`turn_capabilities(provider)` reports optional per-turn behaviors, currently
-`native_image_attachments`: whether the adapter delivers `TurnRequest`
+`turn_capabilities(provider)` reports optional per-turn behaviors.
+`live_messages` says whether a retained turn accepts further user messages
+while it runs; the retained runtime reports it on `RuntimeDriverCapabilities`
+only when process retention is enabled. `native_image_attachments` says whether the adapter delivers `TurnRequest`
 attachments with an `image/*` media type as native provider image inputs
 instead of leaving them described as host paths in the prompt. The retained
 runtime mirrors the same flag on `RuntimeDriverCapabilities` and stops

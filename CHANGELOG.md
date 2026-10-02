@@ -5,7 +5,32 @@ Versioning and Keep a Changelog conventions.
 
 ## [Unreleased]
 
+### Added
+
+- Messages into a running turn. On a retained Claude process,
+  `TurnHandle::send_message` and the cloneable `TurnHandle::message_handle`
+  deliver further user input into the active invocation, which answers it on
+  its own stream and completes only once every message has been answered. A
+  message to an invocation that has ended fails with `InvalidRequest` and
+  `DeliveryState::NotSent`. Support is reported by the new `live_messages`
+  flag on `TurnCapabilities` and `RuntimeDriverCapabilities`; executors and
+  adapters opt in through `RuntimeTurnExecutor::send_retained_message` and
+  `AgentAdapter::encode_user_message`, both with defaults that decline.
+
 ### Fixed
+
+- Interrupting a retained Claude turn no longer kills its background work. The
+  interrupt is now cooperative: Claude's `interrupt` control request stops the
+  foreground reply, its tools and any queued messages, and the process is kept.
+  Background subagents and shells keep running, and their output, Claude's
+  answers to them and their approval requests are buffered (bounded) for the
+  next turn. An unconfirmed interrupt still retires the process after three
+  seconds. Adapter hooks `retained_interrupt_settled` and
+  `retained_background_work` default to the previous behavior.
+- A retained Claude turn now ends on the completion of the commands it sent,
+  correlated through Claude's `command_lifecycle` frames, instead of on the
+  first `result`. A turn whose reply finished before a queued message, or an
+  unrelated follow-up answer, no longer completes early.
 
 - Claude background subagents survive a new prompt on a retained process.
   A retained Claude turn that has answered and is only running background

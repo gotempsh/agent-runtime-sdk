@@ -56,9 +56,49 @@ state machines.
 
 ## Send a new prompt while subagents keep working
 
-A background subagent lives inside the Claude process, so interrupting the turn
-that started it kills it. With `ProviderProcessRetention` enabled, do not
-interrupt: call `RuntimeHandle::start_turn` for the new prompt first.
+A background subagent lives inside the Claude process. With
+`ProviderProcessRetention` enabled, nothing a follow-up does ends that process:
+send the user's message into the running turn, or start a new turn once the
+running one has answered, and interrupt only when the user asks to stop.
+
+### Message the running turn
+
+While a turn runs, deliver the user's next message into it:
+
+```rust,ignore
+let turn = handle.start_turn(input).await?;
+let messages = turn.message_handle(); // cloneable, outlives the stream split
+// ... later, while the turn still runs:
+match messages.send("also update the changelog").await {
+    Ok(()) => {} // answered on this turn's stream; the turn ends after it
+    Err(failure) if failure.kind == RuntimeFailureKind::InvalidRequest => {
+        // The turn has ended: start a new turn with the message instead.
+    }
+    Err(failure) => return Err(failure),
+}
+```
+
+Claude queues the message and answers it within the same exchange, usually
+folding it into the reply it is writing. Its output arrives on the running
+turn's stream, and the turn completes only once every message sent into it
+has been answered. `RuntimeDriverCapabilities::live_messages` reports support;
+without it `send` fails with `CapabilityUnavailable`. Every failure carries
+`DeliveryState::NotSent`, so retrying as a new turn never duplicates a message.
+
+### Interrupt only foreground work
+
+On a retained Claude runtime, `TurnHandle::interrupt` is cooperative. The SDK
+sends Claude's `interrupt` control request, which stops the reply being
+written, its foreground tools and any messages still queued behind it. The
+turn ends `Cancelled`, but the process and its background subagents and
+background shells keep running. Until the next turn arrives the SDK keeps
+reading the process: their events, Claude's answers to their completion, and
+any approval they request are held (bounded) and delivered at the start of
+the next turn. If Claude does not confirm the interruption within a few
+seconds, the process is retired as before. A parked process with no background
+work expires after the configured idle timeout.
+
+### Start a new turn
 
 - If the active turn has already produced its answer and is only waiting on
   background tasks, it hands its live process to the new turn. The active turn
@@ -70,8 +110,8 @@ interrupt: call `RuntimeHandle::start_turn` for the new prompt first.
   own answer is in and the inherited work has finished, or hands off again.
 - Otherwise `start_turn` still fails with `RuntimeBusy`, for example while the
   active turn is still answering or while Claude is composing its answer to a
-  finished task. Retry after the advised delay, or interrupt only if the user
-  asked to stop.
+  finished task. Send the message into the running turn instead, or retry after
+  the advised delay.
 
 ```rust,ignore
 let follow_up = match handle.start_turn(input).await {
@@ -97,6 +137,10 @@ To check the hand-off against an installed Claude CLI, run
 `cargo run --example claude_background_handoff_smoke -- haiku`. It launches a
 background subagent, sends a second prompt while it works, and passes once the
 subagent finishes and its completion reaches the second turn.
+`cargo run --example claude_live_messages_smoke -- haiku` checks the other two
+paths: a message sent during a foreground command is answered by the same
+turn, and an interrupt stops a foreground command while a background shell
+keeps running and its completion reaches a later turn.
 
 ## Persist and replay
 

@@ -680,6 +680,7 @@ impl AgentAdapter for Codex {
             // The app server reports `contextCompaction` items as they start
             // and complete; `exec --json` does not surface compaction.
             compaction_lifecycle: self.app_server_mode(),
+            live_messages: false,
         }
     }
 
