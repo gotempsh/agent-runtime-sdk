@@ -12,8 +12,9 @@ use crate::lifecycle::DeliveryState;
 use crate::{
     AccountCredits, AccountUsageProbeSpec, AccountUsageReport, AccountUsageSnapshot,
     AccountUsageWindow, AccountUsageWindowKind, AdapterOutput, AgentAdapter, AgentTask,
-    AgentTaskActivity, AgentTaskActivityKind, AgentTaskUsage, ApprovalDecision, ApprovalRequest,
-    AuthenticationProbeSpec, AutoCompactionPolicy, CatalogProbeSpec, CommandSpec,
+    AgentTaskActivity, AgentTaskActivityKind, AgentTaskUsage, AgentTranscriptEntry, AgentWorkflow,
+    AgentWorkflowAgent, AgentWorkflowAgentState, AgentWorkflowPhase, ApprovalDecision,
+    ApprovalRequest, AuthenticationProbeSpec, AutoCompactionPolicy, CatalogProbeSpec, CommandSpec,
     CompactionTrigger, ContextCompaction, ContextWindowUsage, HarnessAuthentication,
     HarnessCatalogStatus, HarnessControlGroup, HarnessControlKind, HarnessControlOption,
     HarnessModel, HarnessModelCatalog, HarnessReasoningEffort, InteractionRequest,
@@ -26,6 +27,15 @@ use crate::{
 const CLAUDE_STATE_KEY: &str = "claude.native_tasks";
 const MAX_NATIVE_TASKS: usize = 32;
 const MAX_TASK_FIELD_CHARS: usize = 4_000;
+/// Agents kept per workflow; the rest are counted in `omitted_agents`.
+const MAX_WORKFLOW_AGENTS: usize = 100;
+/// Phases kept per workflow.
+const MAX_WORKFLOW_PHASES: usize = 32;
+/// Most recent script log lines kept per workflow.
+const MAX_WORKFLOW_LOGS: usize = 10;
+/// Bound for each workflow text field (labels, previews, log lines). Every
+/// update carries the whole workflow, so these stay short.
+const MAX_WORKFLOW_TEXT_CHARS: usize = 240;
 /// How long a retained turn waits for Claude's follow-up answer after its
 /// background tasks drain. Claude starts it immediately after the task
 /// notification, so this only bounds a notification it does not answer.
@@ -533,6 +543,64 @@ pub struct Claude {
 }
 
 impl Claude {
+    /// Rebuild the activity recorded in a Claude transcript, such as a
+    /// workflow agent's (see [`AgentWorkflow::agent_transcript_path`]), as
+    /// the events a live turn would have emitted: assistant text and tool
+    /// calls with their results, bounded and redacted the same way.
+    ///
+    /// `transcript` is the JSONL file's contents. A transcript is written
+    /// while the agent runs, so a line that is not complete JSON is skipped
+    /// rather than treated as an error. Only the last `max_entries` entries
+    /// are returned.
+    #[must_use]
+    pub fn transcript_activity(
+        &self,
+        transcript: &str,
+        max_entries: usize,
+    ) -> Vec<AgentTranscriptEntry> {
+        let mut state = AdapterState::default();
+        let mut entries = std::collections::VecDeque::new();
+        for line in transcript.lines() {
+            let Ok(frame) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
+            if !matches!(
+                frame.get("type").and_then(Value::as_str),
+                Some("assistant" | "user")
+            ) {
+                continue;
+            }
+            let Ok(output) = self.parse_line(line, &mut state) else {
+                continue;
+            };
+            let timestamp = frame
+                .get("timestamp")
+                .and_then(Value::as_str)
+                .filter(|timestamp| timestamp.len() <= 64)
+                .map(str::to_owned);
+            for event in output.events {
+                if !matches!(
+                    event,
+                    TurnEvent::TextDelta { .. }
+                        | TurnEvent::ReasoningDelta { .. }
+                        | TurnEvent::ToolCall { .. }
+                ) {
+                    continue;
+                }
+                if entries.len() == max_entries {
+                    entries.pop_front();
+                }
+                if max_entries > 0 {
+                    entries.push_back(AgentTranscriptEntry {
+                        timestamp: timestamp.clone(),
+                        event,
+                    });
+                }
+            }
+        }
+        entries.into()
+    }
+
     /// Use an executable path meaningful inside the selected transport.
     pub fn with_executable(path: impl Into<PathBuf>) -> Self {
         Self {
@@ -1353,6 +1421,11 @@ impl AgentAdapter for Claude {
                 }
             }
             "user" => {
+                if let Some(launch) = value.get("tool_use_result") {
+                    if record_workflow_launch(&mut native, launch) {
+                        emit_tasks(&native, &mut output);
+                    }
+                }
                 let task_id = task_id_for(
                     &native,
                     value.get("parent_tool_use_id").and_then(Value::as_str),
@@ -1375,6 +1448,19 @@ impl AgentAdapter for Claude {
                             .tool_names
                             .remove(tool_use_id)
                             .unwrap_or_else(|| "tool".to_string());
+                        // Claude reports a local_bash task after its Bash
+                        // tool_use; task_started links the tool ID to the
+                        // task, so the result belongs to that shell task.
+                        // Nested subagent calls keep their parent.
+                        let owning_task = task_id.clone().or_else(|| {
+                            native.tool_use_to_task.get(tool_use_id).and_then(|id| {
+                                native
+                                    .tasks
+                                    .get(id)
+                                    .filter(|task| task.kind == "shell")
+                                    .map(|_| id.clone())
+                            })
+                        });
                         output.events.push(TurnEvent::ToolCall {
                             id: Some(tool_use_id.to_string()),
                             name: tool_name.clone(),
@@ -1386,7 +1472,7 @@ impl AgentAdapter for Claude {
                             input: None,
                             output: (!failed).then(|| text.clone()),
                             error: failed.then_some(text),
-                            task_id: task_id.clone(),
+                            task_id: owning_task,
                         });
                         if !failed {
                             match tool_name.as_str() {
@@ -2061,7 +2147,200 @@ fn fallback_task(id: &str) -> AgentTask {
         agent_type: None,
         error: None,
         summary: None,
+        workflow: None,
     }
+}
+
+fn workflow_text(value: &str) -> String {
+    if value.chars().count() <= MAX_WORKFLOW_TEXT_CHARS {
+        value.to_string()
+    } else {
+        let mut text = value
+            .chars()
+            .take(MAX_WORKFLOW_TEXT_CHARS)
+            .collect::<String>();
+        text.push('…');
+        text
+    }
+}
+
+fn workflow_field(entry: &Value, key: &str) -> Option<String> {
+    entry
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(workflow_text)
+}
+
+fn workflow_number(entry: &Value, key: &str) -> Option<u64> {
+    entry.get(key).and_then(Value::as_u64)
+}
+
+fn workflow_index(entry: &Value, key: &str) -> Option<u32> {
+    workflow_number(entry, key).map(|value| u32::try_from(value).unwrap_or(u32::MAX))
+}
+
+/// Parse Claude's `workflow_progress` list: phases, agents and script logs,
+/// each phase and agent reported once with its latest state.
+fn parse_workflow(entries: &[Value], previous: &AgentWorkflow) -> AgentWorkflow {
+    let mut workflow = AgentWorkflow {
+        name: previous.name.clone(),
+        run_id: previous.run_id.clone(),
+        transcript_dir: previous.transcript_dir.clone(),
+        ..AgentWorkflow::default()
+    };
+    let mut reported_agents = 0_u32;
+    let mut logs = std::collections::VecDeque::new();
+    for entry in entries {
+        match entry.get("type").and_then(Value::as_str) {
+            Some("workflow_phase") if workflow.phases.len() < MAX_WORKFLOW_PHASES => {
+                let Some(index) = workflow_index(entry, "index") else {
+                    continue;
+                };
+                workflow.phases.push(AgentWorkflowPhase {
+                    index,
+                    title: workflow_field(entry, "title")
+                        .unwrap_or_else(|| format!("Phase {index}")),
+                    kind: workflow_field(entry, "kind"),
+                });
+            }
+            Some("workflow_agent") => {
+                let Some(agent) = parse_workflow_agent(entry) else {
+                    continue;
+                };
+                reported_agents = reported_agents.saturating_add(1);
+                if workflow.agents.len() < MAX_WORKFLOW_AGENTS {
+                    workflow.agents.push(agent);
+                }
+            }
+            Some("workflow_log") => {
+                if let Some(message) = workflow_field(entry, "message") {
+                    if logs.len() == MAX_WORKFLOW_LOGS {
+                        logs.pop_front();
+                    }
+                    logs.push_back(message);
+                }
+            }
+            _ => {}
+        }
+    }
+    workflow.logs = logs.into();
+    workflow.omitted_agents =
+        reported_agents.saturating_sub(u32::try_from(workflow.agents.len()).unwrap_or(u32::MAX));
+    workflow
+}
+
+fn parse_workflow_agent(entry: &Value) -> Option<AgentWorkflowAgent> {
+    let index = workflow_index(entry, "index")?;
+    let native_state = workflow_field(entry, "state").unwrap_or_else(|| "start".to_string());
+    let started_at_ms = workflow_number(entry, "startedAt");
+    let blocked = entry.get("blocked").and_then(Value::as_bool) == Some(true);
+    let state = match native_state.as_str() {
+        _ if blocked => AgentWorkflowAgentState::Blocked,
+        "done" => AgentWorkflowAgentState::Completed,
+        "error" => AgentWorkflowAgentState::Failed,
+        "start" if started_at_ms.is_none() => AgentWorkflowAgentState::Queued,
+        _ => AgentWorkflowAgentState::Running,
+    };
+    let error = match entry.get("error") {
+        Some(Value::String(error)) if !error.is_empty() => Some(workflow_text(error)),
+        Some(Value::Null) | None => None,
+        Some(other) => Some(workflow_text(&other.to_string())),
+    };
+    Some(AgentWorkflowAgent {
+        index,
+        label: workflow_field(entry, "label").unwrap_or_else(|| format!("agent {index}")),
+        state,
+        native_state,
+        phase_index: workflow_index(entry, "phaseIndex"),
+        phase_title: workflow_field(entry, "phaseTitle"),
+        agent_id: workflow_field(entry, "agentId"),
+        agent_type: workflow_field(entry, "agentType"),
+        model: workflow_field(entry, "model"),
+        isolation: workflow_field(entry, "isolation"),
+        attempt: workflow_index(entry, "attempt"),
+        cached: entry.get("cached").and_then(Value::as_bool) == Some(true),
+        tokens: workflow_number(entry, "tokens"),
+        tool_calls: workflow_number(entry, "toolCalls"),
+        duration_ms: workflow_number(entry, "durationMs"),
+        queued_at_ms: workflow_number(entry, "queuedAt"),
+        started_at_ms,
+        last_progress_at_ms: workflow_number(entry, "lastProgressAt"),
+        last_tool_name: workflow_field(entry, "lastToolName"),
+        last_tool_summary: workflow_field(entry, "lastToolSummary"),
+        prompt_preview: workflow_field(entry, "promptPreview"),
+        result_preview: workflow_field(entry, "resultPreview"),
+        error,
+    })
+}
+
+/// Agents that are new or changed state between two workflow snapshots.
+fn changed_workflow_agents(
+    previous: &AgentWorkflow,
+    next: &AgentWorkflow,
+) -> Vec<AgentWorkflowAgent> {
+    next.agents
+        .iter()
+        .filter(|agent| {
+            previous
+                .agents
+                .iter()
+                .find(|earlier| earlier.index == agent.index)
+                .is_none_or(|earlier| earlier.state != agent.state)
+        })
+        .cloned()
+        .collect()
+}
+
+fn workflow_agent_summary(agent: &AgentWorkflowAgent) -> String {
+    let change = match agent.state {
+        AgentWorkflowAgentState::Queued => "queued",
+        AgentWorkflowAgentState::Running => "started",
+        AgentWorkflowAgentState::Completed if agent.cached => "reused a cached result",
+        AgentWorkflowAgentState::Completed => "completed",
+        AgentWorkflowAgentState::Failed => "failed",
+        AgentWorkflowAgentState::Blocked => "was blocked",
+    };
+    format!("{} {change}", agent.label)
+}
+
+/// Record what the Workflow tool reported when it launched a run: its name,
+/// run identifier and where it writes each agent's transcript.
+fn record_workflow_launch(native: &mut ClaudeNativeState, launch: &Value) -> bool {
+    if launch.get("taskType").and_then(Value::as_str) != Some("local_workflow") {
+        return false;
+    }
+    let Some(task_id) = launch
+        .get("taskId")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+    else {
+        return false;
+    };
+    if !can_track(native, task_id) {
+        return false;
+    }
+    let mut task = native.tasks.get(task_id).cloned().unwrap_or_else(|| {
+        let mut task = fallback_task(task_id);
+        task.kind = "workflow".to_string();
+        task
+    });
+    let workflow = task.workflow.get_or_insert_with(AgentWorkflow::default);
+    if let Some(name) = workflow_field(launch, "workflowName") {
+        workflow.name = Some(name);
+    }
+    if let Some(run_id) = workflow_field(launch, "runId") {
+        workflow.run_id = Some(run_id);
+    }
+    // A path is only useful whole, so it is bounded like any task field
+    // rather than shortened like display text.
+    if let Some(directory) = launch.get("transcriptDir").and_then(Value::as_str) {
+        if !directory.is_empty() && directory.len() <= MAX_TASK_FIELD_CHARS {
+            workflow.transcript_dir = Some(directory.to_string());
+        }
+    }
+    native.tasks.insert(task_id.to_string(), task);
+    true
 }
 
 fn emit_tasks(native: &ClaudeNativeState, output: &mut AdapterOutput) {
@@ -2161,19 +2440,30 @@ fn translate_system_task(
                     .and_then(Value::as_str)
                     .unwrap_or("Background task"),
             );
+            let task_type = value.get("task_type").and_then(Value::as_str);
+            // The Workflow tool's result can arrive first and already record
+            // where the run writes its transcripts.
+            let mut workflow = native
+                .tasks
+                .get(task_id)
+                .and_then(|task| task.workflow.clone());
+            if task_type == Some("local_workflow") {
+                let workflow = workflow.get_or_insert_with(AgentWorkflow::default);
+                if let Some(name) = value.get("workflow_name").and_then(Value::as_str) {
+                    workflow.name = Some(workflow_text(name));
+                }
+            }
             native.tasks.insert(
                 task_id.to_string(),
                 AgentTask {
                     id: task_id.to_string(),
-                    kind: task_kind(
-                        value.get("task_type").and_then(Value::as_str),
-                        agent_type.as_deref(),
-                    ),
+                    kind: task_kind(task_type, agent_type.as_deref()),
                     description: description.clone(),
                     status: "running".to_string(),
                     agent_type: agent_type.clone(),
                     error: None,
                     summary: None,
+                    workflow,
                 },
             );
             if value.get("is_backgrounded").and_then(Value::as_bool) == Some(true) {
@@ -2193,6 +2483,7 @@ fn translate_system_task(
                         .and_then(Value::as_u64)
                         .map(|depth| u32::try_from(depth).unwrap_or(u32::MAX)),
                     usage: None,
+                    workflow_agent: None,
                 },
             });
             emit_tasks(native, output);
@@ -2256,6 +2547,7 @@ fn translate_system_task(
                     last_tool_name: None,
                     spawn_depth: None,
                     usage: None,
+                    workflow_agent: None,
                 },
             });
             emit_tasks(native, output);
@@ -2276,7 +2568,12 @@ fn translate_system_task(
                 .or_else(|| task.agent_type.clone());
             let description = optional_bounded(value.get("description").and_then(Value::as_str));
             let summary = optional_bounded(value.get("summary").and_then(Value::as_str));
-            task.kind = task_kind(Some(&task.kind), agent_type.as_deref());
+            let workflow_progress = value.get("workflow_progress").and_then(Value::as_array);
+            if workflow_progress.is_some() {
+                task.kind = "workflow".to_string();
+            } else {
+                task.kind = task_kind(Some(&task.kind), agent_type.as_deref());
+            }
             if let Some(description) = &description {
                 task.description.clone_from(description);
             }
@@ -2285,6 +2582,34 @@ fn translate_system_task(
                 task.summary.clone_from(&Some(summary.clone()));
             }
             let status = task.status.clone();
+            if task.kind == "workflow" {
+                // Every tick carries the whole workflow: replace it, and
+                // record only agents that changed state, not each tick.
+                if let Some(entries) = workflow_progress {
+                    let previous = task.workflow.take().unwrap_or_default();
+                    let next = parse_workflow(entries, &previous);
+                    for agent in changed_workflow_agents(&previous, &next) {
+                        output.events.push(TurnEvent::TaskActivity {
+                            activity: AgentTaskActivity {
+                                task_id: task_id.to_string(),
+                                kind: AgentTaskActivityKind::Progress,
+                                description: None,
+                                status: Some(status.clone()),
+                                agent_type: agent_type.clone(),
+                                summary: Some(workflow_agent_summary(&agent)),
+                                last_tool_name: None,
+                                spawn_depth: None,
+                                usage: task_usage(value.get("usage")),
+                                workflow_agent: Some(Box::new(agent)),
+                            },
+                        });
+                    }
+                    task.workflow = Some(next);
+                }
+                native.tasks.insert(task_id.to_string(), task);
+                emit_tasks(native, output);
+                return;
+            }
             native.tasks.insert(task_id.to_string(), task);
             output.events.push(TurnEvent::TaskActivity {
                 activity: AgentTaskActivity {
@@ -2299,6 +2624,7 @@ fn translate_system_task(
                     ),
                     spawn_depth: None,
                     usage: task_usage(value.get("usage")),
+                    workflow_agent: None,
                 },
             });
             emit_tasks(native, output);
@@ -2349,6 +2675,7 @@ fn translate_system_task(
                     last_tool_name: None,
                     spawn_depth: None,
                     usage: task_usage(value.get("usage")),
+                    workflow_agent: None,
                 },
             });
             emit_tasks(native, output);
@@ -3321,6 +3648,39 @@ mod tests {
     }
 
     #[test]
+    fn local_bash_result_uses_task_started_tool_id_to_identify_shell_task() {
+        let adapter = Claude::default();
+        let mut state = AdapterState::default();
+        let started = adapter
+            .parse_line(
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_bash","name":"Bash","input":{"command":"pwd"}}]}}"#,
+                &mut state,
+            )
+            .unwrap();
+        assert!(matches!(
+            &started.events[0],
+            TurnEvent::ToolCall { task_id: None, .. }
+        ));
+        adapter
+            .parse_line(
+                r#"{"type":"system","subtype":"task_started","task_id":"shell-1","tool_use_id":"toolu_bash","description":"Check directory","task_type":"local_bash"}"#,
+                &mut state,
+            )
+            .unwrap();
+        let completed = adapter
+            .parse_line(
+                r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_bash","content":"/tmp"}]}}"#,
+                &mut state,
+            )
+            .unwrap();
+        assert!(matches!(
+            &completed.events[0],
+            TurnEvent::ToolCall { task_id: Some(id), output: Some(output), .. }
+                if id == "shell-1" && output == "/tmp"
+        ));
+    }
+
+    #[test]
     fn streams_native_subagent_lifecycle_and_nests_tool_calls() {
         let adapter = Claude::default();
         let mut state = AdapterState::default();
@@ -3679,6 +4039,237 @@ mod tests {
         adapter.mark_retained_turn(&mut state);
         let prompt = own_uuids(&state).remove(0);
         (state, prompt)
+    }
+
+    const WORKFLOW_STREAM: &str = include_str!("fixtures/claude_workflow_stream.jsonl");
+    const WORKFLOW_AGENT_TRANSCRIPT: &str =
+        include_str!("fixtures/claude_workflow_agent_transcript.jsonl");
+
+    /// Replay a recorded Workflow run, returning every event and the final
+    /// task snapshot.
+    fn replay_workflow() -> (Vec<TurnEvent>, Vec<AgentTask>) {
+        let adapter = Claude::default();
+        let mut state = AdapterState::default();
+        let mut events = Vec::new();
+        let mut tasks = Vec::new();
+        for line in WORKFLOW_STREAM.lines() {
+            for event in adapter.parse_line(line, &mut state).unwrap().events {
+                if let TurnEvent::TasksChanged { tasks: snapshot } = &event {
+                    tasks.clone_from(snapshot);
+                }
+                events.push(event);
+            }
+        }
+        (events, tasks)
+    }
+
+    #[test]
+    fn a_workflow_task_carries_its_phases_agents_and_transcripts() {
+        let (_, tasks) = replay_workflow();
+        let [task] = tasks.as_slice() else {
+            panic!("one workflow task: {tasks:?}");
+        };
+        assert_eq!(task.kind, "workflow");
+        let workflow = task.workflow.as_ref().expect("workflow structure");
+        assert_eq!(workflow.name.as_deref(), Some("probe-tools"));
+        assert_eq!(workflow.run_id.as_deref(), Some("wf_1cd9e1a5-ccf"));
+        assert_eq!(
+            workflow.transcript_dir.as_deref(),
+            Some("/home/user/.claude/projects/-workspace/session-1/subagents/workflows/wf_1cd9e1a5-ccf")
+        );
+        let phases: Vec<_> = workflow
+            .phases
+            .iter()
+            .map(|p| (p.index, p.title.as_str()))
+            .collect();
+        assert_eq!(phases, [(1, "Scan"), (2, "Report")]);
+        let agents: Vec<_> = workflow
+            .agents
+            .iter()
+            .map(|a| (a.label.as_str(), a.phase_index, a.state))
+            .collect();
+        assert_eq!(
+            agents,
+            [
+                ("scan:read", Some(1), AgentWorkflowAgentState::Completed),
+                ("scan:list", Some(1), AgentWorkflowAgentState::Completed),
+                ("report", Some(2), AgentWorkflowAgentState::Completed),
+            ]
+        );
+        let read = &workflow.agents[0];
+        assert_eq!(read.last_tool_name.as_deref(), Some("Read"));
+        assert_eq!(read.tool_calls, Some(1));
+        assert_eq!(read.result_preview.as_deref(), Some("alpha"));
+        assert_eq!(
+            workflow.agent_transcript_path(read).unwrap(),
+            std::path::Path::new(
+                "/home/user/.claude/projects/-workspace/session-1/subagents/workflows/wf_1cd9e1a5-ccf/agent-ab60d568c07a44b25.jsonl"
+            )
+        );
+        assert_eq!(workflow.omitted_agents, 0);
+    }
+
+    #[test]
+    fn workflow_activity_records_agent_state_changes_not_every_tick() {
+        let (events, _) = replay_workflow();
+        let changes: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                TurnEvent::TaskActivity { activity }
+                    if activity.kind == AgentTaskActivityKind::Progress =>
+                {
+                    let agent = activity.workflow_agent.as_ref().expect("agent change");
+                    Some((agent.label.clone(), agent.state, activity.summary.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        let ticks = WORKFLOW_STREAM.matches("\"task_progress\"").count();
+        assert!(
+            changes.len() < ticks,
+            "{} changes for {ticks} ticks",
+            changes.len()
+        );
+        assert!(changes.contains(&(
+            "scan:read".to_string(),
+            AgentWorkflowAgentState::Running,
+            Some("scan:read started".to_string())
+        )));
+        assert!(changes.contains(&(
+            "report".to_string(),
+            AgentWorkflowAgentState::Completed,
+            Some("report completed".to_string())
+        )));
+        // Each agent's transitions are recorded once each.
+        let mut seen = std::collections::BTreeSet::new();
+        for (label, state, _) in &changes {
+            assert!(seen.insert((label.clone(), *state as u8)), "{changes:?}");
+        }
+    }
+
+    #[test]
+    fn workflow_agent_states_are_normalized() {
+        let parse = |entry: Value| parse_workflow_agent(&entry).unwrap().state;
+        assert_eq!(
+            parse(json!({"index": 1, "state": "start", "queuedAt": 1})),
+            AgentWorkflowAgentState::Queued
+        );
+        assert_eq!(
+            parse(json!({"index": 1, "state": "start", "startedAt": 2})),
+            AgentWorkflowAgentState::Running
+        );
+        assert_eq!(
+            parse(json!({"index": 1, "state": "error", "blocked": true, "error": "refused"})),
+            AgentWorkflowAgentState::Blocked
+        );
+        assert_eq!(
+            parse(json!({"index": 1, "state": "error", "error": {"message": "boom"}})),
+            AgentWorkflowAgentState::Failed
+        );
+        assert!(parse_workflow_agent(&json!({"state": "done"})).is_none());
+    }
+
+    #[test]
+    fn a_large_workflow_is_bounded() {
+        let mut entries: Vec<Value> = (1..=MAX_WORKFLOW_AGENTS + 5)
+            .map(|index| {
+                json!({"type": "workflow_agent", "index": index, "label": "x".repeat(1_000),
+                       "state": "start", "startedAt": 1})
+            })
+            .collect();
+        entries.extend(
+            (0..MAX_WORKFLOW_LOGS + 3)
+                .map(|n| json!({"type": "workflow_log", "message": format!("log {n}")})),
+        );
+        let workflow = parse_workflow(&entries, &AgentWorkflow::default());
+        assert_eq!(workflow.agents.len(), MAX_WORKFLOW_AGENTS);
+        assert_eq!(workflow.omitted_agents, 5);
+        assert!(workflow.agents[0].label.chars().count() <= MAX_WORKFLOW_TEXT_CHARS + 1);
+        assert_eq!(workflow.logs.len(), MAX_WORKFLOW_LOGS);
+        assert_eq!(workflow.logs.last().map(String::as_str), Some("log 12"));
+    }
+
+    #[test]
+    fn transcript_paths_never_leave_the_transcript_directory() {
+        let mut workflow = AgentWorkflow {
+            transcript_dir: Some("/runs/wf_1".to_string()),
+            ..AgentWorkflow::default()
+        };
+        let mut agent = parse_workflow_agent(&json!({"index": 1})).unwrap();
+        assert_eq!(workflow.agent_transcript_path(&agent), None);
+        for unsafe_id in ["../../etc/passwd", "a/b", "a\\b", ".", ""] {
+            agent.agent_id = Some(unsafe_id.to_string());
+            assert_eq!(workflow.agent_transcript_path(&agent), None, "{unsafe_id}");
+        }
+        agent.agent_id = Some("ab60d568c07a44b25".to_string());
+        assert_eq!(
+            workflow.agent_transcript_path(&agent).unwrap(),
+            std::path::Path::new("/runs/wf_1/agent-ab60d568c07a44b25.jsonl")
+        );
+        workflow.transcript_dir = None;
+        assert_eq!(workflow.agent_transcript_path(&agent), None);
+    }
+
+    #[test]
+    fn a_workflow_agent_transcript_reads_as_its_activity() {
+        let entries = Claude::default().transcript_activity(WORKFLOW_AGENT_TRANSCRIPT, 100);
+        let summary: Vec<String> = entries
+            .iter()
+            .map(|entry| match &entry.event {
+                TurnEvent::ToolCall {
+                    name,
+                    status,
+                    input,
+                    output,
+                    ..
+                } => format!(
+                    "{name} {status:?} {} {}",
+                    input.as_ref().map(Value::to_string).unwrap_or_default(),
+                    output.clone().unwrap_or_default()
+                ),
+                TurnEvent::TextDelta { text } => format!("text {text}"),
+                other => format!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                r#"Read Started {"file_path":"/workspace/notes.txt"} "#.to_string(),
+                "Read Succeeded  1\talpha\n2\t".to_string(),
+                "text alpha".to_string(),
+            ]
+        );
+        assert!(entries.iter().all(|entry| entry.timestamp.is_some()));
+        // Only the most recent entries are kept.
+        let last = Claude::default().transcript_activity(WORKFLOW_AGENT_TRANSCRIPT, 1);
+        assert!(matches!(
+            &last[..],
+            [AgentTranscriptEntry {
+                event: TurnEvent::TextDelta { .. },
+                ..
+            }]
+        ));
+        assert_eq!(
+            Claude::default().transcript_activity(WORKFLOW_AGENT_TRANSCRIPT, 0),
+            Vec::<AgentTranscriptEntry>::new()
+        );
+    }
+
+    #[test]
+    fn workflow_snapshots_from_before_the_field_existed_still_load() {
+        let task: AgentTask = serde_json::from_value(json!({
+            "id": "t1", "kind": "subagent", "description": "d", "status": "running",
+            "agent_type": null, "error": null, "summary": null
+        }))
+        .unwrap();
+        assert_eq!(task.workflow, None);
+        let activity: AgentTaskActivity = serde_json::from_value(json!({
+            "task_id": "t1", "kind": "progress", "description": null, "status": null,
+            "agent_type": null, "summary": null, "last_tool_name": null, "spawn_depth": null,
+            "usage": null
+        }))
+        .unwrap();
+        assert_eq!(activity.workflow_agent, None);
     }
 
     #[test]

@@ -41,6 +41,44 @@ latest tool, and task-local usage when Claude reports them. Tool events use the
 native task ID even though Claude's `parent_tool_use_id` belongs to a separate
 identifier namespace.
 
+## Show Claude workflows
+
+A run of Claude Code's `Workflow` tool is a task with kind `workflow`. Its
+`AgentTask::workflow` carries the run's structure, replaced on every update:
+
+- `phases`, in declaration order;
+- `agents`, each with its label, phase, normalized `state` (queued, running,
+  completed, failed, blocked), model, tokens, tool calls, timings, latest tool
+  (`last_tool_name`, `last_tool_summary`), and bounded prompt and result
+  previews;
+- recent script `logs`, and `omitted_agents` beyond the bound of 100 agents.
+
+Render it as a live card rather than a log: phases as sections, one row per
+agent. For a workflow task, `TaskActivity` records only agent state changes;
+`activity.workflow_agent` is the agent that changed, and `summary` reads such
+as `scan:read completed`. Per-tick progress updates only the snapshot.
+
+Claude does not stream a workflow agent's own tool calls. It writes them to a
+transcript on the execution host instead:
+
+```rust,ignore
+if let (Some(workflow), Some(agent)) = (&task.workflow, task_agent) {
+    if let Some(path) = workflow.agent_transcript_path(agent) {
+        let transcript = std::fs::read_to_string(path)?; // on the execution host
+        for entry in Claude::default().transcript_activity(&transcript, 200) {
+            // entry.event is a TextDelta, ReasoningDelta or ToolCall, exactly
+            // as a live turn would emit it; entry.timestamp is RFC 3339.
+        }
+    }
+}
+```
+
+`agent_transcript_path` only returns a path for a plain agent identifier, so a
+provider-reported value cannot point outside the transcript directory. The
+transcript grows while the agent runs; read it again to refresh, and a line
+still being written is skipped. Keep reading local to the host that runs
+Claude: the transcript directory is a path on that host.
+
 ## Preserve ordering around background completion
 
 Claude may emit its parent `result` while background subagents are still
@@ -176,7 +214,8 @@ approvals:
 - retain unknown provider-native task status strings for forward compatibility.
 
 The adapter bounds the native task set to 32 and each text field to 4,000
-characters. The public event enum is non-exhaustive, so consumers still need a
+characters; a workflow's text fields to 240 characters, its agents to 100,
+phases to 32 and logs to the last 10. The public event enum is non-exhaustive, so consumers still need a
 fallback match arm.
 
 Codex and OpenCode do not currently emit these native task variants through

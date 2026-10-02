@@ -682,6 +682,176 @@ pub struct AgentTask {
     pub error: Option<String>,
     /// Latest bounded progress or terminal summary.
     pub summary: Option<String>,
+    /// Phases and agents of a `workflow` task, replaced on every update.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<AgentWorkflow>,
+}
+
+/// Live structure of a workflow task: an orchestration script that runs
+/// agents, often in parallel, grouped into phases.
+///
+/// Claude Code reports it for runs of its `Workflow` tool. Every update
+/// carries the whole structure, so consumers replace the previous value
+/// rather than merging it. Collections are bounded; see
+/// [`AgentWorkflow::omitted_agents`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct AgentWorkflow {
+    /// Name declared by the workflow script.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Provider-native run identifier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    /// Directory on the execution host holding each agent's transcript; see
+    /// [`AgentWorkflow::agent_transcript_path`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript_dir: Option<String>,
+    /// Phases in declaration order.
+    #[serde(default)]
+    pub phases: Vec<AgentWorkflowPhase>,
+    /// Agents in launch order.
+    #[serde(default)]
+    pub agents: Vec<AgentWorkflowAgent>,
+    /// Most recent log lines the script wrote, oldest first.
+    #[serde(default)]
+    pub logs: Vec<String>,
+    /// Agents left out because the workflow launched more than the bound.
+    #[serde(default)]
+    pub omitted_agents: u32,
+}
+
+impl AgentWorkflow {
+    /// Path, on the execution host, of the transcript the provider writes for
+    /// `agent`, or `None` when it is unknown.
+    ///
+    /// The agent identifier is provider-reported, so only plain identifiers
+    /// (ASCII letters, digits, `-` and `_`) produce a path; anything that
+    /// could leave the transcript directory does not.
+    #[must_use]
+    pub fn agent_transcript_path(&self, agent: &AgentWorkflowAgent) -> Option<std::path::PathBuf> {
+        let directory = self.transcript_dir.as_deref()?;
+        let agent_id = agent.agent_id.as_deref()?;
+        let plain = !agent_id.is_empty()
+            && agent_id.len() <= 128
+            && agent_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_');
+        plain.then(|| std::path::Path::new(directory).join(format!("agent-{agent_id}.jsonl")))
+    }
+}
+
+/// One phase of a workflow.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct AgentWorkflowPhase {
+    /// Provider-assigned position, starting at 1.
+    pub index: u32,
+    /// Phase title.
+    pub title: String,
+    /// Provider-native phase kind when reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+}
+
+/// Normalized state of one workflow agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum AgentWorkflowAgentState {
+    /// Waiting for a concurrency slot.
+    Queued,
+    /// Working.
+    Running,
+    /// Finished with a result.
+    Completed,
+    /// Ended with an error.
+    Failed,
+    /// Refused before it ran, for example by a safety classifier.
+    Blocked,
+}
+
+/// One agent a workflow launched.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct AgentWorkflowAgent {
+    /// Provider-assigned position, starting at 1; stable for the run.
+    pub index: u32,
+    /// Label the script gave the agent.
+    pub label: String,
+    /// Normalized state.
+    pub state: AgentWorkflowAgentState,
+    /// Provider-native state.
+    pub native_state: String,
+    /// Phase the agent belongs to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase_index: Option<u32>,
+    /// Title of that phase.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase_title: Option<String>,
+    /// Provider-native agent identifier, known once the agent starts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    /// Provider-native agent type.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_type: Option<String>,
+    /// Model the agent runs on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Isolation such as `worktree`, when not the shared workspace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub isolation: Option<String>,
+    /// Attempt number when the provider retried the agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<u32>,
+    /// The result was reused from an earlier run instead of recomputed.
+    #[serde(default)]
+    pub cached: bool,
+    /// Tokens the agent used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens: Option<u64>,
+    /// Tool calls the agent made.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<u64>,
+    /// Run time in milliseconds, once finished.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    /// When the agent was queued, in Unix milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queued_at_ms: Option<u64>,
+    /// When the agent started, in Unix milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at_ms: Option<u64>,
+    /// When the agent last reported progress, in Unix milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_progress_at_ms: Option<u64>,
+    /// Tool the agent used most recently.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_tool_name: Option<String>,
+    /// Short description of that tool use, such as a path or command.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_tool_summary: Option<String>,
+    /// Bounded start of the agent's task.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_preview: Option<String>,
+    /// Bounded start of the agent's result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_preview: Option<String>,
+    /// Failure or refusal reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// One entry of a transcript, such as a workflow agent's, in the order the
+/// provider recorded it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct AgentTranscriptEntry {
+    /// Provider-recorded time, in RFC 3339, when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<String>,
+    /// The activity, as the event a live turn would have emitted for it.
+    pub event: TurnEvent,
 }
 
 /// Usage reported for one native task or subagent.
@@ -735,6 +905,9 @@ pub struct AgentTaskActivity {
     pub spawn_depth: Option<u32>,
     /// Provider-reported task usage.
     pub usage: Option<AgentTaskUsage>,
+    /// For a workflow task, the agent whose state this activity records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_agent: Option<Box<AgentWorkflowAgent>>,
 }
 
 /// Provider-neutral streaming event.

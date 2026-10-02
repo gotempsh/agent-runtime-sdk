@@ -101,13 +101,14 @@ pub use transport::{
 pub use types::{
     AccountCredits, AccountUsageReport, AccountUsageSnapshot, AccountUsageStatus,
     AccountUsageWindow, AccountUsageWindowKind, AgentTask, AgentTaskActivity,
-    AgentTaskActivityKind, AgentTaskUsage, ApprovalDecision, ApprovalRequest, AutoCompactionPolicy,
-    CompactionTrigger, ContextCompaction, ContextWindowUsage, DenyAll, EventSink,
-    InteractionHandler, LaunchContext, LaunchContextCapabilities, McpServerConfig, NoopEventSink,
-    PermissionMode, PermissionSupport, Provider, ProviderProcessStatus, ProviderReadiness,
-    QuestionAnswer, QuestionOption, QuestionPrompt, QuestionRequest, RunStatus, SecretString,
-    ToolCallStatus, ToolProcessPolicy, TurnCapabilities, TurnEvent, TurnProvenance, TurnRequest,
-    TurnResult, Usage,
+    AgentTaskActivityKind, AgentTaskUsage, AgentTranscriptEntry, AgentWorkflow, AgentWorkflowAgent,
+    AgentWorkflowAgentState, AgentWorkflowPhase, ApprovalDecision, ApprovalRequest,
+    AutoCompactionPolicy, CompactionTrigger, ContextCompaction, ContextWindowUsage, DenyAll,
+    EventSink, InteractionHandler, LaunchContext, LaunchContextCapabilities, McpServerConfig,
+    NoopEventSink, PermissionMode, PermissionSupport, Provider, ProviderProcessStatus,
+    ProviderReadiness, QuestionAnswer, QuestionOption, QuestionPrompt, QuestionRequest, RunStatus,
+    SecretString, ToolCallStatus, ToolProcessPolicy, TurnCapabilities, TurnEvent, TurnProvenance,
+    TurnRequest, TurnResult, Usage,
 };
 
 pub use startup::{StartupObserver, StartupStage, StartupTiming};

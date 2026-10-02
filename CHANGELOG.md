@@ -7,6 +7,19 @@ Versioning and Keep a Changelog conventions.
 
 ### Added
 
+- Structured Claude workflows. A `workflow` task's `AgentTask::workflow`
+  carries the run's phases, agents (label, phase, state, model, tokens, tool
+  calls, timings, latest tool, prompt and result previews) and recent logs,
+  parsed from Claude's `workflow_progress` and replaced on every update, plus
+  the run's name, identifier and transcript directory from the `Workflow`
+  tool's result. Its `TaskActivity` now records agent state changes, with the
+  changed agent in the new `AgentTaskActivity::workflow_agent`, instead of one
+  `Progress` per tick. `AgentWorkflow::agent_transcript_path` and
+  `Claude::transcript_activity` rebuild a workflow agent's own text and tool
+  calls from its transcript. `AgentTask` and `AgentTaskActivity` gain fields,
+  so code that builds them literally must set `workflow` and `workflow_agent`;
+  stored values without them still deserialize.
+
 - Messages into a running turn. On a retained Claude process,
   `TurnHandle::send_message` and the cloneable `TurnHandle::message_handle`
   deliver further user input into the active invocation, which answers it on
@@ -19,6 +32,8 @@ Versioning and Keep a Changelog conventions.
 
 ### Fixed
 
+- The result of a Claude background shell's `Bash` call carries the shell
+  task's ID, so it is grouped with that task instead of the parent turn.
 - Interrupting a retained Claude turn no longer kills its process. The
   interrupt is now cooperative: Claude's `interrupt` control request (with
   `cancel_queued`) stops the foreground reply, its tools and any queued
