@@ -791,6 +791,11 @@ mod unix {
                 "approval" => approval(&client, &model).await,
                 other => Err(format!("unknown scenario {other}; known: {SCENARIOS:?}").into()),
             };
+            // A scenario that failed partway left its runtime (and any turn
+            // still running on it) behind; never let it overlap the next one.
+            if let Ok(runtime_id) = RuntimeId::new(format!("e2e-{scenario}")) {
+                let _ = client.dispose(&runtime_id).await;
+            }
             let verdict = match outcome {
                 Ok(failed) if failed.is_empty() => "PASS".to_owned(),
                 Ok(failed) => format!("FAIL: {}", failed.join("; ")),
