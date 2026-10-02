@@ -82,8 +82,15 @@ Claude queues the message and answers it within the same exchange, usually
 folding it into the reply it is writing. Its output arrives on the running
 turn's stream, and the turn completes only once every message sent into it
 has been answered. `RuntimeDriverCapabilities::live_messages` reports support;
-without it `send` fails with `CapabilityUnavailable`. Every failure carries
-`DeliveryState::NotSent`, so retrying as a new turn never duplicates a message.
+without it `send` fails with `CapabilityUnavailable`. Remote protocol clients
+always report it as unsupported.
+
+Resend a failed message, as a new turn or later, only when the failure carries
+`DeliveryState::NotSent`. That covers a turn that has ended, missing support,
+and a turn that did not take the message within ten seconds (`Timeout`; the
+message is withdrawn and will never be written). Any other delivery state, such
+as a write that failed partway, means Claude may have received it: reconcile
+with the conversation before sending it again.
 
 ### Interrupt only foreground work
 
@@ -94,7 +101,9 @@ turn ends `Cancelled`, but the process and its background subagents and
 background shells keep running. Until the next turn arrives the SDK keeps
 reading the process: their events, Claude's answers to their completion, and
 any approval they request are held (bounded) and delivered at the start of
-the next turn. If Claude does not confirm the interruption within a few
+the next turn. A request event stays in the buffer for as long as its approval
+is held. Requests beyond the bound are denied and reported as a warning on the
+next turn. If Claude does not confirm the interruption within a few
 seconds, the process is retired as before. A parked process with no background
 work expires after the configured idle timeout.
 

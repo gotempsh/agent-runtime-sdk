@@ -317,7 +317,13 @@ impl RemoteClientInner {
                     }) => {
                         descriptor = Some(RuntimeDescriptor {
                             provider,
-                            driver,
+                            // The protocol has no request that writes into a
+                            // running invocation, so remote turns cannot
+                            // accept messages whatever the host supports.
+                            driver: RuntimeDriverCapabilities {
+                                live_messages: false,
+                                ..driver
+                            },
                             configuration_impacts,
                         });
                         if !wait_for_replay {
@@ -1244,6 +1250,8 @@ mod tests {
             RuntimeDriverCapabilities {
                 retained_process: false,
                 session_resume: true,
+                // A host that could message its turns; remote handles cannot.
+                live_messages: true,
                 live_interactions: true,
                 ..RuntimeDriverCapabilities::default()
             }
@@ -1782,6 +1790,7 @@ mod tests {
             .await
             .expect("acquire remote runtime");
         assert_eq!(handle.provider(), Provider::Claude);
+        assert!(!handle.driver_capabilities().live_messages);
         assert!(handle.driver_capabilities().session_resume);
         assert_eq!(
             handle.configuration_impact(RuntimeConfigurationKey::WorkingDirectory),

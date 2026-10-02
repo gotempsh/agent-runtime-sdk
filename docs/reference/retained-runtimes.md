@@ -70,14 +70,20 @@ When `RuntimeDriverCapabilities::live_messages` is set, `TurnHandle::send_messag
 active invocation, which answers it before completing. A message is accepted
 only while that invocation still owns the process; afterwards it fails with
 `InvalidRequest` and `DeliveryState::NotSent`, so the application can start a
-new turn with it. Executors implement `RuntimeTurnExecutor::send_retained_message`;
+new turn with it. A message the invocation does not take within ten seconds is
+withdrawn and fails with `Timeout` and `DeliveryState::NotSent`. Protocol
+clients report `live_messages` as unavailable, because the remote protocol has
+no request that writes into a running invocation. Executors implement `RuntimeTurnExecutor::send_retained_message`;
 adapters implement `AgentAdapter::encode_user_message`.
 
 Interrupting a retained Claude invocation is cooperative: it stops foreground
 work and queued messages, then keeps the process. A process with background
 work stays parked, and its output and approval requests are buffered for the
-next invocation (at most 1,024 events and 16 approvals; overflow is reported as
-a warning on that invocation). Adapters opt in through
+next invocation (at most 1,024 events and 16 approvals). The oldest events are
+dropped first, except the request events of held approvals. Approvals beyond
+the bound are denied. Both kinds of overflow are reported as a warning on that
+invocation. Once background work drains, a parked process waits only the same
+short grace for Claude's answer, then expires after the idle timeout. Adapters opt in through
 `AgentAdapter::retained_interrupt_settled` and `retained_background_work`. An
 interrupt that is not confirmed within three seconds retires the process.
 

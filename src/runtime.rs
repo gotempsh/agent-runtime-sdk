@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -235,14 +235,73 @@ struct RetainedHandoff {
 struct TurnMessage {
     text: String,
     reply: oneshot::Sender<Result<crate::retained::MessageDelivery>>,
+    /// Decides once whether the turn writes the message or the sender
+    /// withdraws it, so a message that timed out is never written later.
+    claim: Arc<AtomicU8>,
 }
+
+/// The message is still queued.
+const MESSAGE_QUEUED: u8 = 0;
+/// The turn has taken the message and is writing it.
+const MESSAGE_TAKEN: u8 = 1;
+/// The sender gave up waiting; the message must not be written.
+const MESSAGE_WITHDRAWN: u8 = 2;
 
 /// Background output read from a parked process, held for the next turn.
 #[derive(Default)]
 struct ParkedOutput {
     events: std::collections::VecDeque<TurnEvent>,
     dropped_events: u64,
+    /// Requests refused because too many were already waiting.
+    declined_interactions: u64,
     interactions: Vec<InteractionRequest>,
+}
+
+impl ParkedOutput {
+    /// Buffer the events of one parked frame, oldest dropped first.
+    ///
+    /// `declined_request` says the frame's approval or question was refused
+    /// because too many were waiting; its request event is counted for the
+    /// next turn's warning instead of being presented as waiting for an
+    /// answer. Request events of held interactions are never dropped, or the
+    /// application could not show what the next turn is answering; at most
+    /// `MAX_PARKED_INTERACTIONS` events are kept that way.
+    fn buffer(&mut self, events: Vec<TurnEvent>, declined_request: bool) {
+        if declined_request {
+            self.declined_interactions = self.declined_interactions.saturating_add(1);
+        }
+        for event in events {
+            if declined_request && is_interaction_request(&event) {
+                continue;
+            }
+            if self.events.len() >= MAX_PARKED_EVENTS {
+                if let Some(oldest) = self
+                    .events
+                    .iter()
+                    .position(|event| !is_interaction_request(event))
+                {
+                    self.events.remove(oldest);
+                    self.dropped_events = self.dropped_events.saturating_add(1);
+                }
+            }
+            self.events.push_back(event);
+        }
+    }
+}
+
+/// Whether a parked process still has background work to wait for.
+///
+/// Drained work only waits for the provider's answer to it, and only for the
+/// quiet grace a running turn would give it, measured from the last frame.
+fn parked_work_remains(
+    adapter: &dyn AgentAdapter,
+    state: &AdapterState,
+    since_last_frame: Duration,
+) -> bool {
+    adapter.retained_background_work(state)
+        && adapter
+            .retained_completion_grace(state)
+            .is_none_or(|grace| since_last_frame < grace)
 }
 
 /// Events buffered for the next turn while a process is parked.
@@ -582,6 +641,19 @@ async fn deliver_turn_message(
     message: TurnMessage,
 ) -> Result<()> {
     use crate::retained::MessageDelivery;
+    if message
+        .claim
+        .compare_exchange(
+            MESSAGE_QUEUED,
+            MESSAGE_TAKEN,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_err()
+    {
+        // Withdrawn by a sender that stopped waiting.
+        return Ok(());
+    }
     let frame = match adapter.encode_user_message(&message.text, state) {
         Ok(Some(frame)) => frame,
         Ok(None) => {
@@ -679,6 +751,7 @@ async fn supervise_parked_retained_process(
             && retained.usable.load(Ordering::Acquire)
     };
     let mut idle_since: Option<tokio::time::Instant> = None;
+    let mut last_frame = tokio::time::Instant::now();
     loop {
         let healthy = {
             let mut io = retained.io.lock().await;
@@ -689,6 +762,7 @@ async fn supervise_parked_retained_process(
             match read_idle_retained_line(&mut io.reader, max_event_line_bytes).await {
                 None => true,
                 Some(Ok(Some(line))) => {
+                    last_frame = tokio::time::Instant::now();
                     park_frame(adapter.as_ref(), &retained.handoff, provider, io, &line).await
                 }
                 Some(Ok(None) | Err(_)) => false,
@@ -703,7 +777,9 @@ async fn supervise_parked_retained_process(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
-            .is_some_and(|state| adapter.retained_background_work(state));
+            .is_some_and(|state| {
+                parked_work_remains(adapter.as_ref(), state, last_frame.elapsed())
+            });
         if background {
             idle_since = None;
         } else if idle_since
@@ -751,13 +827,7 @@ async fn park_frame(
             .parked
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for event in output.events {
-            if parked.events.len() == MAX_PARKED_EVENTS {
-                parked.events.pop_front();
-                parked.dropped_events = parked.dropped_events.saturating_add(1);
-            }
-            parked.events.push_back(event);
-        }
+        let mut declined = false;
         if let Some(interaction) = output.interaction {
             if parked.interactions.len() < MAX_PARKED_INTERACTIONS {
                 parked.interactions.push(interaction);
@@ -770,12 +840,24 @@ async fn park_frame(
                     Ok(response) => writes.extend(response),
                     Err(_) => return false,
                 }
+                declined = true;
             }
         }
+        parked.buffer(output.events, declined);
     }
     write_provider_frames(provider, Some(&mut io.stdin), &writes, "parked write")
         .await
         .is_ok()
+}
+
+/// Whether `event` announces an approval or question awaiting an answer.
+fn is_interaction_request(event: &TurnEvent) -> bool {
+    matches!(
+        event,
+        TurnEvent::ApprovalRequested(_)
+            | TurnEvent::PlanApprovalRequested(_)
+            | TurnEvent::QuestionRequested(_)
+    )
 }
 
 /// Write newline-terminated provider frames to an interactive stdin.
@@ -2821,19 +2903,44 @@ impl AgentRuntime {
         let Some(sender) = sender else {
             return Ok(MessageDelivery::NotAccepting);
         };
-        let (reply, delivered) = oneshot::channel();
-        if sender.send(TurnMessage { text, reply }).await.is_err() {
-            return Ok(MessageDelivery::NotAccepting);
+        let (reply, mut delivered) = oneshot::channel();
+        let claim = Arc::new(AtomicU8::new(MESSAGE_QUEUED));
+        let message = TurnMessage {
+            text,
+            reply,
+            claim: Arc::clone(&claim),
+        };
+        let deadline = tokio::time::Instant::now() + TURN_MESSAGE_TIMEOUT;
+        match tokio::time::timeout_at(deadline, sender.send(message)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => return Ok(MessageDelivery::NotAccepting),
+            // Never queued, so never written.
+            Err(_) => return Ok(MessageDelivery::Withdrawn),
         }
-        match tokio::time::timeout(TURN_MESSAGE_TIMEOUT, delivered).await {
-            // The turn ended with the message still queued: never written.
-            Ok(Err(_)) => Ok(MessageDelivery::NotAccepting),
-            Ok(Ok(outcome)) => outcome,
-            Err(_) => Err(RuntimeError::Timeout {
-                provider,
-                seconds: TURN_MESSAGE_TIMEOUT.as_secs(),
-            }),
-        }
+        let outcome = if let Ok(outcome) = tokio::time::timeout_at(deadline, &mut delivered).await {
+            outcome
+        } else {
+            if claim
+                .compare_exchange(
+                    MESSAGE_QUEUED,
+                    MESSAGE_WITHDRAWN,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                return Ok(MessageDelivery::Withdrawn);
+            }
+            // The turn took it just in time; its write is the outcome.
+            tokio::time::timeout(TURN_MESSAGE_TIMEOUT, delivered)
+                .await
+                .map_err(|_| RuntimeError::Timeout {
+                    provider,
+                    seconds: 2 * TURN_MESSAGE_TIMEOUT.as_secs(),
+                })?
+        };
+        // A turn that ends with the message still queued never wrote it.
+        outcome.unwrap_or(Ok(MessageDelivery::NotAccepting))
     }
 
     pub(crate) async fn dispose_retained_process(
@@ -3825,6 +3932,17 @@ impl AgentRuntime {
                     message: format!(
                         "{} background event(s) were dropped while no turn was running",
                         parked_output.dropped_events
+                    ),
+                })
+                .await?;
+        }
+        if parked_output.declined_interactions > 0 {
+            events
+                .emit(TurnEvent::Warning {
+                    message: format!(
+                        "{} background request(s) were denied because {} were already \
+                         waiting for this turn",
+                        parked_output.declined_interactions, MAX_PARKED_INTERACTIONS
                     ),
                 })
                 .await?;
@@ -5425,6 +5543,143 @@ impl EventSink for CompactionGuard<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn approval_event(id: &str) -> TurnEvent {
+        TurnEvent::ApprovalRequested(crate::ApprovalRequest {
+            id: id.to_owned(),
+            tool_name: "Bash".to_owned(),
+            input: serde_json::json!({}),
+            description: None,
+        })
+    }
+
+    fn text_event(text: &str) -> TurnEvent {
+        TurnEvent::TextDelta {
+            text: text.to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_full_parked_buffer_keeps_requests_still_waiting_for_an_answer() {
+        let mut parked = ParkedOutput::default();
+        parked.buffer(vec![approval_event("held")], false);
+        parked.buffer(
+            (0..MAX_PARKED_EVENTS)
+                .map(|n| text_event(&n.to_string()))
+                .collect(),
+            false,
+        );
+        assert_eq!(parked.events.len(), MAX_PARKED_EVENTS);
+        assert_eq!(parked.dropped_events, 1);
+        assert_eq!(parked.events.front(), Some(&approval_event("held")));
+        assert_eq!(parked.events.get(1), Some(&text_event("1")));
+    }
+
+    #[test]
+    fn a_declined_parked_request_is_reported_not_presented_as_waiting() {
+        let mut parked = ParkedOutput::default();
+        parked.buffer(vec![text_event("before"), approval_event("denied")], true);
+        assert_eq!(parked.declined_interactions, 1);
+        assert_eq!(
+            parked.events.iter().collect::<Vec<_>>(),
+            [&text_event("before")]
+        );
+    }
+
+    #[cfg(feature = "claude")]
+    #[tokio::test]
+    async fn a_withdrawn_message_is_never_written() {
+        use tokio::io::AsyncReadExt;
+        let adapter = crate::providers::Claude::default();
+        let mut state = AdapterState::default();
+        adapter
+            .prepare_turn(
+                &TurnRequest::new(Provider::Claude, ".", "build it"),
+                &mut state,
+            )
+            .unwrap();
+        adapter.mark_retained_turn(&mut state);
+        let (writer, mut reader) = tokio::io::duplex(64 * 1024);
+        let mut stdin: crate::TransportWriter = Box::new(writer);
+        let send = |text: &str, claim: u8| {
+            let (reply, delivered) = oneshot::channel();
+            (
+                TurnMessage {
+                    text: text.to_owned(),
+                    reply,
+                    claim: Arc::new(AtomicU8::new(claim)),
+                },
+                delivered,
+            )
+        };
+
+        let (withdrawn, withdrawn_reply) = send("withdrawn", MESSAGE_WITHDRAWN);
+        deliver_turn_message(
+            &adapter,
+            Provider::Claude,
+            &mut stdin,
+            &mut state,
+            withdrawn,
+        )
+        .await
+        .unwrap();
+        // Dropped unanswered: its sender already reported it as not sent.
+        assert!(withdrawn_reply.await.is_err());
+
+        let (queued, queued_reply) = send("queued", MESSAGE_QUEUED);
+        let claim = Arc::clone(&queued.claim);
+        deliver_turn_message(&adapter, Provider::Claude, &mut stdin, &mut state, queued)
+            .await
+            .unwrap();
+        assert_eq!(
+            queued_reply.await.unwrap().unwrap(),
+            crate::retained::MessageDelivery::Delivered
+        );
+        assert_eq!(claim.load(Ordering::Acquire), MESSAGE_TAKEN);
+
+        drop(stdin);
+        let mut written = String::new();
+        reader.read_to_string(&mut written).await.unwrap();
+        assert!(written.contains("queued"), "{written}");
+        assert!(!written.contains("withdrawn"), "{written}");
+    }
+
+    #[cfg(feature = "claude")]
+    #[test]
+    fn drained_parked_work_waits_only_for_the_follow_up_grace() {
+        let adapter = crate::providers::Claude::default();
+        let mut state = AdapterState::default();
+        adapter
+            .prepare_turn(
+                &TurnRequest::new(Provider::Claude, ".", "build it"),
+                &mut state,
+            )
+            .unwrap();
+        adapter.mark_retained_turn(&mut state);
+        for line in [
+            r#"{"type":"system","subtype":"task_started","task_id":"agent-bg-1","tool_use_id":"toolu_agent","description":"Wait","task_type":"local_agent","is_backgrounded":true}"#,
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"Launched"}"#,
+        ] {
+            adapter.parse_line(line, &mut state).unwrap();
+        }
+        assert!(parked_work_remains(
+            &adapter,
+            &state,
+            Duration::from_secs(3_600)
+        ));
+
+        adapter
+            .parse_line(
+                r#"{"type":"system","subtype":"task_notification","task_id":"agent-bg-1","status":"completed","summary":"done"}"#,
+                &mut state,
+            )
+            .unwrap();
+        let grace = adapter
+            .retained_completion_grace(&state)
+            .expect("drained work waits for Claude's answer");
+        assert!(parked_work_remains(&adapter, &state, Duration::ZERO));
+        assert!(!parked_work_remains(&adapter, &state, grace));
+    }
 
     fn all_launch_context_capabilities() -> crate::LaunchContextCapabilities {
         crate::LaunchContextCapabilities {

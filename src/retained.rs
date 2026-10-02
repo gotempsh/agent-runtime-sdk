@@ -445,6 +445,9 @@ pub enum MessageDelivery {
     NotAccepting,
     /// The provider or driver cannot accept input while a turn runs.
     Unsupported,
+    /// The running turn did not take the message in time, so it was
+    /// withdrawn and will never be written.
+    Withdrawn,
 }
 
 /// Outcome of disposing a retained runtime.
@@ -952,9 +955,12 @@ impl TurnMessageHandle {
     /// invocation stops queued messages too.
     ///
     /// Fails with `CapabilityUnavailable` unless
-    /// [`RuntimeDriverCapabilities::live_messages`] is set, and with
-    /// `InvalidRequest` once the invocation no longer runs; start a new turn
-    /// then. Both carry [`DeliveryState::NotSent`].
+    /// [`RuntimeDriverCapabilities::live_messages`] is set, with
+    /// `InvalidRequest` once the invocation no longer runs (start a new turn
+    /// then), and with `Timeout` when the invocation does not take the message
+    /// in time. All three carry [`DeliveryState::NotSent`]: the message was
+    /// not and will not be written. Resend only failures marked that way; any
+    /// other delivery state means the provider may have received it.
     pub async fn send(&self, text: impl Into<String>) -> RetainedRuntimeResult<()> {
         self.backend.send(text.into()).await
     }
@@ -1055,6 +1061,19 @@ impl TurnMessageBackend for InProcessTurnMessages {
         match delivery {
             Ok(MessageDelivery::Delivered) => Ok(()),
             Ok(MessageDelivery::NotAccepting) => Err(finished()),
+            Ok(MessageDelivery::Withdrawn) => Err(lifecycle_failure(
+                Some(entry.spec.runtime_id.clone()),
+                Some(self.invocation_id.clone()),
+                RuntimeFailureKind::Timeout,
+                RetryAdvice::After {
+                    milliseconds: 1_000,
+                },
+                DeliveryState::NotSent,
+                format!(
+                    "invocation {} did not take the message in time; it was not sent",
+                    self.invocation_id
+                ),
+            )),
             Ok(MessageDelivery::Unsupported) => Err(failure(
                 RuntimeFailureKind::CapabilityUnavailable,
                 DeliveryState::NotSent,
