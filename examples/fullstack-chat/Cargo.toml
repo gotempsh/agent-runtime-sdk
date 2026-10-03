@@ -12,7 +12,9 @@ futures-core = "0.3"
 ring = "0.17"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-temps-agent-runtime = { path = "../..", features = ["temps-sandbox"] }
+# The UI implements Claude Code, Codex and OpenCode; discovery reports every
+# compiled-in provider, so enable only those.
+temps-agent-runtime = { path = "../..", default-features = false, features = ["claude", "codex", "opencode", "nono", "ssh", "tailnet", "temps-sandbox"] }
 thiserror = "2"
 tokio = { version = "1.43", features = ["io-std", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = "0.7"
