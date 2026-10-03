@@ -34,6 +34,14 @@ Versioning and Keep a Changelog conventions.
 
 ### Fixed
 
+- Changing a Claude turn's model, effort or permission mode no longer
+  replaces the retained process and stops its background subagents and
+  shells. The process switches them in place with `set_model`,
+  `apply_flag_settings` and `set_permission_mode` before the prompt. A change
+  that does need a new process, while background work runs, now fails with the
+  new `RuntimeError::RestartWouldStopBackgroundWork` naming that work, and
+  stops nothing; the new `AgentAdapter::retained_background_summary` describes
+  it.
 - The result of a Claude background shell's `Bash` call carries the shell
   task's ID, so it is grouped with that task instead of the parent turn.
 - Interrupting a retained Claude turn no longer kills its process. The

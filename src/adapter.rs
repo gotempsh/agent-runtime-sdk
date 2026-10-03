@@ -503,6 +503,14 @@ pub trait AgentAdapter: Send + Sync {
         false
     }
 
+    /// Short descriptions of the background work
+    /// [`retained_background_work`](Self::retained_background_work) reports,
+    /// for telling a caller what replacing the process would stop.
+    fn retained_background_summary(&self, state: &AdapterState) -> Vec<String> {
+        let _ = state;
+        Vec::new()
+    }
+
     /// Encode a request asking an idle retained process whether it still
     /// owns live background work for `session_id`.
     ///

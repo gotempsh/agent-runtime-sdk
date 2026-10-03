@@ -196,9 +196,19 @@ follow-up exchange. A retained turn stays open for that answer and completes a
 few seconds after the work drains if Claude stays silent.
 
 Without process retention every turn is its own process, so overlap is still
-`RuntimeBusy` and background subagents end with the turn that started them. A
-configuration change that replaces the retained process (model, permissions,
-sandbox) also ends them.
+`RuntimeBusy` and background subagents end with the turn that started them.
+
+A turn may change the model, effort or permission mode: the retained Claude
+process switches them in place (`set_model`, `apply_flag_settings`,
+`set_permission_mode`) before the prompt, and background work keeps running.
+Other changes need a new process: the working directory, MCP servers or launch
+context, sandbox, harness options, turning thinking off or ultracode on, going
+back to the CLI's default model or effort after launching with one, and
+entering bypass mode on a process launched without it. While background work
+runs, such a turn fails with `RuntimeError::RestartWouldStopBackgroundWork`
+(`RuntimeBusy`, `RequiresUserAction`, prompt not sent), naming the work it
+would stop; nothing is stopped. Send it again once the work finishes, or stop
+the work first. A process that refuses a switch is handled the same way.
 
 To check the hand-off against an installed Claude CLI, run
 `cargo run --example claude_background_handoff_smoke -- haiku`. It launches a
@@ -207,8 +217,10 @@ subagent finishes and its completion reaches the second turn.
 `cargo run --example claude_live_messages_smoke -- haiku [scenario...]` checks
 messages and interrupts end to end: messages answered by the running turn,
 queued messages stopped with it, the same Claude process kept across an
-interrupt, background shells and answered-turn subagents surviving it, and a
-background approval held until the next turn.
+interrupt, background shells and answered-turn subagents surviving it, a
+background approval held until the next turn, and background work surviving a
+change of model (`cfg-model`, `cfg-model-agent`), effort (`cfg-effort`) or
+permission mode (`cfg-permission`).
 
 ## Persist and replay
 

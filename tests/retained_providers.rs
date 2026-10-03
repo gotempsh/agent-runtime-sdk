@@ -262,11 +262,27 @@ async fn claude_default_still_exits_each_turn() {
     f.dispose().await;
 }
 #[tokio::test]
-async fn claude_permission_change_replaces_with_single_pool_slot() {
+async fn claude_permission_change_is_switched_in_place() {
     let f = Fixture::new(true, Duration::from_secs(30)).await;
     f.turn("one", "first").await.unwrap();
     let mut input = TurnInput::new(InvocationId::new("changed").unwrap(), "changed");
     input.permission_mode = Some(PermissionMode::AcceptEdits);
+    f.handle
+        .start_turn(input)
+        .await
+        .unwrap()
+        .wait()
+        .await
+        .unwrap();
+    assert_eq!(f.spawns().len(), 1);
+    f.dispose().await;
+}
+#[tokio::test]
+async fn claude_change_needing_a_new_process_replaces_with_single_pool_slot() {
+    let f = Fixture::new(true, Duration::from_secs(30)).await;
+    f.turn("one", "first").await.unwrap();
+    let mut input = TurnInput::new(InvocationId::new("changed").unwrap(), "changed");
+    input.reasoning = Some("off".into());
     f.handle
         .start_turn(input)
         .await

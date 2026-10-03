@@ -143,6 +143,23 @@ pub enum RuntimeError {
     /// Sandbox capability validation or preparation failed.
     #[error("sandbox error: {0}")]
     Sandbox(#[from] crate::SandboxError),
+    /// The turn's settings need a new provider process, and the current one
+    /// still runs background work that replacing it would stop. Nothing was
+    /// stopped and the prompt was not sent.
+    #[error(
+        "{provider} needs a new process to apply {change}, which would stop background work \
+         still running ({}). Wait for it to finish or stop it, then send the turn again.",
+        tasks.join("; ")
+    )]
+    RestartWouldStopBackgroundWork {
+        /// Provider whose process would be replaced.
+        provider: Provider,
+        /// What about the turn's settings needs the new process.
+        change: String,
+        /// The background work that would be stopped, as the provider
+        /// describes it.
+        tasks: Vec<String>,
+    },
 }
 
 pub(crate) fn classify_provider_failure(diagnostic: &str) -> ProviderProcessErrorKind {

@@ -187,12 +187,14 @@ struct RetainedCodexFingerprint {
 fn retained_fingerprint_command(provider: Provider, mut command: CommandSpec) -> CommandSpec {
     command.initial_stdin = None;
     if provider == Provider::Claude {
+        // The session to resume, and the settings a live process switches in
+        // place (see `ClaudeLiveSettings`), do not call for a new process.
         let mut filtered = Vec::with_capacity(command.args.len());
         let mut arguments = command.args.into_iter();
         while let Some(argument) = arguments.next() {
-            if argument == "--resume" {
+            if argument == "--resume" || CLAUDE_LIVE_FLAGS.iter().any(|flag| argument == *flag) {
                 let _ = arguments.next();
-            } else {
+            } else if argument != CLAUDE_BYPASS_FLAG {
                 filtered.push(argument);
             }
         }
@@ -201,8 +203,245 @@ fn retained_fingerprint_command(provider: Provider, mut command: CommandSpec) ->
     command
 }
 
+/// Claude flags whose settings a live process can switch between turns.
+const CLAUDE_LIVE_FLAGS: [&str; 3] = ["--model", "--effort", "--permission-mode"];
+/// Launch flag without which Claude refuses to switch into bypass mode.
+const CLAUDE_BYPASS_FLAG: &str = "--dangerously-skip-permissions";
+/// Upper bound for Claude to answer the requests that switch its settings.
+const CLAUDE_SETTINGS_SWITCH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The Claude settings a retained process can switch in place between turns:
+/// model (`set_model`), effort (`apply_flag_settings`) and permission mode
+/// (`set_permission_mode`). Changing anything else needs a new process.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ClaudeLiveSettings {
+    model: Option<String>,
+    effort: Option<String>,
+    permission_mode: Option<String>,
+}
+
+impl ClaudeLiveSettings {
+    /// The settings a Claude command line selects, and whether it allows
+    /// switching into bypass mode later.
+    fn from_args(args: &[std::ffi::OsString]) -> (Self, bool) {
+        let mut settings = Self::default();
+        let mut bypass_allowed = false;
+        let mut arguments = args.iter();
+        while let Some(argument) = arguments.next() {
+            let value = |arguments: &mut std::slice::Iter<'_, std::ffi::OsString>| {
+                arguments
+                    .next()
+                    .map(|value| value.to_string_lossy().into_owned())
+            };
+            match argument.to_str() {
+                Some("--model") => settings.model = value(&mut arguments),
+                Some("--effort") => settings.effort = value(&mut arguments),
+                Some("--permission-mode") => settings.permission_mode = value(&mut arguments),
+                Some(CLAUDE_BYPASS_FLAG) => bypass_allowed = true,
+                _ => {}
+            }
+        }
+        (settings, bypass_allowed)
+    }
+}
+
+/// What a retained Claude process was launched with and runs now.
+struct ClaudeProcessSettings {
+    launch: ClaudeLiveSettings,
+    bypass_allowed: bool,
+    /// `None` once a failed switch left the live settings unknown.
+    current: Mutex<Option<ClaudeLiveSettings>>,
+}
+
+impl ClaudeProcessSettings {
+    fn set_current(&self, settings: Option<ClaudeLiveSettings>) {
+        *self
+            .current
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = settings;
+    }
+
+    /// The control requests that switch the process to `wanted`, or what
+    /// about `wanted` it cannot switch to in place.
+    fn switch_to(
+        &self,
+        wanted: &ClaudeLiveSettings,
+    ) -> std::result::Result<Vec<serde_json::Value>, String> {
+        let current = self
+            .current
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        // Unknown settings are all sent again.
+        let changed = |pick: fn(&ClaudeLiveSettings) -> &Option<String>| {
+            current
+                .as_ref()
+                .is_none_or(|current| pick(current) != pick(wanted))
+        };
+        let mut requests = Vec::new();
+        if changed(|settings| &settings.model) {
+            // Claude resets a cleared model to the one it was launched with,
+            // not to its own default.
+            if wanted.model.is_none() && self.launch.model.is_some() {
+                return Err("the default model".to_owned());
+            }
+            requests.push(serde_json::json!({"subtype": "set_model", "model": wanted.model}));
+        }
+        if changed(|settings| &settings.effort) {
+            if wanted.effort.is_none() && self.launch.effort.is_some() {
+                return Err("the default effort".to_owned());
+            }
+            requests.push(serde_json::json!({
+                "subtype": "apply_flag_settings",
+                "settings": {"effortLevel": wanted.effort},
+            }));
+        }
+        if changed(|settings| &settings.permission_mode) {
+            match wanted.permission_mode.as_deref() {
+                Some("bypassPermissions") if !self.bypass_allowed => {
+                    return Err("bypass permissions mode".to_owned());
+                }
+                Some(mode) => requests.push(serde_json::json!({
+                    "subtype": "set_permission_mode",
+                    "mode": mode,
+                })),
+                None => return Err("the default permission mode".to_owned()),
+            }
+        }
+        Ok(requests)
+    }
+}
+
+/// Describe what differs between two retained-process fingerprints, for
+/// telling a caller why the process would have to be replaced.
+fn describe_restart(old: &RetainedCodexFingerprint, new: &RetainedCodexFingerprint) -> String {
+    let mut changes = Vec::new();
+    if old.working_directory != new.working_directory {
+        changes.push("a different working directory");
+    }
+    if old.model != new.model {
+        changes.push("a different model");
+    }
+    if old.reasoning != new.reasoning {
+        changes.push("a different reasoning setting");
+    }
+    if old.permission_mode != new.permission_mode {
+        changes.push("a different permission mode");
+    }
+    if old.harness_options != new.harness_options {
+        changes.push("different harness options");
+    }
+    if old.launch_context != new.launch_context {
+        changes.push("different MCP servers or launch context");
+    }
+    if old.auto_compaction != new.auto_compaction {
+        changes.push("a different auto-compaction policy");
+    }
+    if old.required_sandbox_capabilities != new.required_sandbox_capabilities {
+        changes.push("different sandbox requirements");
+    }
+    if changes.is_empty() {
+        changes.push("a different launch command");
+    }
+    changes.join(", ")
+}
+
+/// The background work a retained process still runs for a parked turn,
+/// described for the caller; `None` when replacing it would stop nothing.
+fn retained_background_tasks(
+    adapter: &dyn AgentAdapter,
+    process: &RetainedCodexProcess,
+) -> Option<Vec<String>> {
+    let inherited = process
+        .handoff
+        .inherited
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let state = inherited
+        .as_ref()
+        .filter(|state| adapter.retained_background_work(state))?;
+    let summary = adapter.retained_background_summary(state);
+    Some(if summary.is_empty() {
+        vec!["background work".to_owned()]
+    } else {
+        summary
+    })
+}
+
+/// Switch a claimed Claude process to new settings before its prompt is
+/// written, waiting for each request's answer.
+///
+/// Output that arrives first belongs to the background work of a parked
+/// process: it is parsed and buffered for the turn, exactly as while parked.
+async fn switch_claude_settings(
+    adapter: &dyn AgentAdapter,
+    provider: Provider,
+    process: &RetainedCodexProcess,
+    generation: u64,
+    requests: Vec<serde_json::Value>,
+    max_event_line_bytes: usize,
+) -> std::result::Result<(), String> {
+    let mut pending = std::collections::BTreeSet::new();
+    let mut frames = Vec::with_capacity(requests.len());
+    for (index, request) in requests.into_iter().enumerate() {
+        let request_id = format!("temps-agent-runtime-settings-{generation}-{index}");
+        frames.push(
+            serde_json::to_vec(&serde_json::json!({
+                "type": "control_request",
+                "request_id": request_id,
+                "request": request,
+            }))
+            .map_err(|error| format!("could not encode the request: {error}"))?,
+        );
+        pending.insert(request_id);
+    }
+    let mut guard = process.io.lock().await;
+    let io = guard
+        .as_mut()
+        .ok_or_else(|| "the process is no longer running".to_owned())?;
+    let exchange = async {
+        write_provider_frames(provider, Some(&mut io.stdin), &frames, "settings switch")
+            .await
+            .map_err(|error| error.to_string())?;
+        while !pending.is_empty() {
+            let line = read_bounded_retained_line(&mut io.reader, max_event_line_bytes)
+                .await
+                .map_err(|error| format!("could not read Claude's answer: {error}"))?
+                .ok_or_else(|| "Claude closed its output".to_owned())?;
+            let frame = serde_json::from_str::<serde_json::Value>(&line).ok();
+            let answer = frame.as_ref().and_then(|frame| {
+                let id = frame.pointer("/response/request_id")?.as_str()?;
+                pending.take(id).map(|_| frame)
+            });
+            if let Some(answer) = answer {
+                if answer
+                    .pointer("/response/subtype")
+                    .and_then(serde_json::Value::as_str)
+                    != Some("success")
+                {
+                    let error = answer
+                        .pointer("/response/error")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("no reason given");
+                    return Err(error.chars().take(200).collect());
+                }
+            } else if process.handoff.pending()
+                && !park_frame(adapter, &process.handoff, provider, io, &line).await
+            {
+                return Err("background output could not be read".to_owned());
+            }
+        }
+        Ok(())
+    };
+    tokio::time::timeout(CLAUDE_SETTINGS_SWITCH_TIMEOUT, exchange)
+        .await
+        .map_err(|_| "Claude did not answer in time".to_owned())?
+}
+
 struct RetainedCodexProcess {
     fingerprint: RetainedCodexFingerprint,
+    /// Claude's switchable settings; `None` for other providers.
+    claude_settings: Option<ClaudeProcessSettings>,
     io: AsyncMutex<Option<RetainedCodexIo>>,
     generation: AtomicU64,
     usable: AtomicBool,
@@ -3487,26 +3726,76 @@ impl AgentRuntime {
                 message: format!("retained {provider} requires complete process-tree termination"),
             });
         }
+        // A Claude process switches model, effort and permission mode in
+        // place, so they are left out of what decides on a new process.
+        let claude_live =
+            (provider == Provider::Claude).then(|| ClaudeLiveSettings::from_args(&spec.args));
         let fingerprint = RetainedCodexFingerprint {
             command: retained_fingerprint_command(provider, spec.clone()),
             working_directory: request.working_directory.clone(),
-            model: request.model.clone(),
-            reasoning: request.reasoning.clone(),
-            permission_mode: request.permission_mode.clone(),
-            harness_options: request.harness_options.clone(),
+            model: if claude_live.is_some() {
+                None
+            } else {
+                request.model.clone()
+            },
+            // Turning thinking off, or ultracode on, still needs a new one.
+            reasoning: if claude_live.is_some() {
+                request
+                    .reasoning
+                    .clone()
+                    .filter(|reasoning| matches!(reasoning.as_str(), "off" | "ultracode"))
+            } else {
+                request.reasoning.clone()
+            },
+            permission_mode: if claude_live.is_some() {
+                crate::PermissionMode::Default
+            } else {
+                request.permission_mode.clone()
+            },
+            harness_options: {
+                let mut options = request.harness_options.clone();
+                if claude_live.is_some() {
+                    options.remove("permission_mode");
+                }
+                options
+            },
             launch_context: request.launch_context.clone(),
             auto_compaction: request.auto_compaction,
             required_sandbox_capabilities: request.required_sandbox_capabilities,
         };
 
+        let mut settings_switch = None;
         let previous = {
             let mut processes = supervisor.inner.processes.lock().await;
             match processes.get(runtime_id) {
-                Some(process)
-                    if process.fingerprint == fingerprint
-                        && process.usable.load(Ordering::Acquire) =>
-                {
-                    None
+                Some(process) if process.usable.load(Ordering::Acquire) => {
+                    let reuse = if process.fingerprint == fingerprint {
+                        match (&process.claude_settings, &claude_live) {
+                            (Some(settings), Some((wanted, _))) => settings.switch_to(wanted),
+                            _ => Ok(Vec::new()),
+                        }
+                    } else {
+                        Err(describe_restart(&process.fingerprint, &fingerprint))
+                    };
+                    match reuse {
+                        Ok(requests) => {
+                            settings_switch = (!requests.is_empty()).then_some(requests);
+                            None
+                        }
+                        // Never stop background work nobody asked to stop.
+                        Err(change) => {
+                            if let Some(tasks) =
+                                retained_background_tasks(adapter.as_ref(), process)
+                            {
+                                return Err(RuntimeError::RestartWouldStopBackgroundWork {
+                                    provider,
+                                    change,
+                                    tasks,
+                                });
+                            }
+                            processes.remove(runtime_id)
+                        }
+                    }
                 }
                 Some(_) => processes.remove(runtime_id),
                 None => None,
@@ -3546,20 +3835,98 @@ impl AgentRuntime {
         let mut claimed_generation = None;
         let mut inherited_state = None;
         let mut parked_output = ParkedOutput::default();
+        // Answers to a settings switch already showed the process is live.
+        let mut settings_switched = false;
         if provider == Provider::Claude {
             if let Some(candidate) = existing.clone() {
                 let claim = candidate.claim().await;
                 claimed_generation = claim;
+                if let (Some(generation), Some(requests), Some(settings), Some((wanted, _))) = (
+                    claim,
+                    settings_switch.take(),
+                    candidate.claude_settings.as_ref(),
+                    claude_live.as_ref(),
+                ) {
+                    events
+                        .emit(TurnEvent::ProviderProcessStatus {
+                            status: crate::ProviderProcessStatus::Checking,
+                            message: "Switching the retained Claude process to this turn's \
+                                      model, effort and permission mode."
+                                .to_string(),
+                        })
+                        .await?;
+                    let switched = switch_claude_settings(
+                        adapter.as_ref(),
+                        provider,
+                        &candidate,
+                        generation,
+                        requests,
+                        self.max_event_line_bytes,
+                    )
+                    .await;
+                    match switched {
+                        Ok(()) => {
+                            settings.set_current(Some(wanted.clone()));
+                            settings_switched = true;
+                        }
+                        Err(reason) => {
+                            settings.set_current(None);
+                            if let Some(tasks) =
+                                retained_background_tasks(adapter.as_ref(), &candidate)
+                            {
+                                // Give the process back to its background work.
+                                tokio::spawn(supervise_parked_retained_process(
+                                    adapter.clone(),
+                                    supervisor.clone(),
+                                    runtime_id.clone(),
+                                    Arc::clone(&candidate),
+                                    generation,
+                                    provider,
+                                    supervisor.inner.config.idle_timeout,
+                                    self.max_event_line_bytes,
+                                ));
+                                return Err(RuntimeError::RestartWouldStopBackgroundWork {
+                                    provider,
+                                    change: format!(
+                                        "this turn's settings, which it could not switch in \
+                                         place ({reason})"
+                                    ),
+                                    tasks,
+                                });
+                            }
+                            supervisor.remove_if_same(runtime_id, &candidate).await;
+                            if available_permit.is_none() {
+                                available_permit = candidate.permit.lock().await.take();
+                            }
+                            candidate.terminate().await?;
+                            existing = None;
+                            claimed_generation = None;
+                            events
+                                .emit(TurnEvent::ProviderProcessStatus {
+                                    status: crate::ProviderProcessStatus::Replacing,
+                                    message: format!(
+                                        "The retained Claude process could not switch to this \
+                                         turn's settings ({reason}); starting a replacement."
+                                    ),
+                                })
+                                .await?;
+                        }
+                    }
+                }
                 // A process handed off by the previous turn was streaming
                 // background work until a moment ago, and that output may
                 // already be queued ahead of any probe response. It is live
                 // by construction, so it skips the probe.
-                inherited_state = claim.and_then(|_| candidate.handoff.take_inherited());
+                inherited_state =
+                    claimed_generation.and_then(|_| candidate.handoff.take_inherited());
                 if inherited_state.is_some() {
                     parked_output = candidate.handoff.take_parked();
                 }
             }
-            if let Some(candidate) = existing.clone().filter(|_| inherited_state.is_none()) {
+            if let Some(candidate) = existing
+                .clone()
+                .filter(|_| inherited_state.is_none() && !settings_switched)
+            {
                 events
                     .emit(TurnEvent::ProviderProcessStatus {
                         status: crate::ProviderProcessStatus::Checking,
@@ -3878,6 +4245,13 @@ impl AgentRuntime {
             };
             let retained = Arc::new(RetainedCodexProcess {
                 fingerprint,
+                claude_settings: claude_live.map(|(launch, bypass_allowed)| {
+                    ClaudeProcessSettings {
+                        current: Mutex::new(Some(launch.clone())),
+                        launch,
+                        bypass_allowed,
+                    }
+                }),
                 io: AsyncMutex::new(Some(RetainedCodexIo {
                     process,
                     stdin,
@@ -5593,6 +5967,139 @@ impl EventSink for CompactionGuard<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn claude_args(args: &[&str]) -> Vec<std::ffi::OsString> {
+        args.iter().map(std::ffi::OsString::from).collect()
+    }
+
+    fn claude_process_settings(args: &[&str]) -> ClaudeProcessSettings {
+        let (launch, bypass_allowed) = ClaudeLiveSettings::from_args(&claude_args(args));
+        ClaudeProcessSettings {
+            current: Mutex::new(Some(launch.clone())),
+            launch,
+            bypass_allowed,
+        }
+    }
+
+    fn live(model: Option<&str>, effort: Option<&str>, mode: &str) -> ClaudeLiveSettings {
+        ClaudeLiveSettings {
+            model: model.map(str::to_owned),
+            effort: effort.map(str::to_owned),
+            permission_mode: Some(mode.to_owned()),
+        }
+    }
+
+    #[test]
+    fn claude_switchable_settings_do_not_decide_on_a_new_process() {
+        let command = |args: &[&str]| {
+            let mut spec = CommandSpec::new("claude");
+            spec.args = claude_args(args);
+            retained_fingerprint_command(Provider::Claude, spec).args
+        };
+        assert_eq!(
+            command(&[
+                "--print",
+                "--permission-mode",
+                "bypassPermissions",
+                "--dangerously-skip-permissions",
+                "--effort",
+                "high",
+                "--model",
+                "opus",
+                "--resume",
+                "session",
+            ]),
+            command(&["--print", "--permission-mode", "manual", "--model", "haiku"])
+        );
+        // Turning thinking off is part of the launch, not switched in place.
+        assert_ne!(
+            command(&["--print", "--thinking", "disabled"]),
+            command(&["--print"])
+        );
+        let (settings, bypass) = ClaudeLiveSettings::from_args(&claude_args(&[
+            "--model",
+            "opus",
+            "--effort",
+            "high",
+            "--permission-mode",
+            "bypassPermissions",
+            "--dangerously-skip-permissions",
+        ]));
+        assert_eq!(
+            settings,
+            live(Some("opus"), Some("high"), "bypassPermissions")
+        );
+        assert!(bypass);
+    }
+
+    #[test]
+    fn claude_settings_switch_with_only_the_requests_that_changed() {
+        let settings = claude_process_settings(&[
+            "--permission-mode",
+            "bypassPermissions",
+            "--dangerously-skip-permissions",
+        ]);
+        assert_eq!(
+            settings.switch_to(&live(None, None, "bypassPermissions")),
+            Ok(Vec::new())
+        );
+        assert_eq!(
+            settings.switch_to(&live(Some("sonnet"), Some("low"), "manual")),
+            Ok(vec![
+                serde_json::json!({"subtype": "set_model", "model": "sonnet"}),
+                serde_json::json!({"subtype": "apply_flag_settings",
+                    "settings": {"effortLevel": "low"}}),
+                serde_json::json!({"subtype": "set_permission_mode", "mode": "manual"}),
+            ])
+        );
+        // Launched without a model or effort, clearing them restores the
+        // provider's defaults.
+        settings.set_current(Some(live(Some("sonnet"), Some("low"), "manual")));
+        assert_eq!(
+            settings.switch_to(&live(None, None, "bypassPermissions")),
+            Ok(vec![
+                serde_json::json!({"subtype": "set_model", "model": null}),
+                serde_json::json!({"subtype": "apply_flag_settings",
+                    "settings": {"effortLevel": null}}),
+                serde_json::json!({"subtype": "set_permission_mode",
+                    "mode": "bypassPermissions"}),
+            ])
+        );
+        // Unknown settings after a failed switch are all sent again.
+        settings.set_current(None);
+        assert_eq!(
+            settings
+                .switch_to(&live(None, None, "bypassPermissions"))
+                .map(|requests| requests.len()),
+            Ok(3)
+        );
+    }
+
+    #[test]
+    fn claude_settings_it_cannot_switch_to_need_a_new_process() {
+        let settings = claude_process_settings(&[
+            "--permission-mode",
+            "manual",
+            "--model",
+            "opus",
+            "--effort",
+            "high",
+        ]);
+        // Claude would restore the launch model and effort, not its defaults.
+        assert_eq!(
+            settings.switch_to(&live(None, Some("high"), "manual")),
+            Err("the default model".to_owned())
+        );
+        assert_eq!(
+            settings.switch_to(&live(Some("opus"), None, "manual")),
+            Err("the default effort".to_owned())
+        );
+        // Bypass mode needs its launch flag.
+        assert_eq!(
+            settings.switch_to(&live(Some("opus"), Some("high"), "bypassPermissions")),
+            Err("bypass permissions mode".to_owned())
+        );
+    }
 
     fn approval_event(id: &str) -> TurnEvent {
         TurnEvent::ApprovalRequested(crate::ApprovalRequest {

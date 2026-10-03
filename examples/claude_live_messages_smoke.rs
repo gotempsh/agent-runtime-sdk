@@ -61,6 +61,10 @@ mod unix {
         "bg-agent",
         "bg-agent-answered",
         "approval",
+        "cfg-model",
+        "cfg-effort",
+        "cfg-permission",
+        "cfg-model-agent",
     ];
     const PID_COMMAND: &str = "echo CLAUDEPID=$PPID";
 
@@ -150,6 +154,15 @@ mod unix {
             handler: Arc<dyn InteractionHandler>,
         ) -> Result<Running, Error> {
             let input = TurnInput::new(InvocationId::new(label)?, prompt);
+            self.start_input(label, input, handler).await
+        }
+
+        async fn start_input(
+            &self,
+            label: &str,
+            input: TurnInput,
+            handler: Arc<dyn InteractionHandler>,
+        ) -> Result<Running, Error> {
             let turn = self
                 .handle
                 .start_turn_with_interactions(input, handler)
@@ -674,6 +687,152 @@ mod unix {
         Ok(failed)
     }
 
+    /// A setting the next turn changes while background work is running.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum ConfigChange {
+        Model,
+        Effort,
+        Permission,
+        /// A model change while a background subagent, which lives inside
+        /// the Claude process, is running.
+        ModelWithAgent,
+    }
+
+    /// Changing a setting between turns keeps the process, and with it the
+    /// background work an earlier turn started.
+    async fn config_change(
+        client: &InProcessRuntimeClient,
+        model: &str,
+        change: ConfigChange,
+    ) -> Result<Vec<String>, Error> {
+        let mut failed = Vec::new();
+        let id = match change {
+            ConfigChange::Model => "e2e-cfg-model",
+            ConfigChange::Effort => "e2e-cfg-effort",
+            ConfigChange::Permission => "e2e-cfg-permission",
+            ConfigChange::ModelWithAgent => "e2e-cfg-model-agent",
+        };
+        let mut s = Session::new(client, id, model, PermissionMode::FullAccess).await?;
+        let marker = s.path("background-finished.txt");
+        let write = format!(
+            "python3 -c 'import time; time.sleep(30)' && echo done > {}",
+            marker.display()
+        );
+        let background_step = if change == ConfigChange::ModelWithAgent {
+            format!(
+                "use the Agent tool with run_in_background set to true and subagent_type \
+                 general-purpose, giving it exactly this task: 'Run this with the Bash tool and \
+                 wait for it: {write}. Then reply BGDONE.' Do not wait for it."
+            )
+        } else {
+            format!("use the Bash tool with run_in_background set to true to run: {write}.")
+        };
+        let work = s
+            .start(
+                "work",
+                format!(
+                    "Do these steps in order. Step 1: use the Bash tool to run: {PID_COMMAND}. \
+                     Step 2: {background_step} Then reply with exactly LAUNCHED and end your turn."
+                ),
+            )
+            .await?;
+        let task = s.background_task_started().await?;
+        println!("  background task {task}");
+        s.wait_for(
+            180,
+            "the answer",
+            |_, event| matches!(event, TurnEvent::TextDelta { text } if text.contains("LAUNCHED")),
+        )
+        .await?;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        let mut input = TurnInput::new(
+            InvocationId::new("next")?,
+            format!(
+                "Use the Bash tool to run: {PID_COMMAND}. Then reply with its output and the \
+                 answer to 2+2."
+            ),
+        );
+        match change {
+            ConfigChange::Model | ConfigChange::ModelWithAgent => {
+                input.model = Some(
+                    if model.contains("haiku") {
+                        "sonnet"
+                    } else {
+                        "haiku"
+                    }
+                    .into(),
+                );
+            }
+            ConfigChange::Effort => input.reasoning = Some("low".into()),
+            ConfigChange::Permission => input.permission_mode = Some(PermissionMode::Default),
+        }
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let approver = Arc::new(Approver {
+            turn: "next",
+            asked: Arc::clone(&asked),
+        });
+        let next = s.start_input("next", input, approver).await?;
+        let next = next.finish(300).await??;
+        println!("  next reply: {:?}", next.text);
+        let work = work.finish(30).await?;
+        println!(
+            "  work turn ended: {}",
+            if work.is_ok() { "ok" } else { "error" }
+        );
+        let (before, after) = (s.claude_pids("work"), s.claude_pids("next"));
+        println!("  claude pid before {before:?}, after {after:?}");
+        check(
+            &mut failed,
+            "same Claude process after the change",
+            !before.is_empty() && before == after,
+        );
+        if matches!(change, ConfigChange::Model | ConfigChange::ModelWithAgent) {
+            let wanted = if model.contains("haiku") {
+                "sonnet"
+            } else {
+                "haiku"
+            };
+            println!("  next turn's model: {:?}", next.model);
+            check(
+                &mut failed,
+                "the next turn ran on the new model",
+                next.model
+                    .as_deref()
+                    .is_some_and(|used| used.contains(wanted)),
+            );
+        }
+        if change == ConfigChange::Permission {
+            let asked = asked
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len();
+            check(
+                &mut failed,
+                "the new permission mode asked first",
+                asked > 0,
+            );
+        }
+        check(
+            &mut failed,
+            "background work finished",
+            wait_for_file(&marker, 60).await,
+        );
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        let last = s.start("last", "Reply with exactly OK.".into()).await?;
+        let last = last.finish(240).await??;
+        println!("  last reply: {:?}", last.text);
+        let completed = s.task_activity("next", &task, AgentTaskActivityKind::Completed)
+            || s.task_activity("last", &task, AgentTaskActivityKind::Completed);
+        check(
+            &mut failed,
+            "a later turn received the completion",
+            completed,
+        );
+        s.dispose().await?;
+        Ok(failed)
+    }
+
     async fn approval(client: &InProcessRuntimeClient, model: &str) -> Result<Vec<String>, Error> {
         let mut failed = Vec::new();
         let mut s = Session::new(client, "e2e-approval", model, PermissionMode::Default).await?;
@@ -789,6 +948,12 @@ mod unix {
                     background(&client, &model, Background::AgentAfterAnswer).await
                 }
                 "approval" => approval(&client, &model).await,
+                "cfg-model" => config_change(&client, &model, ConfigChange::Model).await,
+                "cfg-effort" => config_change(&client, &model, ConfigChange::Effort).await,
+                "cfg-permission" => config_change(&client, &model, ConfigChange::Permission).await,
+                "cfg-model-agent" => {
+                    config_change(&client, &model, ConfigChange::ModelWithAgent).await
+                }
                 other => Err(format!("unknown scenario {other}; known: {SCENARIOS:?}").into()),
             };
             // A scenario that failed partway left its runtime (and any turn

@@ -39,6 +39,8 @@ const MAX_WORKFLOW_TEXT_CHARS: usize = 240;
 /// A workflow tick that only moves counters (tokens, tool calls, latest
 /// tool) is re-emitted once per this many ticks; any other change at once.
 const WORKFLOW_COUNTER_TICKS: u32 = 5;
+/// Background tasks named when explaining what replacing a process would stop.
+const MAX_BACKGROUND_SUMMARY: usize = 5;
 /// How long a retained turn waits for Claude's follow-up answer after its
 /// background tasks drain. Claude starts it immediately after the task
 /// notification, so this only bounds a notification it does not answer.
@@ -1110,6 +1112,35 @@ impl AgentAdapter for Claude {
                 || native.follow_up_active
                 || native.awaiting_follow_up
         })
+    }
+
+    fn retained_background_summary(&self, state: &AdapterState) -> Vec<String> {
+        let Some(native) = peek_native_state(state) else {
+            return Vec::new();
+        };
+        let mut summary: Vec<String> = native
+            .background_task_ids
+            .iter()
+            .take(MAX_BACKGROUND_SUMMARY)
+            .map(|id| match native.tasks.get(id) {
+                Some(task) if !task.description.is_empty() => {
+                    format!("{} {}: {}", task.kind, id, task.description)
+                }
+                Some(task) => format!("{} {id}", task.kind),
+                None => format!("task {id}"),
+            })
+            .collect();
+        let more = native
+            .background_task_ids
+            .len()
+            .saturating_sub(MAX_BACKGROUND_SUMMARY);
+        if more > 0 {
+            summary.push(format!("{more} more"));
+        }
+        if summary.is_empty() && (native.follow_up_active || native.awaiting_follow_up) {
+            summary.push("Claude's answer to finished background work".to_owned());
+        }
+        summary
     }
 
     fn mark_retained_turn(&self, state: &mut AdapterState) {

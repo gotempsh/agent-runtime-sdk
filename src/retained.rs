@@ -2084,6 +2084,12 @@ fn runtime_error_to_failure(
             DeliveryState::PossiblySent,
             None,
         ),
+        RuntimeError::RestartWouldStopBackgroundWork { .. } => (
+            RuntimeFailureKind::RuntimeBusy,
+            RetryAdvice::RequiresUserAction,
+            DeliveryState::NotSent,
+            None,
+        ),
     };
     RuntimeFailure {
         runtime_id: Some(runtime_id),

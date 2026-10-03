@@ -6,7 +6,9 @@
 //! `command_lifecycle` frames keyed by each message's UUID, messages that
 //! arrive mid-exchange folded into the running reply, a native `interrupt`
 //! that cancels only foreground work, and background subagents whose
-//! completion wakes the parent agent.
+//! completion wakes the parent agent, and settings switched in place
+//! (`set_model`, `apply_flag_settings`, `set_permission_mode`), which it
+//! refuses while a `refuse-settings` file exists.
 #![cfg(all(unix, feature = "claude"))]
 
 use std::{fs, os::unix::fs::PermissionsExt, sync::Arc, time::Duration};
@@ -20,7 +22,8 @@ use temps_agent_runtime::{
         TurnHandle, TurnInput,
     },
     AgentRuntime, AgentTaskActivityKind, ApprovalDecision, ApprovalRequest, InteractionHandler,
-    Provider, ProviderProcessRetention, QuestionAnswer, QuestionRequest, TurnEvent, TurnResult,
+    PermissionMode, Provider, ProviderProcessRetention, QuestionAnswer, QuestionRequest, TurnEvent,
+    TurnResult,
 };
 use tokio::task::JoinHandle;
 
@@ -141,6 +144,14 @@ for line in sys.stdin:
    if RUNNING.is_set():INTERRUPT.set()
    with WORK:queued=[uuid for uuid,_ in QUEUE]
    emit({'type':'control_response','response':{'request_id':frame['request_id'],'subtype':'success','response':{'still_queued':queued}}})
+  elif subtype in('set_model','apply_flag_settings','set_permission_mode'):
+   log('setting',request=frame['request'])
+   if released('refuse-settings'):
+    emit({'type':'control_response','response':{'request_id':frame['request_id'],'subtype':'error','error':'not now'}})
+   else:
+    emit({'type':'control_response','response':{'request_id':frame['request_id'],'subtype':'success','response':{}}})
+    # Like Claude, a permission change is announced after it is answered.
+    if subtype=='set_permission_mode':emit({'type':'system','subtype':'status','status':None,'permissionMode':frame['request']['mode']})
   else:
    emit({'type':'control_response','response':{'request_id':frame['request_id'],'subtype':'success','response':{}}})
  elif kind=='control_response':
@@ -267,6 +278,30 @@ impl Fixture {
                 .await
                 .unwrap(),
         )
+    }
+
+    async fn start_input(&self, input: TurnInput) -> Result<Running, RuntimeFailure> {
+        Ok(Running::new(self.handle.start_turn(input).await?))
+    }
+
+    /// Settings requests the fixture received, as `subtype` plus value.
+    fn settings(&self) -> Vec<String> {
+        self.events()
+            .iter()
+            .filter(|v| v["kind"] == "setting")
+            .map(|v| {
+                let request = &v["request"];
+                let value = match request["subtype"].as_str() {
+                    Some("set_model") => request["model"].to_string(),
+                    Some("apply_flag_settings") => request["settings"]["effortLevel"].to_string(),
+                    _ => request["mode"].to_string(),
+                };
+                format!(
+                    "{} {value}",
+                    request["subtype"].as_str().unwrap_or_default()
+                )
+            })
+            .collect()
     }
 
     async fn start_with_approver(&self, id: &str, prompt: &str) -> Running {
@@ -572,4 +607,151 @@ impl Fixture {
     fn turn_count_received(&self) -> usize {
         self.logged("received")
     }
+}
+
+/// Start background work and let its turn end, leaving the process parked.
+async fn park_with_background_work(f: &Fixture) {
+    let turn = f.start("one", "spawn-bg").await;
+    f.wait_for_log("bg-start").await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    drop(turn);
+}
+
+#[tokio::test]
+async fn switching_model_effort_and_permission_keeps_background_work() {
+    let f = Fixture::new(true).await;
+    park_with_background_work(&f).await;
+
+    let mut input = Fixture::input("two", "second");
+    input.model = Some("other-model".into());
+    input.reasoning = Some("low".into());
+    input.permission_mode = Some(PermissionMode::Plan);
+    let next = f
+        .start_input(input)
+        .await
+        .expect("the switch keeps the process");
+    f.wait_for_prompt("second").await;
+    assert_eq!(f.logged("bg-finished"), 0, "the subagent is still running");
+    f.release("bg-release");
+    let (events, result) = next.finish().await;
+    assert!(result.unwrap().text.contains("reply:second"));
+    assert!(task_activity(
+        &events,
+        "bg-1",
+        AgentTaskActivityKind::Completed
+    ));
+    assert_eq!(
+        f.settings(),
+        [
+            r#"set_model "other-model""#,
+            r#"apply_flag_settings "low""#,
+            r#"set_permission_mode "plan""#,
+        ]
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            TurnEvent::PermissionModeChanged { mode } if *mode == PermissionMode::Plan
+        )),
+        "the switched mode reaches the turn: {events:?}"
+    );
+
+    // Back to the runtime's own settings, with nothing running: still the
+    // same process, which is not mistaken for a stuck one by the frame
+    // announcing the permission change.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let last = f.start("three", "third").await;
+    assert_eq!(last.finish().await.1.unwrap().text, "reply:third");
+    assert_eq!(
+        f.settings()[3..],
+        [
+            "set_model null",
+            "apply_flag_settings null",
+            r#"set_permission_mode "manual""#,
+        ]
+    );
+    assert_eq!(f.spawns(), 1, "{:?}", f.events());
+    f.dispose().await;
+}
+
+#[tokio::test]
+async fn a_change_that_needs_a_new_process_waits_for_background_work() {
+    let f = Fixture::new(true).await;
+    park_with_background_work(&f).await;
+
+    // Turning thinking off needs a new process, which would stop the
+    // subagent: the turn is refused and nothing is stopped.
+    let mut input = Fixture::input("two", "second");
+    input.reasoning = Some("off".into());
+    let (_, result) = f.start_input(input).await.unwrap().finish().await;
+    let error = result.expect_err("the change would stop background work");
+    assert_eq!(error.kind, RuntimeFailureKind::RuntimeBusy);
+    assert!(
+        error.message.contains("subagent bg-1") && error.message.contains("Wait for it"),
+        "{}",
+        error.message
+    );
+    assert_eq!(f.spawns(), 1);
+    assert!(f.events().iter().all(|v| v["prompt"] != "second"));
+
+    // The parked process still delivers the subagent's completion.
+    f.release("bg-release");
+    f.wait_for_log("bg-finished").await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let next = f.start("three", "third").await;
+    let (events, result) = next.finish().await;
+    assert_eq!(result.unwrap().text, "reply:third");
+    assert!(task_activity(
+        &events,
+        "bg-1",
+        AgentTaskActivityKind::Completed
+    ));
+
+    // With nothing running, the change replaces the process.
+    let mut input = Fixture::input("four", "fourth");
+    input.reasoning = Some("off".into());
+    let last = f.start_input(input).await.expect("nothing to stop now");
+    assert_eq!(last.finish().await.1.unwrap().text, "reply:fourth");
+    assert_eq!(f.spawns(), 2, "{:?}", f.events());
+    f.dispose().await;
+}
+
+#[tokio::test]
+async fn a_refused_switch_keeps_background_work() {
+    let f = Fixture::new(true).await;
+    park_with_background_work(&f).await;
+    f.release("refuse-settings");
+
+    let mut input = Fixture::input("two", "second");
+    input.model = Some("other-model".into());
+    let (_, result) = f.start_input(input).await.unwrap().finish().await;
+    let error = result.expect_err("a refused switch would need a new process");
+    assert_eq!(error.kind, RuntimeFailureKind::RuntimeBusy);
+    assert!(error.message.contains("not now"), "{}", error.message);
+    assert_eq!(f.spawns(), 1);
+
+    // The process went back to its background work, whose completion the
+    // next turn receives. Its settings are unknown now, so they are sent
+    // again in full.
+    fs::remove_file(f.dir.path().join("refuse-settings")).unwrap();
+    let next = f.start("three", "third").await;
+    f.wait_for_prompt("third").await;
+    f.release("bg-release");
+    let (events, result) = next.finish().await;
+    assert!(result.unwrap().text.contains("reply:third"));
+    assert!(task_activity(
+        &events,
+        "bg-1",
+        AgentTaskActivityKind::Completed
+    ));
+    assert_eq!(
+        f.settings()[1..],
+        [
+            "set_model null",
+            "apply_flag_settings null",
+            r#"set_permission_mode "manual""#,
+        ]
+    );
+    assert_eq!(f.spawns(), 1, "{:?}", f.events());
+    f.dispose().await;
 }
