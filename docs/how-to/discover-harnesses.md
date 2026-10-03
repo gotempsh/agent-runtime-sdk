@@ -94,6 +94,10 @@ Inspect `HarnessReadiness::authentication.status` before enabling a provider:
 - `Unknown`: the adapter cannot prove authentication without a real request.
 
 Claude uses `claude auth status --json`; Codex uses `codex login status`.
+pi uses `pi --list-models`, which lists exactly the models whose provider has a
+usable stored login, environment key or `models.json` key: at least one model
+is `Authenticated`, none is `Required`. It shows configured credentials, not
+that the provider accepts them.
 OpenCode remains `Unknown` because one OpenCode installation can expose models
 from multiple providers with different credentials. An application may combine
 that state with its own provider/account readiness, but must not relabel
@@ -123,6 +127,11 @@ response:
   and sandbox policy.
 - OpenCode uses `opencode models` without `--refresh`, reflecting providers
   configured in that environment.
+- pi uses `get_available_models` and `get_state` on a throwaway
+  `pi --mode rpc --no-session`. Model ids are `provider/id`, each model's
+  reasoning efforts follow its `thinkingLevelMap`, and the session default
+  model and thinking level are marked as defaults. pi has no permission
+  control groups: it accepts only `FullAccess` and `Plan`.
 - Claude Code receives a prompt-free `initialize` control request over its
   stream-JSON channel. The response contains the authenticated installation's
   concrete selectable models, native descriptions, and per-model effort

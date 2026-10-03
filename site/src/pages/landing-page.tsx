@@ -53,7 +53,7 @@ export function LandingPage() {
             <p className="machine-label">Rust SDK · early 0.1</p>
             <h1>Run coding agents from Rust.</h1>
             <p className="hero-lede">
-              Start Claude Code, Codex, or OpenCode through one typed event stream. Keep permissions explicit, supervise the process tree, and add an OS sandbox when the turn needs one.
+              Start Claude Code, Codex, OpenCode, or pi through one typed event stream. Keep permissions explicit, supervise the process tree, and add an OS sandbox when the turn needs one.
             </p>
             <div className="hero-actions">
               <Button asChild variant="primary">
@@ -100,20 +100,20 @@ export function LandingPage() {
         <div className="page-container section-grid">
           <div className="sticky-section-head">
             <p className="machine-label">Provider contract</p>
-            <h2>One caller. Three installed agents.</h2>
+            <h2>One caller. Four installed agents.</h2>
             <p>Choose the CLI at runtime without rewriting process supervision, cancellation, permissions, or event parsing.</p>
           </div>
           <div className="provider-sheet-wrap">
             <table className="provider-sheet">
-              <thead><tr><th>Capability</th><th>Claude</th><th>Codex</th><th>OpenCode</th></tr></thead>
+              <thead><tr><th>Capability</th><th>Claude</th><th>Codex</th><th>OpenCode</th><th>pi</th></tr></thead>
               <tbody>
                 {[
-                  ["Typed text + reasoning", true, true, true],
-                  ["Tool lifecycle", true, true, true],
-                  ["Session resume", true, true, true],
-                  ["Plan mode", true, true, true],
-                  ["Live approvals", true, false, false],
-                  ["Outer sandbox", true, true, true],
+                  ["Typed text + reasoning", true, true, true, true],
+                  ["Tool lifecycle", true, true, true, true],
+                  ["Session resume", true, true, true, true],
+                  ["Plan mode", true, true, true, true],
+                  ["Live approvals", true, false, false, false],
+                  ["Outer sandbox", true, true, true, true],
                 ].map(([name, ...values]) => (
                   <tr key={String(name)}>
                     <th>{name}</th>

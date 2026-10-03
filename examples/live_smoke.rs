@@ -39,6 +39,7 @@ fn provider(value: &str) -> std::result::Result<Provider, String> {
         "claude" => Ok(Provider::Claude),
         "codex" => Ok(Provider::Codex),
         "opencode" => Ok(Provider::OpenCode),
+        "pi" => Ok(Provider::Pi),
         _ => Err(format!("unsupported provider `{value}`")),
     }
 }

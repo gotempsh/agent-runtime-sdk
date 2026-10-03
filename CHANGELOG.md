@@ -7,6 +7,26 @@ Versioning and Keep a Changelog conventions.
 
 ### Added
 
+- A pi adapter. `providers::Pi`, behind the new default `pi` feature, drives
+  `pi --mode rpc` (tested with pi 1.0.0): text and reasoning deltas, tool
+  lifecycle events, usage with cost and context-window occupancy, the
+  compaction lifecycle, session start and resume, cooperative `abort` on
+  cancellation, a model catalog with per-model thinking levels, and a
+  credential check through `pi --list-models`. pi runs tools without asking,
+  so the adapter accepts only `FullAccess` and `Plan` (pi's read-only tools);
+  approvals and questions come from pi extensions' UI requests. A resume of a
+  session pi does not have fails as `pi::session_not_found` before the prompt
+  is sent. `Provider::Pi` is a new variant of the non-exhaustive `Provider`
+  enum, and default discovery now reports four harnesses. Skill discovery and
+  management cover pi's skill directories; pi MCP discovery and management are
+  reported as unsupported.
+- `AgentAdapter::parse_oversized_frame`. A provider line longer than the
+  event-line limit is now consumed without being buffered, and its adapter may
+  accept it from its first 512 bytes instead of failing the turn. The default
+  keeps the previous behavior.
+- `PI_CODING_AGENT_DIR` and `PI_CODING_AGENT_SESSION_DIR` pass through the
+  local, SSH and Temps sandbox environment allowlists, like `CLAUDE_HOME`.
+
 - Structured Claude workflows. A `workflow` task's `AgentTask::workflow`
   carries the run's phases, agents (label, phase, state, model, tokens, tool
   calls, timings, latest tool, prompt and result previews) and recent logs,
@@ -42,6 +62,9 @@ Versioning and Keep a Changelog conventions.
   new `RuntimeError::RestartWouldStopBackgroundWork` naming that work, and
   stops nothing; the new `AgentAdapter::retained_background_summary` describes
   it.
+- Provider event lines are held to `max_event_line_bytes` exactly. A
+  CRLF-terminated line at the limit is no longer rejected, and a final line
+  one byte over it without a terminator is no longer accepted.
 - The result of a Claude background shell's `Bash` call carries the shell
   task's ID, so it is grouped with that task instead of the parent turn.
 - Interrupting a retained Claude turn no longer kills its process. The

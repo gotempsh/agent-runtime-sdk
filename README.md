@@ -1,7 +1,7 @@
 # temps-agent-runtime
 
 `temps-agent-runtime` is a provider-neutral Rust runtime for installed coding
-agents. It starts Claude Code, Codex, or OpenCode as a supervised child process,
+agents. It starts Claude Code, Codex, OpenCode, or pi as a supervised child process,
 normalizes their JSON event streams, bridges approvals, and can place the whole
 turn inside a managed [Nono](https://nono.sh/) sandbox.
 
@@ -28,7 +28,7 @@ Host application
 temps-agent-runtime
         │ optional Nono supervisor
         ▼
-Claude Code / Codex / OpenCode executable
+Claude Code / Codex / OpenCode / pi executable
 ```
 
 It deliberately invokes installed executables. It does not reimplement model
@@ -37,7 +37,7 @@ APIs, own credentials, or silently fall back to an unsandboxed process.
 ## Features
 
 - Typed requests, streaming events, terminal results, and errors
-- Claude Code, Codex, and OpenCode adapters behind independent Cargo features
+- Claude Code, Codex, OpenCode, and pi adapters behind independent Cargo features
 - Live approvals with enforced per-turn permission policy: Codex through
   `codex app-server`, OpenCode through `opencode serve`
 - Bounded concurrent turns and bounded provider output
@@ -171,8 +171,9 @@ For context meters and automatic/manual compaction in a durable host, read
   transport and bounded host-extension helpers use fixed POSIX shell scripts;
   untrusted values remain positional arguments and managed paths are derived
   from validated names.
-- Prompts are not logged. Claude and Codex prompts use stdin, and OpenCode's
-  `Serve` turn mode posts the prompt in an HTTP body. OpenCode's headless
+- Prompts are not logged. Claude and Codex prompts use stdin, pi receives its
+  prompt as an RPC command on stdin, and OpenCode's `Serve` turn mode posts the
+  prompt in an HTTP body. OpenCode's headless
   `Run` mode accepts the message as an argument, so it may be visible to local
   process inspection; see the capability matrix.
 - The runtime keeps no database and emits no telemetry. The embedding

@@ -18,11 +18,13 @@ flowchart TD
     T --> C[Claude Code CLI]
     T --> X[Codex CLI]
     T --> O[OpenCode CLI]
+    T --> I[pi CLI]
     S --> N[Nono run or wrap]
     S --> Z[Custom sandbox or container]
     C -->|native JSON records| P
     X -->|native JSONL records| P
     O -->|native JSON records| P
+    I -->|native JSONL RPC records| P
     P -->|TurnEvent / TurnResult| A
     A -->|ManagedProcessSpec| M[ManagedProcessSupervisor]
     M -->|status and bounded logs| A
@@ -40,7 +42,7 @@ storage or transport model.
 
 ## Why process adapters
 
-Claude's Agent SDK, Codex's CLI/app-server, and OpenCode expose different
+Claude's Agent SDK, Codex's CLI/app-server, OpenCode, and pi's RPC mode expose different
 transport choices. The initial common denominator is the installed headless
 executable. That allows Rust applications to share supervision and event
 semantics without embedding JavaScript runtimes or provider credentials.

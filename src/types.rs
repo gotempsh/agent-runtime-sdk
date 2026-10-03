@@ -166,6 +166,8 @@ pub enum Provider {
     Codex,
     /// OpenCode CLI.
     OpenCode,
+    /// pi coding agent CLI.
+    Pi,
 }
 
 impl fmt::Display for Provider {
@@ -174,6 +176,7 @@ impl fmt::Display for Provider {
             Self::Claude => "Claude Code",
             Self::Codex => "Codex",
             Self::OpenCode => "OpenCode",
+            Self::Pi => "pi",
         })
     }
 }

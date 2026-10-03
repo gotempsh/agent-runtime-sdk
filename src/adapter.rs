@@ -286,6 +286,7 @@ pub trait AgentAdapter: Send + Sync {
             Provider::Claude => "claude",
             Provider::Codex => "codex",
             Provider::OpenCode => "opencode",
+            Provider::Pi => "pi",
         })
     }
 
@@ -556,6 +557,24 @@ pub trait AgentAdapter: Send + Sync {
     /// Translate one stdout line and update accumulated state.
     fn parse_line(&self, line: &str, state: &mut AdapterState) -> Result<AdapterOutput>;
 
+    /// Handle one frame longer than the runtime's event-line limit.
+    ///
+    /// The runtime never buffers such a frame: it keeps only `prefix`, the
+    /// frame's first few hundred bytes, and discards the rest. Returning
+    /// `None` — the default — fails the turn with
+    /// [`crate::RuntimeError::Protocol`]. An adapter whose protocol repeats,
+    /// in summary frames, data it already received in smaller ones returns
+    /// the output for the frames it can do without, so a long turn does not
+    /// fail at its very end merely because its summary outgrew the limit.
+    fn parse_oversized_frame(
+        &self,
+        prefix: &str,
+        state: &mut AdapterState,
+    ) -> Option<AdapterOutput> {
+        let _ = (prefix, state);
+        None
+    }
+
     /// Encode a provider-native cooperative interrupt for the running turn.
     ///
     /// Returning `Some` makes the runtime write the frame on cancellation and
@@ -591,6 +610,7 @@ pub trait AgentAdapter: Send + Sync {
     feature = "claude",
     feature = "codex",
     feature = "opencode",
+    feature = "pi",
     feature = "nono"
 ))]
 pub(crate) fn resolve_executable(override_path: Option<&PathBuf>, name: &str) -> Option<PathBuf> {
@@ -622,7 +642,12 @@ pub(crate) fn resolve_executable(override_path: Option<&PathBuf>, name: &str) ->
         .find(|path| path.is_file())
 }
 
-#[cfg(any(feature = "claude", feature = "codex", feature = "opencode"))]
+#[cfg(any(
+    feature = "claude",
+    feature = "codex",
+    feature = "opencode",
+    feature = "pi"
+))]
 pub(crate) async fn inspect_executable(
     provider: Provider,
     path: Option<PathBuf>,

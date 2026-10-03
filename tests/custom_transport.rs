@@ -379,7 +379,8 @@ async fn harness_inventory_is_probed_inside_the_selected_transport() {
 
     assert_eq!(inventory.transport, "fixture-remote");
     assert!(inventory.transport_capabilities.remote);
-    assert_eq!(inventory.harnesses.len(), 3);
+    // Every adapter enabled by the default features: Claude, Codex, OpenCode and pi.
+    assert_eq!(inventory.harnesses.len(), 4);
     assert_eq!(inventory.harnesses[0].provider, Provider::Claude);
     assert_eq!(
         inventory.harnesses[0].authentication.status,

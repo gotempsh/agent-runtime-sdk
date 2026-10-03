@@ -168,7 +168,7 @@ let system_prompt_note = access.guidance();
 `guidance()` is a short system-prompt note telling the agent the tailnet
 exists and how to use those variables. Provider adapters do nothing special:
 the environment is the whole interface, which is why it works the same for
-Claude Code, Codex, and OpenCode.
+Claude Code, Codex, OpenCode, and pi.
 
 ## Combine with Nono
 

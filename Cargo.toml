@@ -5,7 +5,7 @@ edition = "2021"
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 authors = ["temps-agent-runtime contributors"]
-description = "Run Claude Code, Codex, and OpenCode from Rust through one typed, sandbox-aware event stream"
+description = "Run Claude Code, Codex, OpenCode, and pi from Rust through one typed, sandbox-aware event stream"
 repository = "https://github.com/gotempsh/agent-runtime-sdk"
 homepage = "https://github.com/gotempsh/agent-runtime-sdk"
 documentation = "https://docs.rs/temps-agent-runtime"
@@ -29,10 +29,11 @@ include = [
 ]
 
 [features]
-default = ["claude", "codex", "opencode", "nono", "ssh", "tailnet"]
+default = ["claude", "codex", "opencode", "pi", "nono", "ssh", "tailnet"]
 claude = []
 codex = []
 opencode = []
+pi = []
 nono = []
 ssh = []
 # Per-agent Tailscale identities: supervised userspace tailscaled + split proxy.
@@ -71,8 +72,12 @@ name = "tailnet_smoke"
 required-features = ["tailnet"]
 
 [[example]]
+name = "pi_smoke"
+required-features = ["pi"]
+
+[[example]]
 name = "live_smoke"
-required-features = ["claude", "codex", "opencode", "nono"]
+required-features = ["claude", "codex", "opencode", "pi", "nono"]
 
 [[example]]
 name = "process_lifetime_smoke"

@@ -12,6 +12,8 @@ mod opencode;
 mod opencode_http;
 #[cfg(feature = "opencode")]
 mod opencode_serve;
+#[cfg(feature = "pi")]
+mod pi;
 
 #[cfg(feature = "claude")]
 pub use claude::Claude;
@@ -19,6 +21,8 @@ pub use claude::Claude;
 pub use codex::{Codex, CodexTurnMode};
 #[cfg(feature = "opencode")]
 pub use opencode::{OpenCode, OpenCodeTurnMode};
+#[cfg(feature = "pi")]
+pub use pi::Pi;
 
 #[cfg(any(feature = "claude", feature = "codex"))]
 use serde_json::Value;

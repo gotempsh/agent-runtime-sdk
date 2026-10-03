@@ -10,6 +10,7 @@ pin and test the CLI versions used in production.
 | `claude` | yes | `providers::Claude` stream-JSON adapter |
 | `codex` | yes | `providers::Codex` `exec --json` and `app-server` adapter |
 | `opencode` | yes | `providers::OpenCode` `run --format json` and `serve` adapter |
+| `pi` | yes | `providers::Pi` `pi --mode rpc` adapter |
 | `nono` | yes | profile management and per-turn Nono execution |
 | `tailnet` | yes | per-agent userspace Tailscale daemons and split proxy |
 | `ssh` | yes | OpenSSH execution transport |
@@ -20,33 +21,33 @@ features.
 
 ## Provider capabilities
 
-| Capability | Claude Code | Codex | OpenCode |
-| --- | --- | --- | --- |
-| Installed CLI discovery | yes | yes | yes |
-| Normalized text events | yes | yes | yes |
-| Reasoning events when reported | yes | yes | yes |
-| Tool lifecycle events | yes | yes | yes |
-| Native task/subagent events | yes | no | no |
-| Usage when reported | yes | yes | yes |
-| Account quota windows and reset times | explicit fetch + live turn + optional discovery snapshot | explicit fetch + optional discovery snapshot; live if emitted | no |
-| Context-window occupancy | yes, estimated from native usage components and direct after compaction | no | no |
-| Configurable automatic compaction | yes | no | no |
-| Provider-native manual compaction | yes, retained runtime with an existing session | no | no |
-| Session identifier | yes | yes | yes in `Serve` mode; when reported in `Run` |
-| Resume by session identifier | yes | yes | yes |
-| `Default` | yes | yes, static workspace sandbox | `Serve`: `edit: ask`, `bash: ask`; `Run`: asks auto-reject in headless mode |
-| `AcceptEdits` | yes | yes, static workspace sandbox | `Serve`: `edit: allow`, `bash: ask`; `Run`: rejected rather than broadening access |
-| `Plan` | yes | yes, read-only sandbox | `Serve`: both categories denied; `Run`: built-in `plan` agent |
-| `FullAccess` | yes | yes | `Serve`: `edit: allow`, `bash: allow`; `Run`: `--auto`, explicit configured denies remain |
-| Custom mode | yes | yes, native approval policy | yes, configured agent |
-| Live approvals | yes | app-server mode only (`exec` is configured non-interactively) | `Serve` mode only (`run` is non-interactive) |
-| Live user questions | yes | app-server mode only, blocking and async | no; OpenCode has no question channel |
-| Cooperative interrupt on cancellation | retained process only (`interrupt` control request; keeps the process and background shells; Claude stops background subagents unless it had already answered) | app-server mode only (`turn/interrupt`) | `Serve` mode only (`session/abort`) |
-| Messages into a running turn | retained process only | no | no |
-| Structured launch context | system prompt, exact tools, stdio/HTTP MCP, strict MCP | additive stdio/HTTP MCP | `Serve`: system prompt and tools as a prompt prefix, stdio/HTTP MCP; `Run`: rejected |
-| Native image attachments | no; described as prompt paths | yes (`--image`, `localImage` input) | no; described as prompt paths |
-| Prompt kept out of argv | yes | yes | no; current `run` CLI uses message args |
-| Current backend | CLI stream JSON | `codex exec --json` (default) or `codex app-server` | `opencode run --format json` (default) or `opencode serve` |
+| Capability | Claude Code | Codex | OpenCode | pi |
+| --- | --- | --- | --- | --- |
+| Installed CLI discovery | yes | yes | yes | yes, with the RPC model catalog and `--list-models` credential check |
+| Normalized text events | yes | yes | yes | yes |
+| Reasoning events when reported | yes | yes | yes | yes |
+| Tool lifecycle events | yes | yes | yes | yes |
+| Native task/subagent events | yes | no | no | no |
+| Usage when reported | yes | yes | yes | yes, including cost |
+| Account quota windows and reset times | explicit fetch + live turn + optional discovery snapshot | explicit fetch + optional discovery snapshot; live if emitted | no | no |
+| Context-window occupancy | yes, estimated from native usage components and direct after compaction | no | no | yes, pi's `totalTokens` per assistant message |
+| Configurable automatic compaction | yes | no | no | no |
+| Provider-native manual compaction | yes, retained runtime with an existing session | no | no | no |
+| Session identifier | yes | yes | yes in `Serve` mode; when reported in `Run` | yes, from `get_state` before the prompt |
+| Resume by session identifier | yes | yes | yes | yes; a missing session fails before the prompt is sent |
+| `Default` | yes | yes, static workspace sandbox | `Serve`: `edit: ask`, `bash: ask`; `Run`: asks auto-reject in headless mode | rejected; pi never asks |
+| `AcceptEdits` | yes | yes, static workspace sandbox | `Serve`: `edit: allow`, `bash: ask`; `Run`: rejected rather than broadening access | rejected |
+| `Plan` | yes | yes, read-only sandbox | `Serve`: both categories denied; `Run`: built-in `plan` agent | yes, `--tools` limited to `read`, `grep`, `find`, `ls` |
+| `FullAccess` | yes | yes | `Serve`: `edit: allow`, `bash: allow`; `Run`: `--auto`, explicit configured denies remain | yes, pi's configured tools |
+| Custom mode | yes | yes, native approval policy | yes, configured agent | no |
+| Live approvals | yes | app-server mode only (`exec` is configured non-interactively) | `Serve` mode only (`run` is non-interactive) | only from pi extensions (`confirm`) |
+| Live user questions | yes | app-server mode only, blocking and async | no; OpenCode has no question channel | only from pi extensions (`select`, `input`, `editor`) |
+| Cooperative interrupt on cancellation | retained process only (`interrupt` control request; keeps the process and background shells; Claude stops background subagents unless it had already answered) | app-server mode only (`turn/interrupt`) | `Serve` mode only (`session/abort`) | yes (`abort`) |
+| Messages into a running turn | retained process only | no | no | no |
+| Structured launch context | system prompt, exact tools, stdio/HTTP MCP, strict MCP | additive stdio/HTTP MCP | `Serve`: system prompt and tools as a prompt prefix, stdio/HTTP MCP; `Run`: rejected | system prompt, exact tools, strict MCP (disables all pi extensions); no turn-scoped MCP |
+| Native image attachments | no; described as prompt paths | yes (`--image`, `localImage` input) | no; described as prompt paths | no; described as prompt paths |
+| Prompt kept out of argv | yes | yes | no; current `run` CLI uses message args | yes (`prompt` RPC command on stdin) |
+| Current backend | CLI stream JSON | `codex exec --json` (default) or `codex app-server` | `opencode run --format json` (default) or `opencode serve` | `pi --mode rpc` |
 
 The public adapter trait is the extension point for further provider
 backends. Such adapters should preserve the normalized contract and establish
@@ -141,6 +142,71 @@ validated with `session.get` rather than by listing and filtering, which
 cannot fail closed on a workspace reached through a symlink; a session with a
 parent is a subagent session and is rejected immediately rather than left to
 hang. Reading transcripts from OpenCode's local database is not implemented.
+
+### pi
+
+`providers::Pi` drives `pi --mode rpc`, pi's JSONL command protocol on stdio,
+one process per turn. The runtime first writes `get_state`; its response names
+the session pi opened and is reported as `SessionStarted`. Only then does the
+adapter write the `prompt` command, so the prompt never appears in argv. Events
+stream until `agent_settled` — not `agent_end`, after which pi may still retry
+a failed request or recover from a context overflow — and closing stdin is
+pi's orderly shutdown. Cancellation writes `abort`.
+
+pi runs every enabled tool without asking, so only two modes are accepted:
+
+| `PermissionMode` | pi invocation |
+| --- | --- |
+| `FullAccess` | pi's configured tool set |
+| `Plan` | `--tools` limited to the read-only `read`, `grep`, `find` and `ls`, intersected with `LaunchContext::allowed_tools` |
+| `Default`, `AcceptEdits`, `Custom` | rejected with `InvalidRequest` before a process starts |
+
+Run pi inside an outer sandbox when the workspace must be protected. pi asks
+the user something only when an extension calls its UI context: `confirm`
+becomes an approval (tool name `pi_extension_confirm`), and `select`, `input`
+and `editor` become questions. The answers are written back as
+`extension_ui_response`.
+
+`--no-approve` is passed on every turn, so trust-gated project resources —
+`.pi/settings.json`, `.pi/extensions`, `.pi/mcp.json`, project skills — never
+load merely because a repository is the working directory.
+`Pi::trust_project_resources(true)` passes `--approve` instead.
+
+Session resume uses `--session-id`, which is exact and scoped to the working
+directory (`--session` would also match prefixes and offer on stdout to fork a
+session from another project). pi creates an empty session for an unknown id,
+so the adapter checks `messageCount` in the `get_state` response and fails a
+resume of a session with no messages as `pi::session_not_found` with
+`DeliveryState::NotSent`, before the prompt is written.
+
+`LaunchContext::system_prompt_append` becomes `--append-system-prompt`, which
+replaces pi's discovery of `APPEND_SYSTEM.md`; pi also reads the value as a
+file when it names an existing path. On Windows, where pi's npm shim is a
+batch file, a multi-line value cannot be passed as an argument and the turn
+fails to start. `strict_mcp_config` becomes
+`--no-extensions`, which disables every pi extension including built-in MCP,
+because pi has no MCP-only switch. pi has no turn-scoped MCP argument, so
+`LaunchContext::mcp_servers` is rejected.
+
+Discovery starts `pi --mode rpc --no-session` for `get_available_models` and
+`get_state`: model ids are `provider/id`, reasoning efforts follow each
+model's `thinkingLevelMap`, and the default model and thinking level come from
+`get_state`. The credential check runs `pi --list-models`, which lists exactly
+the models whose provider has a usable stored login, environment key or
+`models.json` key without contacting the provider. `PI_CODING_AGENT_DIR` and
+`PI_CODING_AGENT_SESSION_DIR` pass through the runtime's environment
+allowlist, like `CLAUDE_HOME`. Listing and managing pi MCP servers is not
+supported: `pi mcp list` connects to every configured server.
+
+pi's `agent_end` and `turn_end` echo every message of the run, so a long turn
+can produce one line larger than the event-line limit just before it settles.
+The adapter implements `AgentAdapter::parse_oversized_frame` to drop such
+summaries, oversized non-assistant messages and tool progress, and to report an
+oversized `tool_execution_end` as a completed call with its output omitted. An
+oversized assistant message still fails the turn.
+
+pi's process is not retained across turns yet: each turn starts `pi` and
+resumes its session, so messages into a running turn are not supported.
 
 ## Private-network providers
 
@@ -346,6 +412,13 @@ stderr, and the native exit status, then redacts any returned reason before it
 enters `HarnessReadiness`. Returning no probe is a supported capability state
 and produces `HarnessAuthenticationStatus::Unknown`.
 
+`parse_oversized_frame` handles a frame longer than the event-line limit. The
+runtime never buffers such a frame: it keeps the first 512 bytes, discards the
+rest through the terminating newline, and passes that prefix to the adapter.
+The default returns `None`, which fails the turn with `RuntimeError::Protocol`;
+an adapter whose protocol repeats data in summary frames can return an output
+for the frames it can do without.
+
 `executable` returns a name or path meaningful inside the selected transport.
 An adapter does not require that path to exist locally when constructing a
 command. The older adapter-local `readiness` method remains for compatibility;
@@ -504,7 +577,9 @@ trusted declarations by backend implementers, not runtime attestation.
 ## Limits and compatibility
 
 - Default maximum prompt: 256 KiB.
-- Default maximum provider event line: 2 MiB.
+- Default maximum provider event line: 2 MiB. An oversized line is consumed
+  without being buffered and then fails the turn unless its adapter's
+  `parse_oversized_frame` accepts it.
 - Captured stderr tail: 32 KiB.
 - Default turn deadline: 30 minutes.
 - Default interaction deadline: 10 minutes.

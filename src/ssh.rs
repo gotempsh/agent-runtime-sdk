@@ -46,6 +46,8 @@ const SAFE_REMOTE_ENVIRONMENT: &[&str] = &[
     "TMPDIR",
     "CLAUDE_HOME",
     "CODEX_HOME",
+    "PI_CODING_AGENT_DIR",
+    "PI_CODING_AGENT_SESSION_DIR",
     "SSL_CERT_FILE",
     "SSL_CERT_DIR",
 ];

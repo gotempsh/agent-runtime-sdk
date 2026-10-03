@@ -28,6 +28,8 @@ const SAFE_ENVIRONMENT: &[&str] = &[
     "XDG_STATE_HOME",
     "CLAUDE_HOME",
     "CODEX_HOME",
+    "PI_CODING_AGENT_DIR",
+    "PI_CODING_AGENT_SESSION_DIR",
     "SSL_CERT_FILE",
     "SSL_CERT_DIR",
 ];

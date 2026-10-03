@@ -77,6 +77,7 @@ sees the completed boundary.
 | Claude Code (stream-JSON) | `system`/`status` with `status: "compacting"` (repeated as a keepalive; deduplicated) | `system`/`compact_boundary` | `status: null` with `compact_result: "failed"` and `compact_error`, or the terminal `result` arriving first | `pre_tokens`, `post_tokens`, and derived `dropped_tokens` from `compact_metadata` |
 | Codex (`app-server`) | `item/started` with a `contextCompaction` item | `item/completed` for that item; the deprecated `thread/compacted` only when no item was reported | `turn/completed` or `turn/failed` while the item is open | `pre_tokens` from the latest `thread/tokenUsage/updated` snapshot; the next snapshot carries the post-compaction occupancy |
 | OpenCode (`serve`) | `message.part.updated` with a `compaction` part (`auto: false` means manual) | `session.compacted` | the summary message (`summary: true`, agent `compaction`) reports an `error`, or `session.idle` arrives first | `pre_tokens` from the latest assistant message's token counts |
+| pi (`--mode rpc`) | `compaction_start` (`reason: "manual"` is manual; `threshold` and `overflow` are automatic) | `compaction_end` with a `result` | `compaction_end` without a `result`, or with `aborted: true` | `pre_tokens` from `tokensBefore`, `post_tokens` from `estimatedTokensAfter`, and derived `dropped_tokens` |
 
 `codex exec --json` and `opencode run --format json` do not expose compaction.
 OpenCode's compaction summary is harness-internal and is not streamed as

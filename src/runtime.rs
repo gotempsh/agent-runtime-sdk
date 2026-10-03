@@ -649,38 +649,92 @@ async fn read_bounded_retained_line(
     reader: &mut BufReader<crate::TransportReader>,
     limit: usize,
 ) -> std::io::Result<Option<String>> {
+    match read_provider_frame(reader, limit).await? {
+        None => Ok(None),
+        Some(ProviderFrame::Line(line)) => Ok(Some(line)),
+        Some(ProviderFrame::Oversized { .. }) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "provider event line exceeded configured limit",
+        )),
+    }
+}
+
+/// Bytes kept from an oversized frame so its adapter can identify it.
+const OVERSIZED_FRAME_PREFIX_BYTES: usize = 512;
+
+/// One newline-delimited provider frame read within the event-line limit.
+#[derive(Debug, PartialEq, Eq)]
+enum ProviderFrame {
+    /// A complete frame without its line terminator.
+    Line(String),
+    /// A frame longer than the limit. Only its first
+    /// [`OVERSIZED_FRAME_PREFIX_BYTES`] bytes were kept; the remainder was
+    /// consumed without being buffered.
+    Oversized { prefix: String },
+}
+
+/// Read one frame, bounding memory by `limit` even when the frame is larger.
+///
+/// An oversized frame is consumed through its terminating newline so the
+/// stream stays aligned on the next frame, letting the adapter decide whether
+/// the turn can continue without it.
+async fn read_provider_frame<R>(
+    reader: &mut R,
+    limit: usize,
+) -> std::io::Result<Option<ProviderFrame>>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
     let mut bytes = Vec::new();
+    let mut oversized = false;
+    let mut read_any = false;
     loop {
-        let available = tokio::io::AsyncBufReadExt::fill_buf(reader).await?;
+        let available = reader.fill_buf().await?;
         if available.is_empty() {
-            if bytes.is_empty() {
+            if !read_any {
                 return Ok(None);
             }
             break;
         }
-        let take = available
-            .iter()
-            .position(|byte| *byte == b'\n')
-            .map_or(available.len(), |position| position + 1);
-        if bytes.len().saturating_add(take) > limit.saturating_add(1) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "provider event line exceeded configured limit",
-            ));
+        read_any = true;
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let take = newline.map_or(available.len(), |position| position + 1);
+        // Leave room for a `\r\n` terminator; the stripped frame is held to
+        // `limit` exactly below.
+        if !oversized && bytes.len().saturating_add(take) > limit.saturating_add(2) {
+            oversized = true;
+            bytes.truncate(OVERSIZED_FRAME_PREFIX_BYTES);
         }
-        let ended = available.get(take.saturating_sub(1)) == Some(&b'\n');
-        bytes.extend_from_slice(&available[..take]);
-        tokio::io::AsyncBufReadExt::consume(reader, take);
-        if ended {
-            bytes.pop();
-            if bytes.last() == Some(&b'\r') {
-                bytes.pop();
-            }
+        if oversized {
+            let room = OVERSIZED_FRAME_PREFIX_BYTES.saturating_sub(bytes.len());
+            bytes.extend_from_slice(&available[..take.min(room)]);
+        } else {
+            bytes.extend_from_slice(&available[..take]);
+        }
+        reader.consume(take);
+        if newline.is_some() {
             break;
         }
     }
+    if oversized {
+        return Ok(Some(ProviderFrame::Oversized {
+            prefix: String::from_utf8_lossy(&bytes).into_owned(),
+        }));
+    }
+    if bytes.last() == Some(&b'\n') {
+        bytes.pop();
+        if bytes.last() == Some(&b'\r') {
+            bytes.pop();
+        }
+    }
+    if bytes.len() > limit {
+        bytes.truncate(OVERSIZED_FRAME_PREFIX_BYTES);
+        return Ok(Some(ProviderFrame::Oversized {
+            prefix: String::from_utf8_lossy(&bytes).into_owned(),
+        }));
+    }
     String::from_utf8(bytes)
-        .map(Some)
+        .map(|line| Some(ProviderFrame::Line(line)))
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()))
 }
 
@@ -1306,6 +1360,16 @@ case "$provider" in
     emit_root user claude "$HOME/.claude/skills"
     emit_root user agents "$HOME/.agents/skills"
     ;;
+  pi)
+    user_base=${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}
+    project_base=$PWD/.pi
+    emit_access user "$user_base/skills"
+    emit_access project "$project_base/skills"
+    emit_access user_mcp "$user_base/mcp.json"
+    emit_access project_mcp "$project_base/mcp.json"
+    emit_root user pi "$user_base/skills"
+    emit_root user agents "$HOME/.agents/skills"
+    ;;
   *) exit 64 ;;
 esac
 cursor=$PWD
@@ -1322,6 +1386,10 @@ while test "$depth" -lt 32; do
       emit_root project claude "$cursor/.claude/skills"
       emit_root project agents "$cursor/.agents/skills"
       emit_root project opencode "$cursor/.opencode/skills"
+      ;;
+    pi)
+      emit_root project pi "$cursor/.pi/skills"
+      emit_root project agents "$cursor/.agents/skills"
       ;;
   esac
   test "$cursor" = "$project_root" && break
@@ -1343,9 +1411,11 @@ case "$scope:$provider" in
   user:claude) base=$HOME/.claude/skills ;;
   user:codex) base=$HOME/.agents/skills ;;
   user:open_code) base=${XDG_CONFIG_HOME:-$HOME/.config}/opencode/skills ;;
+  user:pi) base=${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}/skills ;;
   project:claude) base=$PWD/.claude/skills ;;
   project:codex) base=$PWD/.agents/skills ;;
   project:open_code) base=$PWD/.opencode/skills ;;
+  project:pi) base=$PWD/.pi/skills ;;
   *) exit 64 ;;
 esac
 target=$base/$name
@@ -1472,6 +1542,8 @@ impl AgentRuntimeBuilder {
         builder.register(crate::providers::Codex::default());
         #[cfg(feature = "opencode")]
         builder.register(crate::providers::OpenCode::default());
+        #[cfg(feature = "pi")]
+        builder.register(crate::providers::Pi::default());
         builder
     }
 
@@ -2264,6 +2336,18 @@ impl AgentRuntime {
         adapter: Arc<dyn AgentAdapter>,
         working_directory: &std::path::Path,
     ) -> crate::TransportResult<Vec<HarnessMcpServer>> {
+        if provider == Provider::Pi {
+            // `pi mcp list` connects to every configured server and exits
+            // nonzero when any of them is unreachable, so it cannot serve as a
+            // bounded, side-effect-free configuration listing.
+            return Err(TransportError::new(
+                TransportErrorKind::Unsupported,
+                self.transport.name(),
+                "discover_mcp",
+                "pi MCP discovery connects to every configured server; listing is not supported",
+                false,
+            ));
+        }
         let mut command = CommandSpec::new(adapter.executable());
         command.args.extend(["mcp".into(), "list".into()]);
         if provider == Provider::Codex {
@@ -2564,7 +2648,12 @@ impl AgentRuntime {
     async fn discover_harnesses_inner(&self, context: ProviderProbeContext) -> HarnessInventory {
         let capabilities = self.transport.capabilities();
         let mut tasks = tokio::task::JoinSet::new();
-        for provider in [Provider::Claude, Provider::Codex, Provider::OpenCode] {
+        for provider in [
+            Provider::Claude,
+            Provider::Codex,
+            Provider::OpenCode,
+            Provider::Pi,
+        ] {
             if self.adapters.contains_key(&provider) {
                 let runtime = self.clone();
                 let context = context.clone();
@@ -4613,8 +4702,8 @@ impl AgentRuntime {
                     .unwrap_or(request.timeout)
             };
             let deadline = last_semantic_activity + inactivity_timeout;
-            let line = if let Some(line) = prefetched_lines.pop_front() {
-                Some(line)
+            let frame = if let Some(line) = prefetched_lines.pop_front() {
+                Some(ProviderFrame::Line(line))
             } else {
                 let handoff_ready = adapter.retained_handoff_ready(&state);
                 handoff.ready.store(handoff_ready, Ordering::Release);
@@ -4670,7 +4759,7 @@ impl AgentRuntime {
                 // Finish a frame that has begun even if the turn is cancelled
                 // meanwhile: abandoning the read would lose its consumed prefix
                 // and corrupt the stream an interrupted process still owns.
-                let read = read_bounded_retained_line(&mut io.reader, self.max_event_line_bytes);
+                let read = read_provider_frame(&mut io.reader, self.max_event_line_bytes);
                 tokio::pin!(read);
                 let mut frame_deadline = deadline;
                 let mut cancel_seen = false;
@@ -4699,7 +4788,7 @@ impl AgentRuntime {
                     }
                 }
             };
-            let Some(line) = line else {
+            let Some(frame) = frame else {
                 return Err(RuntimeError::ProcessFailed {
                     provider,
                     kind: ProviderProcessErrorKind::Unknown,
@@ -4715,13 +4804,23 @@ impl AgentRuntime {
                 first_output = false;
                 trace.record(StartupStage::FirstOutput);
             }
-            if line.len() > self.max_event_line_bytes {
-                return Err(RuntimeError::Protocol {
-                    provider,
-                    message: format!("event line exceeded {} bytes", self.max_event_line_bytes),
-                });
-            }
-            let output = adapter.parse_line(&line, &mut state)?;
+            let output = match frame {
+                ProviderFrame::Line(line) if line.len() <= self.max_event_line_bytes => {
+                    adapter.parse_line(&line, &mut state)?
+                }
+                ProviderFrame::Line(_) => {
+                    return Err(RuntimeError::Protocol {
+                        provider,
+                        message: format!("event line exceeded {} bytes", self.max_event_line_bytes),
+                    });
+                }
+                ProviderFrame::Oversized { prefix } => adapter
+                    .parse_oversized_frame(&prefix, &mut state)
+                    .ok_or_else(|| RuntimeError::Protocol {
+                        provider,
+                        message: format!("event line exceeded {} bytes", self.max_event_line_bytes),
+                    })?,
+            };
             let semantic_activity = !output.events.is_empty()
                 || !output.writes.is_empty()
                 || output.interaction.is_some()
@@ -5114,10 +5213,10 @@ impl AgentRuntime {
         trace.record(StartupStage::StreamsAttached);
         let mut first_output = true;
         let mut first_text = true;
-        let mut lines = BufReader::new(reader).lines();
+        let mut reader = BufReader::new(reader);
         let mut protocol_completed = false;
         loop {
-            let line = tokio::select! {
+            let frame = tokio::select! {
                 _ = request.cancellation.cancelled() => {
                     let error = cancel_running_process(
                         provider,
@@ -5130,26 +5229,34 @@ impl AgentRuntime {
                     stderr_task.abort();
                     return Err(error);
                 }
-                line = lines.next_line() => line.map_err(|source| RuntimeError::ProcessIo {
+                frame = read_provider_frame(&mut reader, self.max_event_line_bytes) => frame.map_err(|source| RuntimeError::ProcessIo {
                     provider,
                     stream: "stdout read",
                     source,
                 })?,
             };
-            let Some(line) = line else { break };
+            let Some(frame) = frame else { break };
             if first_output {
                 first_output = false;
                 trace.record(StartupStage::FirstOutput);
             }
-            if line.len() > self.max_event_line_bytes {
-                let _ = process.terminate().await;
-                stderr_task.abort();
-                return Err(RuntimeError::Protocol {
-                    provider,
-                    message: format!("event line exceeded {} bytes", self.max_event_line_bytes),
-                });
-            }
-            let output = adapter.parse_line(&line, &mut state)?;
+            let output = match frame {
+                ProviderFrame::Line(line) => adapter.parse_line(&line, &mut state)?,
+                ProviderFrame::Oversized { prefix } => {
+                    let Some(output) = adapter.parse_oversized_frame(&prefix, &mut state) else {
+                        let _ = process.terminate().await;
+                        stderr_task.abort();
+                        return Err(RuntimeError::Protocol {
+                            provider,
+                            message: format!(
+                                "event line exceeded {} bytes",
+                                self.max_event_line_bytes
+                            ),
+                        });
+                    };
+                    output
+                }
+            };
             for event in output.events {
                 if first_text && matches!(&event, TurnEvent::TextDelta { text } if !text.is_empty())
                 {
@@ -5405,6 +5512,7 @@ const fn provider_order(provider: Provider) -> u8 {
         Provider::Claude => 0,
         Provider::Codex => 1,
         Provider::OpenCode => 2,
+        Provider::Pi => 3,
     }
 }
 
@@ -5413,6 +5521,7 @@ fn provider_argument(provider: Provider) -> &'static str {
         Provider::Claude => "claude",
         Provider::Codex => "codex",
         Provider::OpenCode => "open_code",
+        Provider::Pi => "pi",
     }
 }
 
@@ -5731,6 +5840,13 @@ fn mcp_management_access(provider: Provider) -> (HarnessExtensionAccess, Harness
             );
             (denied.clone(), denied)
         }
+        Provider::Pi => {
+            let denied = HarnessExtensionAccess::denied(
+                HarnessExtensionDenialKind::ProviderUnsupported,
+                "pi MCP management is not supported by this SDK yet; configure servers with `pi mcp add`.",
+            );
+            (denied.clone(), denied)
+        }
     }
 }
 
@@ -5883,6 +5999,15 @@ fn build_mcp_management_command(
                 transport,
                 "manage_mcp_server",
                 "OpenCode MCP JSON/JSONC management is not safely supported",
+                false,
+            ));
+        }
+        (Provider::Pi, _) => {
+            return Err(TransportError::new(
+                TransportErrorKind::Unsupported,
+                transport,
+                "manage_mcp_server",
+                "pi MCP management is not supported by this SDK yet",
                 false,
             ));
         }
@@ -6211,6 +6336,78 @@ mod tests {
         reader.read_to_string(&mut written).await.unwrap();
         assert!(written.contains("queued"), "{written}");
         assert!(!written.contains("withdrawn"), "{written}");
+    }
+
+    async fn frames(input: &[u8], limit: usize) -> Vec<ProviderFrame> {
+        let mut reader = BufReader::with_capacity(8, input);
+        let mut frames = Vec::new();
+        while let Some(frame) = read_provider_frame(&mut reader, limit).await.unwrap() {
+            frames.push(frame);
+        }
+        frames
+    }
+
+    #[tokio::test]
+    async fn provider_frames_split_on_newline_only() {
+        let frames = frames("one\r\n{\"text\":\"a\u{2028}b\"}\nlast".as_bytes(), 64).await;
+        assert_eq!(
+            frames,
+            [
+                ProviderFrame::Line("one".into()),
+                ProviderFrame::Line("{\"text\":\"a\u{2028}b\"}".into()),
+                ProviderFrame::Line("last".into()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_oversized_frame_keeps_only_its_prefix_and_the_stream_stays_aligned() {
+        let large = format!(
+            "{{\"type\":\"agent_end\",\"messages\":\"{}\"}}",
+            "x".repeat(10_000)
+        );
+        let input = format!("small\n{large}\nafter\n{large}");
+        let frames = frames(input.as_bytes(), 1_024).await;
+        assert_eq!(frames.len(), 4, "{frames:?}");
+        assert_eq!(frames[0], ProviderFrame::Line("small".into()));
+        assert_eq!(frames[2], ProviderFrame::Line("after".into()));
+        for frame in [&frames[1], &frames[3]] {
+            let ProviderFrame::Oversized { prefix } = frame else {
+                panic!("expected an oversized frame, got {frame:?}");
+            };
+            assert_eq!(prefix.len(), OVERSIZED_FRAME_PREFIX_BYTES);
+            assert!(prefix.starts_with("{\"type\":\"agent_end\""));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_frame_exactly_at_the_limit_is_not_oversized() {
+        let frames = frames(
+            b"0123456789\n0123456789\r\n01234567890\n01234567890\r\n01234567890",
+            10,
+        )
+        .await;
+        assert_eq!(frames.len(), 5, "{frames:?}");
+        assert_eq!(frames[0], ProviderFrame::Line("0123456789".into()));
+        assert_eq!(frames[1], ProviderFrame::Line("0123456789".into()));
+        // One byte over the limit, whatever terminates the frame.
+        for frame in &frames[2..] {
+            assert!(
+                matches!(frame, ProviderFrame::Oversized { .. }),
+                "expected an oversized frame, got {frame:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_retained_reader_still_rejects_oversized_frames() {
+        let input: crate::TransportReader =
+            Box::new(std::io::Cursor::new(b"0123456789AB\n".to_vec()));
+        let mut reader = BufReader::new(input);
+        let error = read_bounded_retained_line(&mut reader, 10)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     }
 
     #[cfg(feature = "claude")]

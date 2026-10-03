@@ -16,7 +16,7 @@ temps-agent-runtime = { path = "../temps-agent-runtime" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
-Default features include Claude Code, Codex, OpenCode, and Nono. Use
+Default features include Claude Code, Codex, OpenCode, pi, and Nono. Use
 `default-features = false` with a provider feature when you need a smaller
 dependency surface.
 
