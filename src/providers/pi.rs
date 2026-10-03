@@ -24,7 +24,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::adapter::{inspect_executable, resolve_executable, AdapterState};
+use crate::adapter::{inspect_executable, resolve_executable, AdapterState, OversizedFrame};
 use crate::error::classify_provider_failure;
 use crate::lifecycle::DeliveryState;
 use crate::{
@@ -954,66 +954,22 @@ impl AgentAdapter for Pi {
         Ok(output)
     }
 
+    fn accepts_oversized_frame(&self, prefix: &str) -> bool {
+        oversized_frame_kind(prefix).is_some()
+    }
+
     fn parse_oversized_frame(
         &self,
-        prefix: &str,
+        frame: OversizedFrame<'_>,
         state: &mut AdapterState,
-    ) -> Option<AdapterOutput> {
-        // pi writes `type` first. These frames repeat what the turn already
-        // received in smaller ones: `agent_end` and `turn_end` echo every
-        // message of the run, non-assistant `message_*` records echo user
-        // input and tool results, and tool progress is superseded by
-        // `tool_execution_end`.
-        const REDUNDANT: [&str; 4] = [
-            r#"{"type":"agent_end""#,
-            r#"{"type":"turn_end""#,
-            r#"{"type":"message_start""#,
-            r#"{"type":"tool_execution_update""#,
-        ];
-        if REDUNDANT.iter().any(|frame| prefix.starts_with(frame)) {
-            return Some(AdapterOutput::default());
+    ) -> Result<AdapterOutput> {
+        match oversized_frame_kind(frame.prefix) {
+            Some(OversizedKind::Redundant) => Ok(AdapterOutput::default()),
+            Some(OversizedKind::ToolEnd) => Ok(oversized_tool_end(frame, state)),
+            None => Err(protocol(
+                "pi wrote an event larger than the event limit that cannot be skipped",
+            )),
         }
-        if prefix.starts_with(r#"{"type":"message_end","message":{"role":""#)
-            && !prefix.starts_with(r#"{"type":"message_end","message":{"role":"assistant""#)
-        {
-            return Some(AdapterOutput::default());
-        }
-        // A tool whose result is too large to relay (an image read, say)
-        // still finished; report it without its output. pi writes the call
-        // id before the result, and the only call in flight is the fallback.
-        if prefix.starts_with(r#"{"type":"tool_execution_end""#) {
-            let field = |name: &str| {
-                let start = prefix.find(&format!(r#""{name}":""#))? + name.len() + 4;
-                let end = prefix[start..].find('"')? + start;
-                Some(prefix[start..end].to_string())
-            };
-            let mut turn = load(state);
-            let running = match field("toolCallId") {
-                Some(id) => turn
-                    .running_tools
-                    .iter()
-                    .position(|(running, _)| *running == id),
-                None if turn.running_tools.len() == 1 => Some(0),
-                None => None,
-            }
-            .map(|index| turn.running_tools.remove(index));
-            store(state, &turn);
-            return Some(AdapterOutput {
-                events: vec![TurnEvent::ToolCall {
-                    id: field("toolCallId").or_else(|| running.as_ref().map(|(id, _)| id.clone())),
-                    name: field("toolName")
-                        .or_else(|| running.map(|(_, name)| name))
-                        .unwrap_or_else(|| "tool".into()),
-                    status: ToolCallStatus::Succeeded,
-                    input: None,
-                    output: Some("[pi tool output omitted: larger than the event limit]".into()),
-                    error: None,
-                    task_id: None,
-                }],
-                ..AdapterOutput::default()
-            });
-        }
-        None
     }
 
     fn approval_response(
@@ -1060,6 +1016,113 @@ impl AgentAdapter for Pi {
     }
 }
 
+/// An event pi wrote that is larger than the event limit and can be read
+/// without.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OversizedKind {
+    /// It repeats what the turn already received in smaller events.
+    Redundant,
+    /// A tool finished with a result too large to relay.
+    ToolEnd,
+}
+
+fn oversized_frame_kind(prefix: &str) -> Option<OversizedKind> {
+    // pi writes `type` first. These frames repeat what the turn already
+    // received in smaller ones: `agent_end` and `turn_end` echo every message
+    // of the run, non-assistant `message_*` records echo user input and tool
+    // results, and tool progress is superseded by `tool_execution_end`.
+    const REDUNDANT: [&str; 4] = [
+        r#"{"type":"agent_end""#,
+        r#"{"type":"turn_end""#,
+        r#"{"type":"message_start""#,
+        r#"{"type":"tool_execution_update""#,
+    ];
+    if REDUNDANT.iter().any(|frame| prefix.starts_with(frame))
+        || (prefix.starts_with(r#"{"type":"message_end","message":{"role":""#)
+            && !prefix.starts_with(r#"{"type":"message_end","message":{"role":"assistant""#))
+    {
+        return Some(OversizedKind::Redundant);
+    }
+    prefix
+        .starts_with(r#"{"type":"tool_execution_end""#)
+        .then_some(OversizedKind::ToolEnd)
+}
+
+/// Report a tool whose result (an image read, say) is too large to relay,
+/// without that result.
+fn oversized_tool_end(frame: OversizedFrame<'_>, state: &mut AdapterState) -> AdapterOutput {
+    // pi writes the call id before the result, and the only call in flight
+    // is the fallback.
+    let field = |name: &str| {
+        let start = frame.prefix.find(&format!(r#""{name}":""#))? + name.len() + 4;
+        let end = frame.prefix[start..].find('"')? + start;
+        Some(frame.prefix[start..end].to_string())
+    };
+    let mut turn = load(state);
+    let running = match field("toolCallId") {
+        Some(id) => turn
+            .running_tools
+            .iter()
+            .position(|(running, _)| *running == id),
+        None if turn.running_tools.len() == 1 => Some(0),
+        None => None,
+    }
+    .map(|index| turn.running_tools.remove(index));
+    store(state, &turn);
+    let id = field("toolCallId").or_else(|| running.as_ref().map(|(id, _)| id.clone()));
+    let name = field("toolName")
+        .or_else(|| running.map(|(_, name)| name))
+        .unwrap_or_else(|| "tool".into());
+    let (status, output, error) = match oversized_tool_failed(frame.suffix) {
+        Some(false) => (
+            ToolCallStatus::Succeeded,
+            Some("[pi tool output omitted: larger than the event limit]".to_string()),
+            None,
+        ),
+        Some(true) => (
+            ToolCallStatus::Failed,
+            None,
+            Some("[pi tool error omitted: larger than the event limit]".to_string()),
+        ),
+        // Never report success that pi did not confirm.
+        None => (
+            ToolCallStatus::Failed,
+            None,
+            Some(
+                "pi reported a tool result larger than the event limit, and whether the tool \
+                 succeeded could not be read"
+                    .to_string(),
+            ),
+        ),
+    };
+    AdapterOutput {
+        events: vec![TurnEvent::ToolCall {
+            id,
+            name,
+            status,
+            input: None,
+            output,
+            error,
+            task_id: None,
+        }],
+        ..AdapterOutput::default()
+    }
+}
+
+/// Whether an oversized `tool_execution_end` reports a failure. pi writes
+/// `isError` last, after the result, so it survives in the frame's tail; a
+/// tail that does not end with it is unknown.
+fn oversized_tool_failed(suffix: &str) -> Option<bool> {
+    let suffix = suffix.trim_end();
+    if suffix.ends_with(r#","isError":true}"#) {
+        Some(true)
+    } else if suffix.ends_with(r#","isError":false}"#) {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 /// Handle a response to one of the adapter's own commands.
 fn response(
     value: &Value,
@@ -1089,17 +1152,37 @@ fn response(
             // pi writes a session file only once it holds a message, so a
             // resumed session that reports none did not exist: `--session-id`
             // created an empty one. Fail rather than silently answer
-            // without the conversation the caller meant to continue.
+            // without the conversation the caller meant to continue, and fail
+            // too when pi does not say, since the session cannot be
+            // confirmed.
             if let Some(resume) = turn.resume.as_deref() {
-                if data.get("messageCount").and_then(Value::as_u64) == Some(0) {
-                    fail(
-                        state,
-                        output,
-                        format!("pi session `{resume}` was not found for this working directory"),
-                        Some("session_not_found"),
-                        DeliveryState::NotSent,
-                    );
-                    return Ok(());
+                match data.get("messageCount").and_then(Value::as_u64) {
+                    Some(count) if count > 0 => {}
+                    Some(_) => {
+                        fail(
+                            state,
+                            output,
+                            format!(
+                                "pi session `{resume}` was not found for this working directory"
+                            ),
+                            Some("session_not_found"),
+                            DeliveryState::NotSent,
+                        );
+                        return Ok(());
+                    }
+                    None => {
+                        fail(
+                            state,
+                            output,
+                            format!(
+                                "pi did not report how many messages session `{resume}` holds, \
+                                 so resuming it could not be confirmed"
+                            ),
+                            Some("session_unconfirmed"),
+                            DeliveryState::NotSent,
+                        );
+                        return Ok(());
+                    }
                 }
             }
             let model = data.get("model");
@@ -1469,6 +1552,40 @@ mod tests {
             Some("pi::session_not_found")
         );
         assert_eq!(failure.delivery, DeliveryState::NotSent);
+    }
+
+    #[test]
+    fn a_resume_pi_cannot_confirm_fails_before_the_prompt_is_sent() {
+        let adapter = Pi::default();
+        let mut request = full_access("continue");
+        request.session_id = Some("kept".into());
+        for data in [
+            json!({"sessionId": "kept"}),
+            json!({"sessionId": "kept", "messageCount": null}),
+            json!({"sessionId": "kept", "messageCount": "3"}),
+            json!({"sessionId": "kept", "messageCount": -1}),
+            json!({"sessionId": "kept", "messageCount": 2.5}),
+        ] {
+            let mut state = AdapterState::default();
+            adapter.prepare_turn(&request, &mut state).unwrap();
+            let output = adapter
+                .parse_line(
+                    &json!({"id": ID_STATE, "type": "response", "command": "get_state",
+                        "success": true, "data": data})
+                    .to_string(),
+                    &mut state,
+                )
+                .unwrap();
+            assert!(output.terminal, "{data}");
+            assert!(output.writes.is_empty(), "the prompt was sent for {data}");
+            let failure = state.terminal_failure.unwrap();
+            assert_eq!(
+                failure.provider_code.as_deref(),
+                Some("pi::session_unconfirmed"),
+                "{data}"
+            );
+            assert_eq!(failure.delivery, DeliveryState::NotSent);
+        }
     }
 
     #[test]
@@ -1893,23 +2010,80 @@ mod tests {
             r#"{"type":"message_start","message":{"role":"user""#,
             r#"{"type":"tool_execution_update","toolCallId":"x""#,
         ] {
+            assert!(adapter.accepts_oversized_frame(prefix), "{prefix}");
             let output = adapter
-                .parse_oversized_frame(prefix, &mut state)
-                .expect(prefix);
-            assert!(output.events.is_empty() && !output.terminal);
+                .parse_oversized_frame(OversizedFrame::new(prefix, "]}"), &mut state)
+                .unwrap();
+            assert!(output.events.is_empty() && !output.terminal, "{prefix}");
         }
-        let output = adapter
-            .parse_oversized_frame(
-                r#"{"type":"tool_execution_end","toolCallId":"call-9","toolName":"read","result":{"content":[{"type":"image","data":"iVBOR"#,
-                &mut state,
-            )
-            .unwrap();
-        assert!(matches!(
-            output.events.as_slice(),
-            [TurnEvent::ToolCall { id: Some(id), name, status: ToolCallStatus::Succeeded, .. }]
-                if id == "call-9" && name == "read"
-        ));
-        // Without an id in the prefix, the single call in flight finished.
+        // The answer itself and unknown events cannot be done without.
+        for prefix in [
+            r#"{"type":"message_end","message":{"role":"assistant""#,
+            r#"{"type":"agent_settled"}"#,
+            r#"{"type":"message_update","assistantMessageEvent":{"#,
+        ] {
+            assert!(!adapter.accepts_oversized_frame(prefix), "{prefix}");
+            assert!(adapter
+                .parse_oversized_frame(OversizedFrame::new(prefix, "}"), &mut state)
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn an_oversized_tool_result_keeps_the_outcome_pi_reported() {
+        let adapter = Pi::default();
+        let prefix = r#"{"type":"tool_execution_end","toolCallId":"call-9","toolName":"read","result":{"content":[{"type":"image","data":"iVBOR"#;
+        assert!(adapter.accepts_oversized_frame(prefix));
+        for (suffix, status, failed_text) in [
+            (
+                r#"AAAA"}],"details":{}},"isError":false}"#,
+                ToolCallStatus::Succeeded,
+                None,
+            ),
+            (
+                r#"too large"}],"details":{}},"isError":true}"#,
+                ToolCallStatus::Failed,
+                Some("[pi tool error omitted: larger than the event limit]"),
+            ),
+            // A tail that does not end with `isError` is never a success.
+            (
+                r#"AAAA"}],"details":{}}}"#,
+                ToolCallStatus::Failed,
+                Some("pi reported a tool result larger than the event limit, and whether the tool succeeded could not be read"),
+            ),
+            // `isError` inside the result's text is escaped and does not count.
+            (
+                r#"\",\"isError\":false}"}]}}"#,
+                ToolCallStatus::Failed,
+                Some("pi reported a tool result larger than the event limit, and whether the tool succeeded could not be read"),
+            ),
+        ] {
+            let mut state = AdapterState::default();
+            let output = adapter
+                .parse_oversized_frame(OversizedFrame::new(prefix, suffix), &mut state)
+                .unwrap();
+            let [TurnEvent::ToolCall {
+                id: Some(id),
+                name,
+                status: reported,
+                output,
+                error,
+                ..
+            }] = output.events.as_slice()
+            else {
+                panic!("expected one tool call for {suffix}: {:?}", output.events);
+            };
+            assert_eq!((id.as_str(), name.as_str()), ("call-9", "read"));
+            assert_eq!(*reported, status, "{suffix}");
+            assert_eq!(error.as_deref(), failed_text, "{suffix}");
+            assert_eq!(output.is_some(), failed_text.is_none(), "{suffix}");
+        }
+    }
+
+    #[test]
+    fn an_oversized_tool_result_without_an_id_finishes_the_call_in_flight() {
+        let adapter = Pi::default();
+        let mut state = AdapterState::default();
         adapter
             .parse_line(
                 &json!({"type": "tool_execution_start", "toolCallId": "call-10", "toolName": "read", "args": {}})
@@ -1919,27 +2093,22 @@ mod tests {
             .unwrap();
         let output = adapter
             .parse_oversized_frame(
-                r#"{"type":"tool_execution_end","result":{"content":[{"#,
+                OversizedFrame::new(
+                    r#"{"type":"tool_execution_end","result":{"content":[{"#,
+                    r#"]},"isError":true}"#,
+                ),
                 &mut state,
             )
             .unwrap();
         assert!(matches!(
             output.events.as_slice(),
-            [TurnEvent::ToolCall { id: Some(id), name, .. }] if id == "call-10" && name == "read"
+            [TurnEvent::ToolCall { id: Some(id), name, status: ToolCallStatus::Failed, .. }]
+                if id == "call-10" && name == "read"
         ));
         assert!(
             load(&state).running_tools.is_empty(),
             "the finished call is no longer in flight"
         );
-        assert!(adapter
-            .parse_oversized_frame(
-                r#"{"type":"message_end","message":{"role":"assistant""#,
-                &mut state
-            )
-            .is_none());
-        assert!(adapter
-            .parse_oversized_frame(r#"{"type":"agent_settled"}"#, &mut state)
-            .is_none());
     }
 
     #[test]

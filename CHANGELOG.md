@@ -15,15 +15,17 @@ Versioning and Keep a Changelog conventions.
   credential check through `pi --list-models`. pi runs tools without asking,
   so the adapter accepts only `FullAccess` and `Plan` (pi's read-only tools);
   approvals and questions come from pi extensions' UI requests. A resume of a
-  session pi does not have fails as `pi::session_not_found` before the prompt
-  is sent. `Provider::Pi` is a new variant of the non-exhaustive `Provider`
+  session pi does not have fails as `pi::session_not_found`, and one pi cannot
+  confirm as `pi::session_unconfirmed`, before the prompt is sent. `Provider::Pi` is a new variant of the non-exhaustive `Provider`
   enum, and default discovery now reports four harnesses. Skill discovery and
   management cover pi's skill directories; pi MCP discovery and management are
   reported as unsupported.
-- `AgentAdapter::parse_oversized_frame`. A provider line longer than the
-  event-line limit is now consumed without being buffered, and its adapter may
-  accept it from its first 512 bytes instead of failing the turn. The default
-  keeps the previous behavior.
+- `AgentAdapter::accepts_oversized_frame`, `AgentAdapter::parse_oversized_frame`
+  and `OversizedFrame`. An adapter may accept a provider line longer than the
+  event-line limit from its first 512 bytes instead of failing the turn; the
+  runtime then consumes the line without buffering it and passes its first and
+  last 512 bytes to the adapter. The default still fails the turn as soon as
+  the line crosses the limit.
 - `PI_CODING_AGENT_DIR` and `PI_CODING_AGENT_SESSION_DIR` pass through the
   local, SSH and Temps sandbox environment allowlists, like `CLAUDE_HOME`.
 

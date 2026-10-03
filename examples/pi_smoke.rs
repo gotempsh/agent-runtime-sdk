@@ -276,7 +276,44 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         .await?;
     println!("small-limit turn: text={:?}", oversized.text.trim());
 
-    // 6. Cancellation interrupts a running turn.
+    // 6. A failing tool whose output is larger than the event limit is still
+    // reported as failed.
+    let events = Recorder::default();
+    small
+        .run(
+            smoke.request(
+                "BIGFAIL: Use the bash tool to run `seq 1 3000; exit 3` exactly once, then reply with the word done.",
+                PermissionMode::FullAccess,
+            ),
+            &events,
+            None,
+        )
+        .await?;
+    let tools = events.tool_calls();
+    println!(
+        "oversized failing tool: {:?}",
+        tools
+            .iter()
+            .map(|(name, status, text)| {
+                let text = text.as_deref().unwrap_or_default();
+                (name, status, &text[..text.len().min(80)])
+            })
+            .collect::<Vec<_>>()
+    );
+    check(
+        tools
+            .iter()
+            .any(|(name, status, _)| name == "bash" && *status == ToolCallStatus::Failed),
+        "the oversized failing bash call was not reported as failed",
+    )?;
+    check(
+        !tools
+            .iter()
+            .any(|(name, status, _)| name == "bash" && *status == ToolCallStatus::Succeeded),
+        "the oversized failing bash call was reported as succeeded",
+    )?;
+
+    // 7. Cancellation interrupts a running turn.
     let token = tokio_util::sync::CancellationToken::new();
     let mut slow = smoke.request(
         "SLOW: count from 1 to 400, one number per line.",

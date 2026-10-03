@@ -175,9 +175,11 @@ load merely because a repository is the working directory.
 Session resume uses `--session-id`, which is exact and scoped to the working
 directory (`--session` would also match prefixes and offer on stdout to fork a
 session from another project). pi creates an empty session for an unknown id,
-so the adapter checks `messageCount` in the `get_state` response and fails a
-resume of a session with no messages as `pi::session_not_found` with
-`DeliveryState::NotSent`, before the prompt is written.
+so the adapter checks `messageCount` in the `get_state` response before the
+prompt is written. A resume of a session with no messages fails as
+`pi::session_not_found`, and one whose `messageCount` is missing or not a
+non-negative integer fails as `pi::session_unconfirmed`, both with
+`DeliveryState::NotSent`.
 
 `LaunchContext::system_prompt_append` becomes `--append-system-prompt`, which
 replaces pi's discovery of `APPEND_SYSTEM.md`; pi also reads the value as a
@@ -200,10 +202,13 @@ supported: `pi mcp list` connects to every configured server.
 
 pi's `agent_end` and `turn_end` echo every message of the run, so a long turn
 can produce one line larger than the event-line limit just before it settles.
-The adapter implements `AgentAdapter::parse_oversized_frame` to drop such
-summaries, oversized non-assistant messages and tool progress, and to report an
-oversized `tool_execution_end` as a completed call with its output omitted. An
-oversized assistant message still fails the turn.
+The adapter accepts such summaries, oversized non-assistant messages and tool
+progress through `AgentAdapter::accepts_oversized_frame` and drops them. An
+oversized `tool_execution_end` is reported with its output omitted and with
+the outcome pi wrote in `isError`, which pi places after the result and the
+runtime keeps in the frame's last bytes; if that field cannot be read, the call
+is reported as failed rather than succeeded. An oversized assistant message
+still fails the turn.
 
 pi's process is not retained across turns yet: each turn starts `pi` and
 resumes its session, so messages into a running turn are not supported.
@@ -412,12 +417,15 @@ stderr, and the native exit status, then redacts any returned reason before it
 enters `HarnessReadiness`. Returning no probe is a supported capability state
 and produces `HarnessAuthenticationStatus::Unknown`.
 
-`parse_oversized_frame` handles a frame longer than the event-line limit. The
-runtime never buffers such a frame: it keeps the first 512 bytes, discards the
-rest through the terminating newline, and passes that prefix to the adapter.
-The default returns `None`, which fails the turn with `RuntimeError::Protocol`;
-an adapter whose protocol repeats data in summary frames can return an output
-for the frames it can do without.
+`accepts_oversized_frame` and `parse_oversized_frame` handle a frame longer
+than the event-line limit, which the runtime never buffers. As soon as a frame
+crosses the limit, the runtime passes its first 512 bytes to
+`accepts_oversized_frame`. The default returns `false`, which fails the turn
+with `RuntimeError::Protocol` at once, without reading the rest of the frame.
+An adapter whose protocol repeats data in summary frames returns `true` for the
+frames it can do without; the runtime then consumes the rest through the
+terminating newline and passes an `OversizedFrame` with the first and last 512
+bytes to `parse_oversized_frame`.
 
 `executable` returns a name or path meaningful inside the selected transport.
 An adapter does not require that path to exist locally when constructing a
@@ -577,9 +585,10 @@ trusted declarations by backend implementers, not runtime attestation.
 ## Limits and compatibility
 
 - Default maximum prompt: 256 KiB.
-- Default maximum provider event line: 2 MiB. An oversized line is consumed
-  without being buffered and then fails the turn unless its adapter's
-  `parse_oversized_frame` accepts it.
+- Default maximum provider event line: 2 MiB. An oversized line fails the
+  turn as soon as it crosses the limit unless its adapter's
+  `accepts_oversized_frame` accepts it; an accepted line is consumed without
+  being buffered.
 - Captured stderr tail: 32 KiB.
 - Default turn deadline: 30 minutes.
 - Default interaction deadline: 10 minutes.

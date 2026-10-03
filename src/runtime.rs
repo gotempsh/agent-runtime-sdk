@@ -7,7 +7,9 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex, Notify, OwnedSemaphorePermit, Semaphore};
 
-use crate::adapter::{AdapterState, AgentAdapter, CommandSpec, IdleFrame, InteractionRequest};
+use crate::adapter::{
+    AdapterState, AgentAdapter, CommandSpec, IdleFrame, InteractionRequest, OversizedFrame,
+};
 use crate::error::classify_provider_failure;
 use crate::startup::{StartupObserver, StartupObserverState, StartupStage, StartupTrace};
 use crate::{
@@ -649,44 +651,54 @@ async fn read_bounded_retained_line(
     reader: &mut BufReader<crate::TransportReader>,
     limit: usize,
 ) -> std::io::Result<Option<String>> {
-    match read_provider_frame(reader, limit).await? {
+    match read_provider_frame(reader, limit, |_| false).await? {
         None => Ok(None),
         Some(ProviderFrame::Line(line)) => Ok(Some(line)),
-        Some(ProviderFrame::Oversized { .. }) => Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "provider event line exceeded configured limit",
-        )),
+        Some(ProviderFrame::Oversized { .. } | ProviderFrame::Rejected) => {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "provider event line exceeded configured limit",
+            ))
+        }
     }
 }
 
-/// Bytes kept from an oversized frame so its adapter can identify it.
-const OVERSIZED_FRAME_PREFIX_BYTES: usize = 512;
+/// Bytes kept from each end of an oversized frame.
+const OVERSIZED_FRAME_EDGE_BYTES: usize = 512;
 
 /// One newline-delimited provider frame read within the event-line limit.
 #[derive(Debug, PartialEq, Eq)]
 enum ProviderFrame {
     /// A complete frame without its line terminator.
     Line(String),
-    /// A frame longer than the limit. Only its first
-    /// [`OVERSIZED_FRAME_PREFIX_BYTES`] bytes were kept; the remainder was
-    /// consumed without being buffered.
-    Oversized { prefix: String },
+    /// A frame longer than the limit that the adapter accepted. Only its
+    /// first and last [`OVERSIZED_FRAME_EDGE_BYTES`] bytes were kept; the
+    /// rest was consumed without being buffered.
+    Oversized { prefix: String, suffix: String },
+    /// A frame longer than the limit that the adapter declined. Reading
+    /// stopped there, so the stream is no longer aligned on a frame.
+    Rejected,
 }
 
 /// Read one frame, bounding memory by `limit` even when the frame is larger.
 ///
-/// An oversized frame is consumed through its terminating newline so the
-/// stream stays aligned on the next frame, letting the adapter decide whether
-/// the turn can continue without it.
-async fn read_provider_frame<R>(
+/// When a frame grows past `limit`, `accept_oversized` decides from its first
+/// bytes whether to read on. A declined frame is reported at once; an
+/// accepted one is consumed through its terminating newline, so the stream
+/// stays aligned on the next frame.
+async fn read_provider_frame<R, F>(
     reader: &mut R,
     limit: usize,
+    accept_oversized: F,
 ) -> std::io::Result<Option<ProviderFrame>>
 where
     R: tokio::io::AsyncBufRead + Unpin,
+    F: Fn(&str) -> bool,
 {
     let mut bytes = Vec::new();
-    let mut oversized = false;
+    // Once the frame is known to be oversized: its prefix, and a window over
+    // the last bytes read.
+    let mut oversized: Option<(String, Vec<u8>)> = None;
     let mut read_any = false;
     loop {
         let available = reader.fill_buf().await?;
@@ -699,43 +711,83 @@ where
         read_any = true;
         let newline = available.iter().position(|byte| *byte == b'\n');
         let take = newline.map_or(available.len(), |position| position + 1);
-        // Leave room for a `\r\n` terminator; the stripped frame is held to
-        // `limit` exactly below.
-        if !oversized && bytes.len().saturating_add(take) > limit.saturating_add(2) {
-            oversized = true;
-            bytes.truncate(OVERSIZED_FRAME_PREFIX_BYTES);
-        }
-        if oversized {
-            let room = OVERSIZED_FRAME_PREFIX_BYTES.saturating_sub(bytes.len());
-            bytes.extend_from_slice(&available[..take.min(room)]);
+        let chunk = &available[..take];
+        if let Some((_, tail)) = oversized.as_mut() {
+            keep_frame_tail(tail, chunk);
+        } else if bytes.len().saturating_add(take)
+            > limit.saturating_add(2).max(OVERSIZED_FRAME_EDGE_BYTES - 1)
+        {
+            // Past room for a `\r\n` terminator, the frame exceeds `limit`
+            // however it ends. Under a limit smaller than the prefix, the
+            // decision waits for the whole prefix or the end of the frame.
+            bytes.extend_from_slice(chunk);
+            let prefix = frame_prefix(&bytes);
+            if !accept_oversized(&prefix) {
+                return Ok(Some(ProviderFrame::Rejected));
+            }
+            let mut tail = Vec::new();
+            keep_frame_tail(&mut tail, &bytes);
+            bytes = Vec::new();
+            oversized = Some((prefix, tail));
         } else {
-            bytes.extend_from_slice(&available[..take]);
+            bytes.extend_from_slice(chunk);
         }
         reader.consume(take);
         if newline.is_some() {
             break;
         }
     }
-    if oversized {
+    if let Some((prefix, tail)) = oversized {
         return Ok(Some(ProviderFrame::Oversized {
-            prefix: String::from_utf8_lossy(&bytes).into_owned(),
+            prefix,
+            suffix: frame_suffix(tail),
         }));
     }
+    strip_frame_terminator(&mut bytes);
+    // A frame up to two bytes over can only be judged once its terminator is
+    // known.
+    if bytes.len() > limit {
+        let prefix = frame_prefix(&bytes);
+        if !accept_oversized(&prefix) {
+            return Ok(Some(ProviderFrame::Rejected));
+        }
+        return Ok(Some(ProviderFrame::Oversized {
+            prefix,
+            suffix: frame_suffix(bytes),
+        }));
+    }
+    String::from_utf8(bytes)
+        .map(|line| Some(ProviderFrame::Line(line)))
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()))
+}
+
+fn frame_prefix(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(&bytes[..bytes.len().min(OVERSIZED_FRAME_EDGE_BYTES)]).into_owned()
+}
+
+/// Slide `tail` over `chunk`, keeping enough to strip a `\r\n` terminator
+/// and still hold [`OVERSIZED_FRAME_EDGE_BYTES`].
+fn keep_frame_tail(tail: &mut Vec<u8>, chunk: &[u8]) {
+    let keep = OVERSIZED_FRAME_EDGE_BYTES + 2;
+    tail.extend_from_slice(&chunk[chunk.len().saturating_sub(keep)..]);
+    if tail.len() > keep {
+        tail.drain(..tail.len() - keep);
+    }
+}
+
+fn frame_suffix(mut tail: Vec<u8>) -> String {
+    strip_frame_terminator(&mut tail);
+    let start = tail.len().saturating_sub(OVERSIZED_FRAME_EDGE_BYTES);
+    String::from_utf8_lossy(&tail[start..]).into_owned()
+}
+
+fn strip_frame_terminator(bytes: &mut Vec<u8>) {
     if bytes.last() == Some(&b'\n') {
         bytes.pop();
         if bytes.last() == Some(&b'\r') {
             bytes.pop();
         }
     }
-    if bytes.len() > limit {
-        bytes.truncate(OVERSIZED_FRAME_PREFIX_BYTES);
-        return Ok(Some(ProviderFrame::Oversized {
-            prefix: String::from_utf8_lossy(&bytes).into_owned(),
-        }));
-    }
-    String::from_utf8(bytes)
-        .map(|line| Some(ProviderFrame::Line(line)))
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()))
 }
 
 impl RetainedCodexProcess {
@@ -4759,7 +4811,10 @@ impl AgentRuntime {
                 // Finish a frame that has begun even if the turn is cancelled
                 // meanwhile: abandoning the read would lose its consumed prefix
                 // and corrupt the stream an interrupted process still owns.
-                let read = read_provider_frame(&mut io.reader, self.max_event_line_bytes);
+                let read =
+                    read_provider_frame(&mut io.reader, self.max_event_line_bytes, |prefix| {
+                        adapter.accepts_oversized_frame(prefix)
+                    });
                 tokio::pin!(read);
                 let mut frame_deadline = deadline;
                 let mut cancel_seen = false;
@@ -4808,18 +4863,14 @@ impl AgentRuntime {
                 ProviderFrame::Line(line) if line.len() <= self.max_event_line_bytes => {
                     adapter.parse_line(&line, &mut state)?
                 }
-                ProviderFrame::Line(_) => {
+                ProviderFrame::Oversized { prefix, suffix } => adapter
+                    .parse_oversized_frame(OversizedFrame::new(&prefix, &suffix), &mut state)?,
+                ProviderFrame::Line(_) | ProviderFrame::Rejected => {
                     return Err(RuntimeError::Protocol {
                         provider,
                         message: format!("event line exceeded {} bytes", self.max_event_line_bytes),
                     });
                 }
-                ProviderFrame::Oversized { prefix } => adapter
-                    .parse_oversized_frame(&prefix, &mut state)
-                    .ok_or_else(|| RuntimeError::Protocol {
-                        provider,
-                        message: format!("event line exceeded {} bytes", self.max_event_line_bytes),
-                    })?,
             };
             let semantic_activity = !output.events.is_empty()
                 || !output.writes.is_empty()
@@ -5229,7 +5280,7 @@ impl AgentRuntime {
                     stderr_task.abort();
                     return Err(error);
                 }
-                frame = read_provider_frame(&mut reader, self.max_event_line_bytes) => frame.map_err(|source| RuntimeError::ProcessIo {
+                frame = read_provider_frame(&mut reader, self.max_event_line_bytes, |prefix| adapter.accepts_oversized_frame(prefix)) => frame.map_err(|source| RuntimeError::ProcessIo {
                     provider,
                     stream: "stdout read",
                     source,
@@ -5242,19 +5293,15 @@ impl AgentRuntime {
             }
             let output = match frame {
                 ProviderFrame::Line(line) => adapter.parse_line(&line, &mut state)?,
-                ProviderFrame::Oversized { prefix } => {
-                    let Some(output) = adapter.parse_oversized_frame(&prefix, &mut state) else {
-                        let _ = process.terminate().await;
-                        stderr_task.abort();
-                        return Err(RuntimeError::Protocol {
-                            provider,
-                            message: format!(
-                                "event line exceeded {} bytes",
-                                self.max_event_line_bytes
-                            ),
-                        });
-                    };
-                    output
+                ProviderFrame::Oversized { prefix, suffix } => adapter
+                    .parse_oversized_frame(OversizedFrame::new(&prefix, &suffix), &mut state)?,
+                ProviderFrame::Rejected => {
+                    let _ = process.terminate().await;
+                    stderr_task.abort();
+                    return Err(RuntimeError::Protocol {
+                        provider,
+                        message: format!("event line exceeded {} bytes", self.max_event_line_bytes),
+                    });
                 }
             };
             for event in output.events {
@@ -6338,10 +6385,14 @@ mod tests {
         assert!(!written.contains("withdrawn"), "{written}");
     }
 
+    /// Read every frame, accepting all oversized ones.
     async fn frames(input: &[u8], limit: usize) -> Vec<ProviderFrame> {
         let mut reader = BufReader::with_capacity(8, input);
         let mut frames = Vec::new();
-        while let Some(frame) = read_provider_frame(&mut reader, limit).await.unwrap() {
+        while let Some(frame) = read_provider_frame(&mut reader, limit, |_| true)
+            .await
+            .unwrap()
+        {
             frames.push(frame);
         }
         frames
@@ -6361,23 +6412,78 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_oversized_frame_keeps_only_its_prefix_and_the_stream_stays_aligned() {
+    async fn an_oversized_frame_keeps_only_its_edges_and_the_stream_stays_aligned() {
         let large = format!(
-            "{{\"type\":\"agent_end\",\"messages\":\"{}\"}}",
+            "{{\"type\":\"tool_execution_end\",\"result\":\"{}\",\"isError\":true}}",
             "x".repeat(10_000)
         );
-        let input = format!("small\n{large}\nafter\n{large}");
+        let input = format!("small\n{large}\r\nafter\n{large}");
         let frames = frames(input.as_bytes(), 1_024).await;
         assert_eq!(frames.len(), 4, "{frames:?}");
         assert_eq!(frames[0], ProviderFrame::Line("small".into()));
         assert_eq!(frames[2], ProviderFrame::Line("after".into()));
         for frame in [&frames[1], &frames[3]] {
-            let ProviderFrame::Oversized { prefix } = frame else {
+            let ProviderFrame::Oversized { prefix, suffix } = frame else {
                 panic!("expected an oversized frame, got {frame:?}");
             };
-            assert_eq!(prefix.len(), OVERSIZED_FRAME_PREFIX_BYTES);
-            assert!(prefix.starts_with("{\"type\":\"agent_end\""));
+            assert_eq!(prefix.len(), OVERSIZED_FRAME_EDGE_BYTES);
+            assert!(prefix.starts_with("{\"type\":\"tool_execution_end\""));
+            assert_eq!(suffix.len(), OVERSIZED_FRAME_EDGE_BYTES);
+            assert!(suffix.ends_with("x\",\"isError\":true}"), "{suffix}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_short_oversized_frame_reports_overlapping_edges() {
+        let frames = frames(b"{\"type\":\"x\",\"isError\":false}\n", 16).await;
+        assert_eq!(
+            frames,
+            [ProviderFrame::Oversized {
+                prefix: "{\"type\":\"x\",\"isError\":false}".into(),
+                suffix: "{\"type\":\"x\",\"isError\":false}".into(),
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_limit_smaller_than_the_prefix_still_yields_the_whole_prefix() {
+        let frame = format!(
+            "{{\"type\":\"agent_end\",\"data\":\"{}\"}}",
+            "y".repeat(2_000)
+        );
+        let frames = frames(format!("{frame}\nnext\n").as_bytes(), 16).await;
+        assert_eq!(frames.len(), 2, "{frames:?}");
+        let ProviderFrame::Oversized { prefix, suffix } = &frames[0] else {
+            panic!("expected an oversized frame, got {:?}", frames[0]);
+        };
+        assert_eq!(prefix.as_str(), &frame[..OVERSIZED_FRAME_EDGE_BYTES]);
+        assert_eq!(
+            suffix.as_str(),
+            &frame[frame.len() - OVERSIZED_FRAME_EDGE_BYTES..]
+        );
+        assert_eq!(frames[1], ProviderFrame::Line("next".into()));
+    }
+
+    #[tokio::test]
+    async fn a_declined_frame_is_rejected_at_the_limit_without_waiting_for_its_end() {
+        let (mut writer, reader) = tokio::io::duplex(64 * 1024);
+        // Twice the limit and no newline; the writer stays open.
+        writer.write_all(&[b'x'; 2_048]).await.unwrap();
+        let mut reader = BufReader::with_capacity(256, reader);
+        let seen = std::sync::Mutex::new(None);
+        let frame = tokio::time::timeout(
+            Duration::from_secs(5),
+            read_provider_frame(&mut reader, 1_024, |prefix| {
+                *seen.lock().unwrap() = Some(prefix.len());
+                false
+            }),
+        )
+        .await
+        .expect("a declined frame must not wait for its newline")
+        .unwrap();
+        assert_eq!(frame, Some(ProviderFrame::Rejected));
+        assert_eq!(*seen.lock().unwrap(), Some(OVERSIZED_FRAME_EDGE_BYTES));
+        drop(writer);
     }
 
     #[tokio::test]

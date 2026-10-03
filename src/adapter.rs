@@ -196,6 +196,29 @@ pub enum InteractionRequest {
     },
 }
 
+/// A provider frame longer than the runtime's event-line limit.
+///
+/// The runtime never buffers such a frame. It keeps only the frame's first
+/// and last few hundred bytes, so an adapter can identify the frame from its
+/// head and read fields its provider writes after a large payload from its
+/// tail. The two overlap when the frame is shorter than both together.
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub struct OversizedFrame<'a> {
+    /// The frame's first bytes.
+    pub prefix: &'a str,
+    /// The frame's last bytes, without its line terminator.
+    pub suffix: &'a str,
+}
+
+impl<'a> OversizedFrame<'a> {
+    /// Describe an oversized frame by its first and last bytes.
+    #[must_use]
+    pub const fn new(prefix: &'a str, suffix: &'a str) -> Self {
+        Self { prefix, suffix }
+    }
+}
+
 /// Result of parsing one provider output line.
 #[derive(Debug, Default)]
 pub struct AdapterOutput {
@@ -557,22 +580,33 @@ pub trait AgentAdapter: Send + Sync {
     /// Translate one stdout line and update accumulated state.
     fn parse_line(&self, line: &str, state: &mut AdapterState) -> Result<AdapterOutput>;
 
-    /// Handle one frame longer than the runtime's event-line limit.
+    /// Decide whether a frame longer than the event-line limit may be read
+    /// past the limit instead of failing the turn.
     ///
-    /// The runtime never buffers such a frame: it keeps only `prefix`, the
-    /// frame's first few hundred bytes, and discards the rest. Returning
-    /// `None` — the default — fails the turn with
-    /// [`crate::RuntimeError::Protocol`]. An adapter whose protocol repeats,
-    /// in summary frames, data it already received in smaller ones returns
-    /// the output for the frames it can do without, so a long turn does not
-    /// fail at its very end merely because its summary outgrew the limit.
+    /// Called once, as soon as the frame grows past the limit, with its first
+    /// few hundred bytes. Returning `false` — the default — fails the turn
+    /// with [`crate::RuntimeError::Protocol`] at once, without reading the
+    /// rest of the frame. Returning `true` makes the runtime consume the rest
+    /// without buffering it and pass the frame to
+    /// [`AgentAdapter::parse_oversized_frame`]. An adapter whose protocol
+    /// repeats, in summary frames, data it already received in smaller ones
+    /// accepts those, so a long turn does not fail at its very end merely
+    /// because its summary outgrew the limit.
+    fn accepts_oversized_frame(&self, prefix: &str) -> bool {
+        let _ = prefix;
+        false
+    }
+
+    /// Translate a frame accepted by
+    /// [`AgentAdapter::accepts_oversized_frame`], from its first and last
+    /// bytes.
     fn parse_oversized_frame(
         &self,
-        prefix: &str,
+        frame: OversizedFrame<'_>,
         state: &mut AdapterState,
-    ) -> Option<AdapterOutput> {
-        let _ = (prefix, state);
-        None
+    ) -> Result<AdapterOutput> {
+        let _ = (frame, state);
+        Ok(AdapterOutput::default())
     }
 
     /// Encode a provider-native cooperative interrupt for the running turn.

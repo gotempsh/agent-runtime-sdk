@@ -41,6 +41,8 @@ enum Script {
     /// Like `ToolRun`, but the run summary and one tool result exceed
     /// [`SMALL_FRAME_LIMIT`].
     OversizedSummary,
+    /// Like `OversizedSummary`, but the tool with the oversized result fails.
+    OversizedToolFailure,
     /// The final assistant message itself exceeds [`SMALL_FRAME_LIMIT`].
     OversizedAnswer,
     /// An extension asks for confirmation before the answer.
@@ -210,9 +212,10 @@ async fn send(output: &mut DuplexStream, value: &Value) {
 
 /// Serialize the way pi does. pi builds every record as a JavaScript object
 /// literal that starts with `type` (a message, with `role`; a tool event,
-/// with its call id and name before the result), and `JSON.stringify` keeps
-/// that order. `serde_json` would sort the keys instead, and the adapter
-/// identifies oversized frames by that prefix.
+/// with its call id and name before the result, and `isError` after it), and
+/// `JSON.stringify` keeps that order. `serde_json` would sort the keys
+/// instead, and the adapter reads oversized frames by their first and last
+/// bytes.
 fn pi_json(value: &Value) -> String {
     match value {
         Value::Object(map) => {
@@ -221,6 +224,7 @@ fn pi_json(value: &Value) -> String {
                 "type" | "role" => 0,
                 "toolCallId" => 1,
                 "toolName" => 2,
+                "isError" => 4,
                 _ => 3,
             });
             let fields = keys
@@ -257,11 +261,15 @@ fn answer(text: &str) -> Vec<Value> {
 
 fn tool_run(script: Script) -> Vec<Value> {
     let padding = "x".repeat(2 * SMALL_FRAME_LIMIT);
-    let tool_output = if script == Script::OversizedSummary {
+    let tool_output = if matches!(
+        script,
+        Script::OversizedSummary | Script::OversizedToolFailure
+    ) {
         padding.clone()
     } else {
         "src\nCargo.toml\n".to_string()
     };
+    let tool_failed = script == Script::OversizedToolFailure;
     let mut frames = vec![
         json!({"type": "agent_start"}),
         json!({"type": "turn_start"}),
@@ -274,7 +282,7 @@ fn tool_run(script: Script) -> Vec<Value> {
             "stopReason": "toolUse"}}),
         json!({"type": "tool_execution_start", "toolCallId": "call-1", "toolName": "bash", "args": {"command": "ls"}}),
         json!({"type": "tool_execution_end", "toolCallId": "call-1", "toolName": "bash",
-            "result": {"content": [{"type": "text", "text": tool_output}]}, "isError": false}),
+            "result": {"content": [{"type": "text", "text": tool_output}]}, "isError": tool_failed}),
         json!({"type": "message_end", "message": {"role": "toolResult", "toolCallId": "call-1",
             "content": [{"type": "text", "text": tool_output}]}}),
         json!({"type": "turn_end", "message": {}, "toolResults": [{"content": tool_output}]}),
@@ -541,6 +549,39 @@ async fn oversized_run_summaries_do_not_fail_a_long_turn() {
         .expect("the oversized tool result still completes its call");
     assert_eq!(completed.0.as_deref(), Some("call-1"));
     assert!(completed.1.unwrap().contains("omitted"));
+}
+
+#[tokio::test]
+async fn an_oversized_failed_tool_result_is_reported_as_failed() {
+    let transport = PiFixture::new(Script::OversizedToolFailure);
+    let events = Collector::default();
+    let result = small_frame_runtime(transport)
+        .run(request("list the files"), &events, None)
+        .await
+        .unwrap();
+
+    assert_eq!(result.text, "Listing files. Two entries.");
+    let finished = events
+        .events()
+        .into_iter()
+        .filter_map(|event| match event {
+            TurnEvent::ToolCall {
+                status: status @ (ToolCallStatus::Succeeded | ToolCallStatus::Failed),
+                id,
+                output,
+                error,
+                ..
+            } => Some((id, status, output, error)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let [(id, status, output, error)] = finished.as_slice() else {
+        panic!("expected one finished tool call, got {finished:?}");
+    };
+    assert_eq!(id.as_deref(), Some("call-1"));
+    assert_eq!(*status, ToolCallStatus::Failed);
+    assert_eq!(*output, None);
+    assert!(error.as_deref().unwrap().contains("omitted"), "{error:?}");
 }
 
 #[tokio::test]
