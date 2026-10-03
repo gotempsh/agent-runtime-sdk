@@ -209,6 +209,9 @@ const CLAUDE_LIVE_FLAGS: [&str; 3] = ["--model", "--effort", "--permission-mode"
 const CLAUDE_BYPASS_FLAG: &str = "--dangerously-skip-permissions";
 /// Upper bound for Claude to answer the requests that switch its settings.
 const CLAUDE_SETTINGS_SWITCH_TIMEOUT: Duration = Duration::from_secs(10);
+/// Frames an idle Claude process may write, besides its answers, while its
+/// settings switch; the turn reads them first.
+const MAX_SWITCH_UNSOLICITED_FRAMES: usize = 64;
 
 /// The Claude settings a retained process can switch in place between turns:
 /// model (`set_model`), effort (`apply_flag_settings`) and permission mode
@@ -371,8 +374,11 @@ fn retained_background_tasks(
 /// Switch a claimed Claude process to new settings before its prompt is
 /// written, waiting for each request's answer.
 ///
-/// Output that arrives first belongs to the background work of a parked
-/// process: it is parsed and buffered for the turn, exactly as while parked.
+/// Other output that arrives meanwhile is kept, never dropped. A parked
+/// process's belongs to its background work: it is parsed and buffered for
+/// the turn, exactly as while parked. An idle process's (such as Claude's
+/// announcement of a permission change) is returned, in order, for the turn
+/// to read before its own output.
 async fn switch_claude_settings(
     adapter: &dyn AgentAdapter,
     provider: Provider,
@@ -380,7 +386,8 @@ async fn switch_claude_settings(
     generation: u64,
     requests: Vec<serde_json::Value>,
     max_event_line_bytes: usize,
-) -> std::result::Result<(), String> {
+) -> std::result::Result<std::collections::VecDeque<String>, String> {
+    let mut unsolicited = std::collections::VecDeque::new();
     let mut pending = std::collections::BTreeSet::new();
     let mut frames = Vec::with_capacity(requests.len());
     for (index, request) in requests.into_iter().enumerate() {
@@ -425,13 +432,17 @@ async fn switch_claude_settings(
                         .unwrap_or("no reason given");
                     return Err(error.chars().take(200).collect());
                 }
-            } else if process.handoff.pending()
-                && !park_frame(adapter, &process.handoff, provider, io, &line).await
-            {
-                return Err("background output could not be read".to_owned());
+            } else if process.handoff.pending() {
+                if !park_frame(adapter, &process.handoff, provider, io, &line).await {
+                    return Err("background output could not be read".to_owned());
+                }
+            } else if unsolicited.len() < MAX_SWITCH_UNSOLICITED_FRAMES {
+                unsolicited.push_back(line);
+            } else {
+                return Err("Claude wrote more than expected while switching".to_owned());
             }
         }
-        Ok(())
+        Ok(unsolicited)
     };
     tokio::time::timeout(CLAUDE_SETTINGS_SWITCH_TIMEOUT, exchange)
         .await
@@ -3830,7 +3841,7 @@ impl AgentRuntime {
             }
         }
         let mut prepared_protocol_streams = None;
-        let mut prefetched_line = None;
+        let mut prefetched_lines = std::collections::VecDeque::new();
         let mut preflight_events = Vec::new();
         let mut claimed_generation = None;
         let mut inherited_state = None;
@@ -3865,9 +3876,10 @@ impl AgentRuntime {
                     )
                     .await;
                     match switched {
-                        Ok(()) => {
+                        Ok(unsolicited) => {
                             settings.set_current(Some(wanted.clone()));
                             settings_switched = true;
+                            prefetched_lines.extend(unsolicited);
                         }
                         Err(reason) => {
                             settings.set_current(None);
@@ -4099,7 +4111,7 @@ impl AgentRuntime {
                 if let Ok(Ok((writer, reader, line, pending_events))) = health {
                     state = preflight_state;
                     prepared_protocol_streams = Some((writer, reader));
-                    prefetched_line = Some(line);
+                    prefetched_lines.push_back(line);
                     preflight_events = pending_events;
                 } else {
                     supervisor.remove_if_same(runtime_id, &candidate).await;
@@ -4373,7 +4385,7 @@ impl AgentRuntime {
                 &retained.handoff,
                 supervisor.inner.config,
                 state,
-                prefetched_line,
+                prefetched_lines,
                 parked_output.interactions,
             )
             .await;
@@ -4519,7 +4531,7 @@ impl AgentRuntime {
         handoff: &RetainedHandoff,
         retention: ProviderProcessRetention,
         state: AdapterState,
-        prefetched_line: Option<String>,
+        prefetched_lines: std::collections::VecDeque<String>,
         parked_interactions: Vec<InteractionRequest>,
     ) -> Result<RetainedTurnEnd> {
         let (sender, mut messages) = mpsc::channel(TURN_MESSAGE_QUEUE);
@@ -4535,7 +4547,7 @@ impl AgentRuntime {
                 handoff,
                 retention,
                 state,
-                prefetched_line,
+                prefetched_lines,
                 parked_interactions,
                 &mut messages,
             )
@@ -4562,7 +4574,7 @@ impl AgentRuntime {
         handoff: &RetainedHandoff,
         retention: ProviderProcessRetention,
         mut state: AdapterState,
-        mut prefetched_line: Option<String>,
+        mut prefetched_lines: std::collections::VecDeque<String>,
         parked_interactions: Vec<InteractionRequest>,
         messages: &mut mpsc::Receiver<TurnMessage>,
     ) -> Result<RetainedTurnEnd> {
@@ -4601,7 +4613,7 @@ impl AgentRuntime {
                     .unwrap_or(request.timeout)
             };
             let deadline = last_semantic_activity + inactivity_timeout;
-            let line = if let Some(line) = prefetched_line.take() {
+            let line = if let Some(line) = prefetched_lines.pop_front() {
                 Some(line)
             } else {
                 let handoff_ready = adapter.retained_handoff_ready(&state);

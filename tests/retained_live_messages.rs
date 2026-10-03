@@ -149,9 +149,13 @@ for line in sys.stdin:
    if released('refuse-settings'):
     emit({'type':'control_response','response':{'request_id':frame['request_id'],'subtype':'error','error':'not now'}})
    else:
+    # A permission change is announced; while `announce-early` exists, before
+    # its answer, so the frame arrives between the switch's answers.
+    announce={'type':'system','subtype':'status','status':None,'permissionMode':frame['request'].get('mode')}
+    early=subtype=='set_permission_mode' and released('announce-early')
+    if early:emit(announce)
     emit({'type':'control_response','response':{'request_id':frame['request_id'],'subtype':'success','response':{}}})
-    # Like Claude, a permission change is announced after it is answered.
-    if subtype=='set_permission_mode':emit({'type':'system','subtype':'status','status':None,'permissionMode':frame['request']['mode']})
+    if subtype=='set_permission_mode' and not early:emit(announce)
   else:
    emit({'type':'control_response','response':{'request_id':frame['request_id'],'subtype':'success','response':{}}})
  elif kind=='control_response':
@@ -752,6 +756,31 @@ async fn a_refused_switch_keeps_background_work() {
             r#"set_permission_mode "manual""#,
         ]
     );
+    assert_eq!(f.spawns(), 1, "{:?}", f.events());
+    f.dispose().await;
+}
+
+#[tokio::test]
+async fn a_switch_keeps_what_an_idle_process_writes_between_answers() {
+    let f = Fixture::new(true).await;
+    assert_eq!(
+        f.start("one", "first").await.finish().await.1.unwrap().text,
+        "reply:first"
+    );
+    f.release("announce-early");
+
+    let mut input = Fixture::input("two", "second");
+    input.permission_mode = Some(PermissionMode::AcceptEdits);
+    let (events, result) = f.start_input(input).await.unwrap().finish().await;
+    assert_eq!(result.unwrap().text, "reply:second");
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            TurnEvent::PermissionModeChanged { mode } if *mode == PermissionMode::AcceptEdits
+        )),
+        "Claude's announcement reaches the turn: {events:?}"
+    );
+    assert_eq!(f.settings(), [r#"set_permission_mode "acceptEdits""#]);
     assert_eq!(f.spawns(), 1, "{:?}", f.events());
     f.dispose().await;
 }
