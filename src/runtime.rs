@@ -1307,7 +1307,10 @@ async fn finish_retained_turn(
             delivery: failure.delivery,
         });
     }
-    if state.result.text.is_empty() {
+    // A compaction has no reply text by design.
+    if state.result.text.is_empty()
+        && !crate::providers::is_manual_compaction_prompt(&request.prompt)
+    {
         events
             .emit(TurnEvent::Warning {
                 message: format!("{provider} completed without a text response"),
@@ -5516,7 +5519,9 @@ impl AgentRuntime {
                 delivery,
             });
         }
-        if state.result.text.is_empty() {
+        if state.result.text.is_empty()
+            && !crate::providers::is_manual_compaction_prompt(&request.prompt)
+        {
             let _delivery = trace.event_delivery();
             events
                 .emit(TurnEvent::Warning {

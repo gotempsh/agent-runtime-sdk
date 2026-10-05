@@ -933,6 +933,13 @@ async fn a_manual_compaction_compacts_the_thread_once() {
         .unwrap();
     assert_eq!(transport.method_count("thread/compact/start"), 1);
     assert_eq!(transport.method_count("turn/start"), 0);
+    assert!(
+        !events
+            .events()
+            .iter()
+            .any(|event| matches!(event, TurnEvent::Warning { .. })),
+        "a compaction has no reply text to warn about"
+    );
     let compaction = compaction_events(&events.events());
     assert!(
         matches!(
