@@ -1991,12 +1991,7 @@ fn claude_account_usage(value: &Value) -> Option<AccountUsageSnapshot> {
 }
 
 /// Whether a prompt is Claude Code's native `/compact` command.
-fn is_manual_compaction_prompt(prompt: &str) -> bool {
-    let prompt = prompt.trim_start();
-    prompt
-        .strip_prefix("/compact")
-        .is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
-}
+use super::is_manual_compaction_prompt;
 
 /// Maximum characters of a provider compaction diagnostic carried in events.
 const MAX_COMPACTION_ERROR_CHARS: usize = 512;

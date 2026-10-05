@@ -73,3 +73,12 @@ fn merge_usage(target: &mut Usage, incoming: &Usage) {
         .or_else(|| target.context_window.clone());
     target.cost_usd = incoming.cost_usd.or(target.cost_usd);
 }
+
+/// Whether a turn prompt is a manual compaction request (`/compact` plus
+/// optional instructions), the form `CompactionInput` produces.
+pub(crate) fn is_manual_compaction_prompt(prompt: &str) -> bool {
+    let prompt = prompt.trim_start();
+    prompt
+        .strip_prefix("/compact")
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+}

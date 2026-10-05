@@ -96,6 +96,9 @@ impl OpenCode {
             "--port".into(),
             port.to_string().into(),
         ]);
+        // The client below talks to this port on the SDK host's loopback;
+        // a remote transport forwards it there.
+        spec.loopback_ports.push(port);
         // The policy travels in the environment rather than argv because it is
         // this turn's entire enforcement boundary, and `clear_environment`
         // means nothing reaches the child that was not put here deliberately.
@@ -129,6 +132,8 @@ impl AgentAdapter for OpenCode {
             // summary message, and `session.compacted` over its event stream;
             // `opencode run --format json` does not.
             compaction_lifecycle: self.serve_mode(),
+            // `/session/{id}/summarize` is a server request.
+            manual_compaction: self.serve_mode(),
             ..TurnCapabilities::default()
         }
     }

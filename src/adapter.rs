@@ -32,6 +32,10 @@ pub struct CommandSpec {
     pub initial_stdin: Option<Vec<u8>>,
     /// Whether stdin must remain available for interaction responses.
     pub interactive_stdin: bool,
+    /// Loopback ports the process listens on that the SDK host must reach at
+    /// the same port, such as `opencode serve`'s HTTP server. Local
+    /// execution needs nothing; a remote transport forwards each one.
+    pub loopback_ports: Vec<u16>,
 }
 
 impl fmt::Debug for CommandSpec {
@@ -50,6 +54,7 @@ impl fmt::Debug for CommandSpec {
                 &self.initial_stdin.as_ref().map(Vec::len),
             )
             .field("interactive_stdin", &self.interactive_stdin)
+            .field("loopback_ports", &self.loopback_ports)
             .finish()
     }
 }
@@ -91,6 +96,7 @@ impl CommandSpec {
             clear_environment: true,
             initial_stdin: None,
             interactive_stdin: false,
+            loopback_ports: Vec::new(),
         }
     }
 
@@ -117,6 +123,7 @@ impl CommandSpec {
             clear_environment: self.clear_environment,
             initial_stdin: self.initial_stdin,
             interactive_stdin: self.interactive_stdin,
+            loopback_ports: self.loopback_ports,
         }
     }
 }

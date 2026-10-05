@@ -7,6 +7,16 @@ Versioning and Keep a Changelog conventions.
 
 ### Added
 
+- Manual compaction for Codex and OpenCode. `RuntimeHandle::compact` now runs
+  `thread/compact/start` on the Codex app server and `/session/{id}/summarize`
+  on `opencode serve` (which needs a pinned model), reporting the same manual
+  compaction lifecycle as Claude. `TurnCapabilities::manual_compaction` states
+  which adapters support it; the retained driver's `manual_compaction`
+  capability now follows it instead of naming Claude alone.
+- `CommandSpec::loopback_ports`: loopback ports a provider process serves that
+  the SDK host must reach. `SshTransport` forwards each one (`ssh -L`, with
+  `ExitOnForwardFailure`), so `OpenCode::serve()` works on SSH targets; local
+  execution ignores it.
 - A pi adapter. `providers::Pi`, behind the new default `pi` feature, drives
   `pi --mode rpc` (tested with pi 1.0.0): text and reasoning deltas, tool
   lifecycle events, usage with cost and context-window occupancy, the

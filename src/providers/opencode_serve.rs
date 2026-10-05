@@ -65,6 +65,9 @@ pub(super) struct TurnState {
     parts: Vec<Value>,
     /// Native `{providerID, modelID}` selection, when the caller pinned one.
     model: Option<Value>,
+    /// This invocation summarizes the session (`/session/{id}/summarize`)
+    /// instead of sending a prompt.
+    manual_compaction: bool,
     /// Session being prompted.
     session_id: Option<String>,
     /// Whether every permission must be refused without consulting the
@@ -337,6 +340,7 @@ pub(super) fn prepare_turn(request: &TurnRequest, state: &mut AdapterState, port
             resume: request.session_id.clone(),
             parts,
             model: model_selection(request.model.as_deref()),
+            manual_compaction: super::is_manual_compaction_prompt(&request.prompt),
             plan_mode: is_plan_mode(request),
             tools_denied: request
                 .launch_context
@@ -457,6 +461,26 @@ fn prompt(turn: &TurnState, output: &mut AdapterOutput) -> Result<()> {
     let Some(session) = turn.session_id.as_deref() else {
         return Ok(());
     };
+    if turn.manual_compaction {
+        // OpenCode summarizes with an explicit model; its compaction part and
+        // `session.compacted` then report the lifecycle like an automatic one.
+        let Some(model) = &turn.model else {
+            return Err(RuntimeError::InvalidRequest {
+                field: "model",
+                message: "Select an OpenCode model before compacting this session.".into(),
+            });
+        };
+        output.writes.push(encode(&post(
+            Some(ID_PROMPT),
+            format!(
+                "/session/{}/summarize?directory={}",
+                query_escape(session),
+                query_escape(&turn.directory)
+            ),
+            model.clone(),
+        ))?);
+        return Ok(());
+    }
     let mut body = json!({"parts": turn.parts});
     if let Some(model) = &turn.model {
         body["model"] = model.clone();
@@ -1041,6 +1065,46 @@ mod tests {
         .unwrap();
         parse_line(&json!({"type": FRAME_SUBSCRIBED}).to_string(), &mut state).unwrap();
         state
+    }
+
+    #[test]
+    fn a_manual_compaction_summarizes_the_session_with_its_model() {
+        let mut request = request(PermissionMode::Default);
+        request.prompt = "/compact".into();
+        request.model = Some("anthropic/claude-sonnet-4-5".into());
+        let mut state = AdapterState::default();
+        prepare_turn(&request, &mut state, 4242);
+        parse_line(&json!({"type": FRAME_READY}).to_string(), &mut state).unwrap();
+        parse_line(
+            &json!({"type": FRAME_RESPONSE, "id": ID_SESSION, "status": 200,
+                    "body": {"id": "session-1"}})
+            .to_string(),
+            &mut state,
+        )
+        .unwrap();
+        let sent = parse_line(&json!({"type": FRAME_SUBSCRIBED}).to_string(), &mut state).unwrap();
+        let frame = decode(&sent.writes[0]);
+        assert!(frame["path"]
+            .as_str()
+            .unwrap()
+            .starts_with("/session/session-1/summarize"));
+        assert_eq!(frame["body"]["providerID"], json!("anthropic"));
+        assert_eq!(frame["body"]["modelID"], json!("claude-sonnet-4-5"));
+
+        // Without a model there is nothing to summarize with.
+        let mut request = request.clone();
+        request.model = None;
+        let mut state = AdapterState::default();
+        prepare_turn(&request, &mut state, 4242);
+        parse_line(&json!({"type": FRAME_READY}).to_string(), &mut state).unwrap();
+        parse_line(
+            &json!({"type": FRAME_RESPONSE, "id": ID_SESSION, "status": 200,
+                    "body": {"id": "session-1"}})
+            .to_string(),
+            &mut state,
+        )
+        .unwrap();
+        assert!(parse_line(&json!({"type": FRAME_SUBSCRIBED}).to_string(), &mut state).is_err());
     }
 
     fn permission_event(kind: &str) -> String {

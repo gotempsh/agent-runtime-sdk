@@ -83,6 +83,9 @@ struct TurnState {
     /// Latest active-context occupancy, the pre-compaction size when a
     /// compaction starts.
     last_context_tokens: Option<u64>,
+    /// This invocation compacts the thread (`thread/compact/start`) instead of
+    /// starting a turn.
+    manual_compaction: bool,
 }
 
 pub(super) fn mark_retained(state: &mut AdapterState) {
@@ -218,6 +221,7 @@ pub(super) fn prepare_turn(request: &TurnRequest, state: &mut AdapterState) -> R
             turn_params,
             resume: request.session_id.is_some(),
             model: request.model.clone(),
+            manual_compaction: super::is_manual_compaction_prompt(&request.prompt),
             ..TurnState::default()
         },
     );
@@ -442,6 +446,18 @@ fn parse_response(
                 });
             }
             turn.thread_id = Some(thread_id.clone());
+            if turn.manual_compaction {
+                turn.open_compaction = Some("manual".to_string());
+                output.events.push(TurnEvent::CompactionStarted {
+                    trigger: CompactionTrigger::Manual,
+                });
+                output.writes.push(encode(&request(
+                    ID_TURN,
+                    "thread/compact/start",
+                    json!({"threadId": thread_id}),
+                ))?);
+                return Ok(());
+            }
             let mut params = turn.turn_params.clone();
             params["threadId"] = json!(thread_id);
             output
@@ -638,6 +654,18 @@ fn notification(
                 output.events.push(TurnEvent::Usage(usage));
             }
         }
+        "thread/compacted" if turn.manual_compaction => {
+            // A manual compaction is complete once the thread says so.
+            if turn.open_compaction.take().is_some() {
+                output.events.push(TurnEvent::CompactionCompleted {
+                    compaction: completed_compaction_with(
+                        CompactionTrigger::Manual,
+                        turn.last_context_tokens,
+                    ),
+                });
+            }
+            output.terminal = true;
+        }
         "thread/compacted" => {
             // Deprecated in favor of the `contextCompaction` item, but still
             // the only signal from older app servers. Report it only when no
@@ -672,7 +700,11 @@ fn notification(
                 // A turn cannot end with its compaction still running; the
                 // application must see it close instead of spinning forever.
                 output.events.push(TurnEvent::CompactionFailed {
-                    trigger: CompactionTrigger::Automatic,
+                    trigger: if turn.manual_compaction {
+                        CompactionTrigger::Manual
+                    } else {
+                        CompactionTrigger::Automatic
+                    },
                     message: Some(turn.error_message.clone().unwrap_or_else(|| {
                         "Codex ended the turn before the compaction finished.".to_string()
                     })),
@@ -740,16 +772,33 @@ fn compaction_item(
         }
         return;
     }
-    turn.open_compaction = None;
+    // A manual compaction opened its own lifecycle when it was requested.
+    let trigger = if turn.manual_compaction {
+        CompactionTrigger::Manual
+    } else {
+        CompactionTrigger::Automatic
+    };
+    let was_open = turn.open_compaction.take().is_some();
+    if turn.manual_compaction && !was_open {
+        // `thread/compacted` already reported this manual compaction.
+        return;
+    }
     turn.saw_compaction_item = true;
     output.events.push(TurnEvent::CompactionCompleted {
-        compaction: completed_compaction(turn.last_context_tokens),
+        compaction: completed_compaction_with(trigger, turn.last_context_tokens),
     });
 }
 
 fn completed_compaction(pre_tokens: Option<u64>) -> ContextCompaction {
+    completed_compaction_with(CompactionTrigger::Automatic, pre_tokens)
+}
+
+fn completed_compaction_with(
+    trigger: CompactionTrigger,
+    pre_tokens: Option<u64>,
+) -> ContextCompaction {
     ContextCompaction {
-        trigger: CompactionTrigger::Automatic,
+        trigger,
         pre_tokens,
         post_tokens: None,
         dropped_tokens: None,
@@ -1519,6 +1568,40 @@ mod tests {
                 {"type": "localImage", "path": "/tmp/screenshot.png"}
             ])
         );
+    }
+
+    #[test]
+    fn a_manual_compaction_compacts_the_opened_thread_instead_of_starting_a_turn() {
+        let mut request = TurnRequest::new(Provider::Codex, ".", "/compact");
+        request.session_id = Some("thread-9".into());
+        let mut state = AdapterState::default();
+        prepare_turn(&request, &mut state).unwrap();
+        parse_line(r#"{"id":1,"result":{}}"#, &mut state).unwrap();
+        let opened = parse_line(
+            r#"{"id":2,"result":{"thread":{"id":"thread-9"}}}"#,
+            &mut state,
+        )
+        .unwrap();
+        let compact = decode(opened.writes[0].clone());
+        assert_eq!(compact["method"], "thread/compact/start");
+        assert_eq!(compact["params"]["threadId"], "thread-9");
+        assert!(opened.events.iter().any(|event| matches!(
+            event,
+            TurnEvent::CompactionStarted {
+                trigger: CompactionTrigger::Manual
+            }
+        )));
+
+        let done = parse_line(
+            r#"{"jsonrpc":"2.0","method":"thread/compacted","params":{"threadId":"thread-9"}}"#,
+            &mut state,
+        )
+        .unwrap();
+        assert!(done.terminal);
+        assert!(done.events.iter().any(|event| matches!(
+            event,
+            TurnEvent::CompactionCompleted { compaction } if compaction.trigger == CompactionTrigger::Manual
+        )));
     }
 
     #[test]
