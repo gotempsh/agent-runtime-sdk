@@ -1206,6 +1206,9 @@ impl AgentAdapter for Claude {
             // when it ends, for automatic and manual compaction alike.
             compaction_lifecycle: true,
             live_messages: true,
+            // `/compact [instructions]` is Claude Code's own command.
+            manual_compaction: true,
+            compaction_instructions: true,
             ..TurnCapabilities::default()
         }
     }

@@ -157,6 +157,7 @@ pub(super) fn handshake() -> Vec<u8> {
 /// Build the thread and turn parameters this transport sends once the app
 /// server accepts the handshake.
 pub(super) fn prepare_turn(request: &TurnRequest, state: &mut AdapterState) -> Result<()> {
+    super::refuse_compaction_instructions(Provider::Codex, &request.prompt)?;
     let controls = super::codex::resolve_controls(request)?;
     let (approval, collaboration, sandbox) =
         controls.unwrap_or(("never", "default", "danger-full-access"));
@@ -303,11 +304,27 @@ pub(super) fn parse_line(line: &str, state: &mut AdapterState) -> Result<Adapter
     // `thread/compact/start` answers with an empty result; the compaction's
     // turn id first appears on `turn/started`, so a manual compaction adopts
     // it there instead of discarding its own turn as uncorrelated.
-    if turn.manual_compaction && turn.turn_id.is_none() && method == "turn/started" {
+    if turn.manual_compaction
+        && turn.turn_id.is_none()
+        && method == "turn/started"
+        && turn.thread_id.is_some()
+        && value.pointer("/params/threadId").and_then(Value::as_str) == turn.thread_id.as_deref()
+    {
         if let Some(started) = reported_turn_id(&value) {
             turn.turn_id = Some(started.to_string());
             store(state, &turn);
         }
+    }
+    // Older app servers report a finished compaction only through
+    // `thread/compacted`, which names the thread but no turn.
+    let own_thread_compacted = turn.manual_compaction
+        && method == "thread/compacted"
+        && turn.thread_id.is_some()
+        && value.pointer("/params/threadId").and_then(Value::as_str) == turn.thread_id.as_deref();
+    if own_thread_compacted {
+        notification(&value, &method, &mut turn, state, &mut output);
+        store(state, &turn);
+        return Ok(output);
     }
     if turn.retained
         && !method.is_empty()
@@ -788,9 +805,14 @@ fn compaction_item(
         CompactionTrigger::Automatic
     };
     let was_open = turn.open_compaction.take().is_some();
-    if turn.manual_compaction && !was_open {
-        // `thread/compacted` already reported this manual compaction.
-        return;
+    if turn.manual_compaction {
+        // The compaction is the whole invocation: its completed item ends it,
+        // whether or not `turn/completed` or `thread/compacted` follows.
+        output.terminal = true;
+        if !was_open {
+            // `thread/compacted` already reported this manual compaction.
+            return;
+        }
     }
     turn.saw_compaction_item = true;
     output.events.push(TurnEvent::CompactionCompleted {
@@ -1611,6 +1633,84 @@ mod tests {
             event,
             TurnEvent::CompactionCompleted { compaction } if compaction.trigger == CompactionTrigger::Manual
         )));
+    }
+
+    #[test]
+    fn a_retained_manual_compaction_follows_only_its_own_threads_turn() {
+        let mut request = TurnRequest::new(Provider::Codex, ".", "/compact");
+        request.session_id = Some("thread-9".into());
+        let mut state = AdapterState::default();
+        prepare_turn(&request, &mut state).unwrap();
+        mark_retained(&mut state);
+        parse_line(
+            r#"{"id":2,"result":{"thread":{"id":"thread-9"}}}"#,
+            &mut state,
+        )
+        .unwrap();
+        parse_line(r#"{"id":4,"result":{}}"#, &mut state).unwrap();
+
+        // A late turn from another thread on the shared connection is not
+        // this compaction's turn.
+        parse_line(
+            r#"{"method":"turn/started","params":{"threadId":"thread-other","turn":{"id":"turn-x"}}}"#,
+            &mut state,
+        )
+        .unwrap();
+        let stray = parse_line(
+            r#"{"method":"item/completed","params":{"threadId":"thread-other","turnId":"turn-x","item":{"type":"contextCompaction","id":"c-x"}}}"#,
+            &mut state,
+        )
+        .unwrap();
+        assert!(!stray.terminal);
+        assert!(stray.events.is_empty());
+
+        parse_line(
+            r#"{"method":"turn/started","params":{"threadId":"thread-9","turn":{"id":"turn-c"}}}"#,
+            &mut state,
+        )
+        .unwrap();
+        let done = parse_line(
+            r#"{"method":"item/completed","params":{"threadId":"thread-9","turnId":"turn-c","item":{"type":"contextCompaction","id":"c-1"}}}"#,
+            &mut state,
+        )
+        .unwrap();
+        // The completed compaction item ends the invocation by itself.
+        assert!(done.terminal);
+        assert!(done.events.iter().any(|event| matches!(
+            event,
+            TurnEvent::CompactionCompleted { compaction } if compaction.trigger == CompactionTrigger::Manual
+        )));
+    }
+
+    #[test]
+    fn a_retained_manual_compaction_also_ends_on_the_older_thread_compacted() {
+        let mut request = TurnRequest::new(Provider::Codex, ".", "/compact");
+        request.session_id = Some("thread-9".into());
+        let mut state = AdapterState::default();
+        prepare_turn(&request, &mut state).unwrap();
+        mark_retained(&mut state);
+        parse_line(
+            r#"{"id":2,"result":{"thread":{"id":"thread-9"}}}"#,
+            &mut state,
+        )
+        .unwrap();
+        parse_line(r#"{"id":4,"result":{}}"#, &mut state).unwrap();
+        let other = parse_line(
+            r#"{"method":"thread/compacted","params":{"threadId":"thread-other"}}"#,
+            &mut state,
+        )
+        .unwrap();
+        assert!(!other.terminal);
+        let done = parse_line(
+            r#"{"method":"thread/compacted","params":{"threadId":"thread-9"}}"#,
+            &mut state,
+        )
+        .unwrap();
+        assert!(done.terminal);
+        assert!(done
+            .events
+            .iter()
+            .any(|event| matches!(event, TurnEvent::CompactionCompleted { .. })));
     }
 
     #[test]

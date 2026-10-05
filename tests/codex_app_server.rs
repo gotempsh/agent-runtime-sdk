@@ -1004,6 +1004,35 @@ async fn a_retained_process_compacts_its_thread_after_a_turn() {
 }
 
 #[tokio::test]
+async fn compaction_instructions_are_refused_rather_than_dropped() {
+    let transport = AppServer::new(Script::AsyncQuestion);
+    let runtime = retained_runtime(transport.clone(), Duration::from_secs(30));
+    let (_client, handle) = retained_handle(runtime).await;
+    assert!(!handle.driver_capabilities().compaction_instructions);
+    handle
+        .start_turn(TurnInput::new(
+            InvocationId::new("before").unwrap(),
+            "first",
+        ))
+        .await
+        .unwrap()
+        .wait()
+        .await
+        .unwrap();
+    let mut input =
+        temps_agent_runtime::retained::CompactionInput::new(InvocationId::new("focused").unwrap());
+    input.instructions = Some("keep the API notes".into());
+    let Err(error) = handle.compact(input).await else {
+        panic!("Codex cannot take compaction instructions");
+    };
+    assert!(
+        error.to_string().contains("without summary instructions"),
+        "{error}"
+    );
+    assert_eq!(transport.method_count("thread/compact/start"), 0);
+}
+
+#[tokio::test]
 async fn a_crashed_process_is_replaced_for_the_next_turn() {
     let transport = AppServer::new(Script::Crash);
     let runtime = retained_runtime(transport.clone(), Duration::from_secs(30));

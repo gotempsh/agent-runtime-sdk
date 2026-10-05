@@ -682,6 +682,8 @@ impl AgentAdapter for Codex {
             compaction_lifecycle: self.app_server_mode(),
             // `thread/compact/start` is an app-server request.
             manual_compaction: self.app_server_mode(),
+            // `thread/compact/start` takes no summary instructions.
+            compaction_instructions: false,
             live_messages: false,
         }
     }

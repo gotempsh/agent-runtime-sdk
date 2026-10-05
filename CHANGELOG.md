@@ -5,14 +5,29 @@ Versioning and Keep a Changelog conventions.
 
 ## [Unreleased]
 
+### Security
+
+- `opencode serve` now requires HTTP Basic credentials
+  (`OPENCODE_SERVER_USERNAME`/`OPENCODE_SERVER_PASSWORD`, a per-process
+  password derived from a random SDK secret and the port), and the SDK's HTTP
+  bridge sends them. Another local process can no longer drive a served
+  session through its loopback port, including a port forwarded to the SDK
+  host for an SSH target.
+
 ### Added
 
 - Manual compaction for Codex and OpenCode. `RuntimeHandle::compact` now runs
   `thread/compact/start` on the Codex app server and `/session/{id}/summarize`
   on `opencode serve` (which needs a pinned model), reporting the same manual
-  compaction lifecycle as Claude. `TurnCapabilities::manual_compaction` states
-  which adapters support it; the retained driver's `manual_compaction`
-  capability now follows it instead of naming Claude alone.
+  compaction lifecycle as Claude and ending the invocation when the provider
+  confirms it. `TurnCapabilities::manual_compaction` states which adapters
+  support it; the retained driver's `manual_compaction` capability now follows
+  it instead of naming Claude alone.
+- `TurnCapabilities::compaction_instructions` and
+  `RuntimeDriverCapabilities::compaction_instructions`. Only Claude's native
+  compaction takes summary instructions; `RuntimeHandle::compact` with
+  instructions on Codex or OpenCode fails with `CapabilityUnavailable` instead
+  of compacting without them.
 - `CommandSpec::loopback_ports`: loopback ports a provider process serves that
   the SDK host must reach. `SshTransport` forwards each one (`ssh -L`, with
   `ExitOnForwardFailure`), so `OpenCode::serve()` works on SSH targets; local

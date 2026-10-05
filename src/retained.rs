@@ -342,6 +342,10 @@ pub struct RuntimeDriverCapabilities {
     /// The harness supports provider-native manual compaction of an existing session.
     #[serde(default)]
     pub manual_compaction: bool,
+    /// Manual compaction accepts summary instructions
+    /// ([`CompactionInput::instructions`]).
+    #[serde(default)]
+    pub compaction_instructions: bool,
     /// The driver emits active context-window occupancy snapshots when available.
     #[serde(default)]
     pub context_window_usage: bool,
@@ -536,10 +540,12 @@ impl RuntimeTurnExecutor for AgentRuntime {
             live_interactions: permissions
                 .is_some_and(|support| support.live_approvals || support.live_questions),
             configurable_auto_compaction: provider == Provider::Claude,
-            manual_compaction: provider == Provider::Claude
-                || self
-                    .turn_capabilities(provider)
-                    .is_ok_and(|capabilities| capabilities.manual_compaction),
+            manual_compaction: self
+                .turn_capabilities(provider)
+                .is_ok_and(|capabilities| capabilities.manual_compaction),
+            compaction_instructions: self
+                .turn_capabilities(provider)
+                .is_ok_and(|capabilities| capabilities.compaction_instructions),
             context_window_usage: provider == Provider::Claude
                 || self
                     .turn_capabilities(provider)
@@ -843,6 +849,19 @@ impl RuntimeHandle {
                 DeliveryState::NotSent,
                 format!(
                     "{} does not support provider-native manual compaction",
+                    self.provider
+                ),
+            ));
+        }
+        if input.instructions.is_some() && !self.driver.compaction_instructions {
+            return Err(lifecycle_failure(
+                Some(self.runtime_id.clone()),
+                Some(input.invocation_id),
+                RuntimeFailureKind::CapabilityUnavailable,
+                RetryAdvice::Never,
+                DeliveryState::NotSent,
+                format!(
+                    "{} compacts natively without summary instructions; omit them",
                     self.provider
                 ),
             ));
@@ -2366,6 +2385,7 @@ mod tests {
                 live_interactions: true,
                 configurable_auto_compaction: true,
                 manual_compaction: true,
+                compaction_instructions: true,
                 context_window_usage: true,
                 native_image_attachments: true,
                 compaction_lifecycle: true,
@@ -2425,6 +2445,7 @@ mod tests {
             RuntimeDriverCapabilities {
                 session_resume: true,
                 manual_compaction: true,
+                compaction_instructions: true,
                 compaction_lifecycle: true,
                 ..RuntimeDriverCapabilities::default()
             }
@@ -2992,6 +3013,7 @@ mod tests {
                 retained_process: true,
                 session_resume: true,
                 manual_compaction: true,
+                compaction_instructions: true,
                 ..RuntimeDriverCapabilities::default()
             }
         }

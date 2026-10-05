@@ -60,6 +60,11 @@ pub struct TurnCapabilities {
     /// is a manual compaction request (see `RuntimeHandle::compact`).
     #[serde(default)]
     pub manual_compaction: bool,
+    /// The adapter's native manual compaction accepts summary instructions
+    /// (`/compact <instructions>`). Codex and OpenCode compact natively
+    /// without them, so they refuse instructions rather than drop them.
+    #[serde(default)]
+    pub compaction_instructions: bool,
     /// The adapter delivers image attachments as native provider image inputs.
     ///
     /// Applications and the retained runtime stop describing those files in

@@ -1291,12 +1291,22 @@ async fn write_provider_frames(
 }
 
 /// Close a retained turn that reached its terminal frame or quiet completion.
+/// Whether this turn was a provider-native manual compaction, which has no
+/// reply text by design. Adapters without native compaction (pi, Codex exec,
+/// OpenCode run) send `/compact` as an ordinary prompt, so an empty reply
+/// there still warns.
+fn performed_native_compaction(adapter: &dyn AgentAdapter, request: &TurnRequest) -> bool {
+    adapter.turn_capabilities().manual_compaction
+        && crate::providers::is_manual_compaction_prompt(&request.prompt)
+}
+
 async fn finish_retained_turn(
-    provider: Provider,
+    adapter: &dyn AgentAdapter,
     request: &TurnRequest,
     events: &dyn EventSink,
     mut state: AdapterState,
 ) -> Result<TurnResult> {
+    let provider = request.provider;
     if let Some(failure) = state.terminal_failure.take() {
         return Err(RuntimeError::ProcessFailed {
             provider,
@@ -1307,10 +1317,7 @@ async fn finish_retained_turn(
             delivery: failure.delivery,
         });
     }
-    // A compaction has no reply text by design.
-    if state.result.text.is_empty()
-        && !crate::providers::is_manual_compaction_prompt(&request.prompt)
-    {
+    if state.result.text.is_empty() && !performed_native_compaction(adapter, request) {
         events
             .emit(TurnEvent::Warning {
                 message: format!("{provider} completed without a text response"),
@@ -4806,7 +4813,7 @@ impl AgentRuntime {
                         continue;
                     }
                     () = tokio::time::sleep_until(quiet_completion.unwrap_or(deadline)), if quiet_completion.is_some() => {
-                        return finish_retained_turn(provider, request, events, state)
+                        return finish_retained_turn(adapter, request, events, state)
                             .await
                             .map(RetainedTurnEnd::Completed);
                     }
@@ -4934,7 +4941,7 @@ impl AgentRuntime {
                 }
             }
             if output.terminal {
-                return finish_retained_turn(provider, request, events, state)
+                return finish_retained_turn(adapter, request, events, state)
                     .await
                     .map(RetainedTurnEnd::Completed);
             }
@@ -5519,9 +5526,7 @@ impl AgentRuntime {
                 delivery,
             });
         }
-        if state.result.text.is_empty()
-            && !crate::providers::is_manual_compaction_prompt(&request.prompt)
-        {
+        if state.result.text.is_empty() && !performed_native_compaction(adapter.as_ref(), request) {
             let _delivery = trace.event_delivery();
             events
                 .emit(TurnEvent::Warning {
@@ -6156,6 +6161,45 @@ impl EventSink for CompactionGuard<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_native_compaction_silences_the_empty_reply_warning() {
+        let compact = TurnRequest::new(Provider::Codex, ".", "/compact");
+        let prompt = TurnRequest::new(Provider::Codex, ".", "hello");
+        #[cfg(feature = "codex")]
+        {
+            assert!(performed_native_compaction(
+                &crate::providers::Codex::app_server(),
+                &compact
+            ));
+            // `codex exec` sends `/compact` as an ordinary prompt.
+            assert!(!performed_native_compaction(
+                &crate::providers::Codex::default(),
+                &compact
+            ));
+            assert!(!performed_native_compaction(
+                &crate::providers::Codex::app_server(),
+                &prompt
+            ));
+        }
+        #[cfg(feature = "opencode")]
+        {
+            assert!(performed_native_compaction(
+                &crate::providers::OpenCode::serve(),
+                &compact
+            ));
+            assert!(!performed_native_compaction(
+                &crate::providers::OpenCode::default(),
+                &compact
+            ));
+        }
+        #[cfg(feature = "claude")]
+        assert!(performed_native_compaction(
+            &crate::providers::Claude::default(),
+            &compact
+        ));
+        let _ = (compact, prompt);
+    }
 
     fn claude_args(args: &[&str]) -> Vec<std::ffi::OsString> {
         args.iter().map(std::ffi::OsString::from).collect()
