@@ -20,13 +20,19 @@ struct Container(String);
 
 impl Container {
     async fn start() -> Option<Self> {
+        Self::start_with(&[]).await
+    }
+
+    async fn start_with(options: &[&str]) -> Option<Self> {
         if std::env::var("TEMPS_AGENT_RUNTIME_DOCKER_TESTS").as_deref() != Ok("1") {
             return None;
         }
         let image = std::env::var("TEMPS_AGENT_RUNTIME_DOCKER_TEST_IMAGE")
             .unwrap_or_else(|_| "ubuntu:24.04".into());
         let output = tokio::process::Command::new("docker")
-            .args(["run", "-d", "--rm", "--init", &image, "sleep", "300"])
+            .args(["run", "-d", "--rm", "--init"])
+            .args(options)
+            .args([image.as_str(), "sleep", "300"])
             .output()
             .await
             .expect("docker run");
@@ -147,6 +153,34 @@ async fn terminate_stops_the_process_group_inside_the_container() {
     assert_eq!(container.exec("pgrep -c -x sleep").await.trim(), "3");
     process.terminate().await.unwrap();
     assert_eq!(container.exec("pgrep -c -x sleep").await.trim(), "1");
+}
+
+#[tokio::test]
+async fn a_selected_user_gets_its_own_home() {
+    let Some(container) = Container::start_with(&["--env", "HOME=/root"]).await else {
+        return;
+    };
+    // ubuntu:24.04 ships the `ubuntu` user (home /home/ubuntu).
+    let transport = DockerTransport::builder(&container.0)
+        .user("ubuntu")
+        .build()
+        .unwrap();
+    let mut process = transport
+        .spawn(request(
+            "sh",
+            &["-c", "printf '%s|%s' \"$HOME\" \"$(id -un)\""],
+        ))
+        .await
+        .unwrap();
+    let mut output = String::new();
+    process
+        .take_stdout()
+        .unwrap()
+        .read_to_string(&mut output)
+        .await
+        .unwrap();
+    assert!(process.wait().await.unwrap().success);
+    assert_eq!(output, "/home/ubuntu|ubuntu");
 }
 
 #[tokio::test]

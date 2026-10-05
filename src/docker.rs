@@ -99,6 +99,10 @@ impl DockerTransportBuilder {
 }
 
 /// Execute provider CLIs and managed processes inside a running container.
+///
+/// The container's login environment (`HOME`, `PATH`, `SHELL`) is resolved
+/// once per transport. After replacing the container, even under the same
+/// name, build a new transport.
 #[derive(Debug, Clone)]
 pub struct DockerTransport {
     shell: RemoteShell<DockerCarrier>,
@@ -135,6 +139,23 @@ impl DockerCarrier {
 impl ShellCarrier for DockerCarrier {
     fn transport_name(&self) -> &'static str {
         "docker"
+    }
+
+    fn login_prelude(&self) -> String {
+        // `docker exec -u` keeps the container's `HOME`, which belongs to the
+        // image's user. Use the selected user's home from /etc/passwd.
+        if self.user.is_none() {
+            return String::new();
+        }
+        "runtime_uid=$(id -u); \
+         if [ -r /etc/passwd ]; then \
+           while IFS=: read -r _ _ runtime_entry_uid _ _ runtime_entry_home _; do \
+             if [ \"$runtime_entry_uid\" = \"$runtime_uid\" ] && [ -n \"$runtime_entry_home\" ]; then \
+               HOME=$runtime_entry_home; export HOME; break; \
+             fi; \
+           done < /etc/passwd; \
+         fi; "
+            .to_string()
     }
 
     fn location(&self) -> &'static str {
@@ -181,9 +202,10 @@ impl ShellCarrier for DockerCarrier {
     }
 }
 
-/// `docker exec` reports its own failures as exit status 125, and an OCI
-/// runtime that cannot start the command as 126/127 with an `OCI runtime`
-/// diagnostic. Any other status is the command's own.
+/// `docker exec` passes the command's own exit status through, so a status
+/// is Docker's only when Docker's own diagnostic accompanies it: a daemon
+/// error with 125, an OCI runtime failure with 126/127, or a CLI that cannot
+/// reach the daemon (status 1).
 fn classify_docker_failure(
     operation: &'static str,
     code: Option<i32>,
@@ -191,8 +213,19 @@ fn classify_docker_failure(
 ) -> Option<TransportError> {
     let diagnostic = bounded_diagnostic(stderr);
     let lower = diagnostic.to_ascii_lowercase();
+    let cli = lower.strip_prefix("docker: ").unwrap_or(&lower);
+    let unreachable = cli.starts_with("cannot connect to the docker daemon")
+        || cli.starts_with("error during connect")
+        || cli.starts_with("permission denied while trying to connect to the docker daemon");
+    let daemon_error = cli.starts_with("error response from daemon")
+        || cli.starts_with("error: no such container");
     let oci_failure = matches!(code, Some(126 | 127)) && lower.contains("oci runtime");
-    if code != Some(125) && !oci_failure {
+    let docker_failure = match code {
+        Some(1) => unreachable,
+        Some(125) => unreachable || daemon_error,
+        _ => oci_failure,
+    };
+    if !docker_failure {
         return None;
     }
     let (kind, retryable, message) = if lower.contains("no such container") {
@@ -207,7 +240,13 @@ fn classify_docker_failure(
             true,
             "the container is not running",
         )
-    } else if lower.contains("cannot connect to the docker daemon") {
+    } else if lower.contains("permission denied while trying to connect") {
+        (
+            TransportErrorKind::PermissionDenied,
+            false,
+            "the Docker daemon refused this user",
+        )
+    } else if unreachable {
         (
             TransportErrorKind::ConnectionRefused,
             true,
@@ -345,6 +384,16 @@ mod tests {
     }
 
     #[test]
+    fn a_selected_user_resolves_its_own_home() {
+        let transport = DockerTransport::builder("c").user("agent").build().unwrap();
+        let prelude = transport.shell.carrier.login_prelude();
+        assert!(prelude.contains("/etc/passwd"));
+        assert!(prelude.contains("export HOME"));
+        let default_user = DockerTransport::builder("c").build().unwrap();
+        assert_eq!(default_user.shell.carrier.login_prelude(), "");
+    }
+
+    #[test]
     fn rejects_references_that_could_become_options_or_shell() {
         for container in ["", "-it", "name with space", "a;b", "$(x)"] {
             assert!(
@@ -387,9 +436,24 @@ mod tests {
         let daemon = classify_docker_failure(
             "spawn",
             Some(1),
-            b"Cannot connect to the Docker daemon at unix:///var/run/docker.sock",
+            b"Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?",
+        )
+        .expect("daemon outage");
+        assert_eq!(daemon.kind, TransportErrorKind::ConnectionRefused);
+        assert!(daemon.retryable);
+        assert!(
+            classify_docker_failure("spawn", Some(1), b"error: build failed").is_none(),
+            "exit 1 without Docker's diagnostic is the command's own status"
         );
-        assert!(daemon.is_none(), "exit 1 is the command's own status");
+        // A provider that exits 125 itself keeps its status.
+        assert!(classify_docker_failure("spawn", Some(125), b"fatal: provider crashed").is_none());
+        let socket = classify_docker_failure(
+            "probe",
+            Some(1),
+            b"permission denied while trying to connect to the Docker daemon socket at unix:///var/run/docker.sock",
+        )
+        .expect("socket permission");
+        assert_eq!(socket.kind, TransportErrorKind::PermissionDenied);
 
         let oci = classify_docker_failure(
             "spawn",

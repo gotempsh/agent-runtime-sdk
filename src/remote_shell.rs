@@ -59,6 +59,12 @@ pub(crate) trait ShellCarrier: Clone + Debug + Send + Sync + 'static {
     /// Stable transport name used in errors and process handles.
     fn transport_name(&self) -> &'static str;
 
+    /// Shell run before the login-environment probe, for carriers whose
+    /// remote `HOME` may not belong to the user they run commands as.
+    fn login_prelude(&self) -> String {
+        String::new()
+    }
+
     /// Human name of the place commands run in, for readiness details.
     fn location(&self) -> &'static str;
 
@@ -134,7 +140,11 @@ impl<C: ShellCarrier> RemoteShell<C> {
                 let output = self
                     .output(
                         "resolve_login_environment",
-                        &login_environment_probe_command(),
+                        &format!(
+                            "{}{}",
+                            self.carrier.login_prelude(),
+                            login_environment_probe_command()
+                        ),
                     )
                     .await?;
                 if !output.status.success() {
@@ -276,8 +286,10 @@ impl<C: ShellCarrier> RemoteShell<C> {
     async fn terminate_remote(&self, pid_file: &str) -> TransportResult<()> {
         // The launcher is a process-group leader over SSH, but not under
         // `docker exec`, which starts it in the exec session's group; so the
-        // descendants are also collected from `/proc` (where it exists) before
-        // the first signal, while they are still parented to the launcher.
+        // descendants are also collected from `/proc` before the first
+        // signal, while they are still parented to the launcher. Without
+        // `/proc` or a process group the tree cannot be found, and
+        // termination fails rather than leave children running.
         let command = format!(
             "descendants() {{ all=$1; [ -d /proc ] || {{ echo \"$all\"; return 0; }}; changed=1; \
                while [ \"$changed\" = 1 ]; do changed=0; \
@@ -292,6 +304,12 @@ impl<C: ShellCarrier> RemoteShell<C> {
              i=0; while [ ! -s {pid_file} ] && [ \"$i\" -lt 20 ]; do sleep 0.05; i=$((i + 1)); done; \
              if IFS= read -r pid < {pid_file}; then \
                case \"$pid\" in (*[!0-9]*|'') exit 64;; esac; \
+               if [ ! -d /proc ] && ! kill -0 -- -\"$pid\" 2>/dev/null; then \
+                 kill -TERM \"$pid\" 2>/dev/null; sleep 0.2; kill -KILL \"$pid\" 2>/dev/null; \
+                 rm -f -- {pid_file}; \
+                 echo 'its children could not be found: there is no /proc and the launcher is not a process-group leader' >&2; \
+                 exit 65; \
+               fi; \
                tree=$(descendants \"$pid\"); \
                kill -TERM -- -\"$pid\" 2>/dev/null || true; kill -TERM $tree 2>/dev/null || true; sleep 0.2; \
                kill -KILL -- -\"$pid\" 2>/dev/null || true; kill -KILL $tree 2>/dev/null || true; \
