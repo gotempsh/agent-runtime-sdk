@@ -19,7 +19,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use tokio::process::Command;
 
-use crate::remote_shell::{bounded_diagnostic, RemoteShell, ShellCarrier, UNSUPPORTED_REMOTE_EXIT};
+use crate::remote_shell::{
+    bounded_diagnostic, RemoteShell, ShellCarrier, UNSUPPORTED_REMOTE_MARKER,
+};
 use crate::{
     ExecutionTransport, ProviderReadiness, SandboxCapabilities, TransportCapabilities,
     TransportError, TransportErrorKind, TransportProcess, TransportReadinessRequest,
@@ -147,8 +149,8 @@ impl ShellCarrier for DockerCarrier {
         // without it before anything is launched there.
         let proc_check = format!(
             "if [ ! -d /proc ]; then \
-               echo 'the container has no /proc, so its processes could not be stopped' >&2; \
-               exit {UNSUPPORTED_REMOTE_EXIT}; \
+               echo '{UNSUPPORTED_REMOTE_MARKER}the container has no /proc, so its processes could not be stopped' >&2; \
+               exit 1; \
              fi; "
         );
         // `docker exec -u` keeps the container's `HOME`, which belongs to the

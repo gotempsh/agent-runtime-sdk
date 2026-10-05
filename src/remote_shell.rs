@@ -55,9 +55,18 @@ const SAFE_REMOTE_ENVIRONMENT: &[&str] = &[
 ];
 
 /// How a remote shell is reached from the SDK host.
-/// Exit status a carrier's login prelude uses to refuse a remote it cannot
-/// operate safely, with the reason on stderr.
-pub(crate) const UNSUPPORTED_REMOTE_EXIT: i32 = 66;
+/// Prefix of the stderr line on which a carrier's login prelude refuses a
+/// remote it cannot operate safely, followed by the reason. A login shell's
+/// own failures never carry it, whatever their exit status.
+pub(crate) const UNSUPPORTED_REMOTE_MARKER: &str = "temps-agent-runtime unsupported remote: ";
+
+/// The reason a carrier prelude gave for refusing the remote, if it did.
+fn unsupported_remote_reason(stderr: &[u8]) -> Option<String> {
+    String::from_utf8_lossy(stderr)
+        .lines()
+        .find_map(|line| line.strip_prefix(UNSUPPORTED_REMOTE_MARKER))
+        .map(|reason| reason.trim().to_string())
+}
 
 pub(crate) trait ShellCarrier: Clone + Debug + Send + Sync + 'static {
     /// Stable transport name used in errors and process handles.
@@ -158,12 +167,8 @@ impl<C: ShellCarrier> RemoteShell<C> {
                             TransportErrorKind::Unsupported,
                             format!("the {location} user needs Bash or Zsh to resolve its login PATH"),
                         )
-                    } else if output.status.code() == Some(UNSUPPORTED_REMOTE_EXIT) {
-                        // A carrier prelude refused this remote; it says why.
-                        (
-                            TransportErrorKind::Unsupported,
-                            bounded_diagnostic(&output.stderr),
-                        )
+                    } else if let Some(reason) = unsupported_remote_reason(&output.stderr) {
+                        (TransportErrorKind::Unsupported, reason)
                     } else {
                         let diagnostic = bounded_diagnostic(&output.stderr);
                         let message = if diagnostic.is_empty() {
@@ -1075,6 +1080,17 @@ pub(crate) fn bounded_diagnostic(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_carrier_refusal_marks_a_remote_unsupported() {
+        let refusal = format!("noise\n{UNSUPPORTED_REMOTE_MARKER}no /proc here\n");
+        assert_eq!(
+            unsupported_remote_reason(refusal.as_bytes()).as_deref(),
+            Some("no /proc here")
+        );
+        // A login shell's own failure, whatever its status, is not a refusal.
+        assert_eq!(unsupported_remote_reason(b"~/.bashrc: exit 66"), None);
+    }
     use crate::CommandSpec;
 
     pub(crate) fn login_environment() -> RemoteLoginEnvironment {
