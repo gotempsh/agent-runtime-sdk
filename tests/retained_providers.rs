@@ -19,6 +19,7 @@ import json,os,sys,threading,time
 LOG=LOG_PATH
 RELEASE=RELEASE_PATH
 LOCK=threading.Lock()
+BACKGROUND=[]
 def log(kind, **data):
  with open(LOG,'a') as f:f.write(json.dumps(dict(kind=kind,pid=os.getpid(),**data))+'\n')
 def emit(frame):
@@ -64,9 +65,16 @@ for line in sys.stdin:
    emit({'type':'system','subtype':'background_tasks_changed','tasks':[{'task_id':'bg-1','task_type':'local_agent','description':'Background work'}]})
    emit({'type':'assistant','parent_tool_use_id':None,'message':{'content':[{'type':'text','text':'LAUNCHED'}]}})
    result('LAUNCHED')
-   threading.Thread(target=subagent,args=(prompt=='spawn-bg',),daemon=True).start()
+   thread=threading.Thread(target=subagent,args=(prompt=='spawn-bg',),daemon=True)
+   BACKGROUND.append(thread);thread.start()
    continue
   result('reply:'+prompt)
+# stdin closed. Let released background work finish, then exit holding the
+# output lock: interpreter shutdown while a daemon thread is inside print()
+# aborts CPython ('could not acquire lock for <stdout> at interpreter shutdown').
+for thread in BACKGROUND:thread.join(5)
+with LOCK:
+ sys.stdout.flush();os._exit(0)
 ";
 
 struct Fixture {
@@ -581,7 +589,8 @@ async fn claude_background_work_without_retention_keeps_rejecting_overlap() {
     f.release_background();
     let (_, result) = first.finish().await;
     // One-shot behavior is unchanged; whether this fixture prints its
-    // follow-up before stdin closes is a race outside this test's scope.
+    // follow-up before stdin closes is a race outside this test's scope
+    // (the fixture finishes its background work and exits cleanly either way).
     assert!(result.unwrap().text.starts_with("LAUNCHED"));
     f.dispose().await;
 }
