@@ -65,6 +65,11 @@ pub(super) struct TurnState {
     parts: Vec<Value>,
     /// Native `{providerID, modelID}` selection, when the caller pinned one.
     model: Option<Value>,
+    /// This invocation summarizes the session (`/session/{id}/summarize`)
+    /// instead of sending a prompt.
+    manual_compaction: bool,
+    /// OpenCode confirmed this invocation's manual compaction.
+    compacted: bool,
     /// Session being prompted.
     session_id: Option<String>,
     /// Whether every permission must be refused without consulting the
@@ -337,6 +342,7 @@ pub(super) fn prepare_turn(request: &TurnRequest, state: &mut AdapterState, port
             resume: request.session_id.clone(),
             parts,
             model: model_selection(request.model.as_deref()),
+            manual_compaction: super::is_manual_compaction_prompt(&request.prompt),
             plan_mode: is_plan_mode(request),
             tools_denied: request
                 .launch_context
@@ -457,6 +463,26 @@ fn prompt(turn: &TurnState, output: &mut AdapterOutput) -> Result<()> {
     let Some(session) = turn.session_id.as_deref() else {
         return Ok(());
     };
+    if turn.manual_compaction {
+        // OpenCode summarizes with an explicit model; its compaction part and
+        // `session.compacted` then report the lifecycle like an automatic one.
+        let Some(model) = &turn.model else {
+            return Err(RuntimeError::InvalidRequest {
+                field: "model",
+                message: "Select an OpenCode model before compacting this session.".into(),
+            });
+        };
+        output.writes.push(encode(&post(
+            Some(ID_PROMPT),
+            format!(
+                "/session/{}/summarize?directory={}",
+                query_escape(session),
+                query_escape(&turn.directory)
+            ),
+            model.clone(),
+        ))?);
+        return Ok(());
+    }
     let mut body = json!({"parts": turn.parts});
     if let Some(model) = &turn.model {
         body["model"] = model.clone();
@@ -691,6 +717,11 @@ fn event(
                     duration_ms: None,
                 },
             });
+            if turn.manual_compaction {
+                // The summary is the whole invocation; it has no reply text.
+                turn.compacted = true;
+                output.terminal = true;
+            }
         }
         "session.error" => {
             turn.error_message = properties
@@ -712,6 +743,16 @@ fn event(
             }
             if let Some(message) = turn.error_message.clone() {
                 fail(turn, state, output, &message, None);
+            } else if turn.manual_compaction {
+                if !turn.compacted {
+                    fail(
+                        turn,
+                        state,
+                        output,
+                        "OpenCode went idle without confirming the compaction.",
+                        None,
+                    );
+                }
             } else if state.result.text.trim().is_empty() && !turn.saw_activity {
                 // A turn that produced no text and no tool call is a real
                 // failure, not an empty success: it is what a silently
@@ -1041,6 +1082,120 @@ mod tests {
         .unwrap();
         parse_line(&json!({"type": FRAME_SUBSCRIBED}).to_string(), &mut state).unwrap();
         state
+    }
+
+    #[test]
+    fn a_manual_compaction_summarizes_the_session_with_its_model() {
+        let mut request = request(PermissionMode::Default);
+        request.prompt = "/compact".into();
+        request.model = Some("anthropic/claude-sonnet-4-5".into());
+        let mut state = AdapterState::default();
+        prepare_turn(&request, &mut state, 4242);
+        parse_line(&json!({"type": FRAME_READY}).to_string(), &mut state).unwrap();
+        parse_line(
+            &json!({"type": FRAME_RESPONSE, "id": ID_SESSION, "status": 200,
+                    "body": {"id": "session-1"}})
+            .to_string(),
+            &mut state,
+        )
+        .unwrap();
+        let sent = parse_line(&json!({"type": FRAME_SUBSCRIBED}).to_string(), &mut state).unwrap();
+        let frame = decode(&sent.writes[0]);
+        assert!(frame["path"]
+            .as_str()
+            .unwrap()
+            .starts_with("/session/session-1/summarize"));
+        assert_eq!(frame["body"]["providerID"], json!("anthropic"));
+        assert_eq!(frame["body"]["modelID"], json!("claude-sonnet-4-5"));
+
+        // Without a model there is nothing to summarize with.
+        let mut request = request.clone();
+        request.model = None;
+        let mut state = AdapterState::default();
+        prepare_turn(&request, &mut state, 4242);
+        parse_line(&json!({"type": FRAME_READY}).to_string(), &mut state).unwrap();
+        parse_line(
+            &json!({"type": FRAME_RESPONSE, "id": ID_SESSION, "status": 200,
+                    "body": {"id": "session-1"}})
+            .to_string(),
+            &mut state,
+        )
+        .unwrap();
+        assert!(parse_line(&json!({"type": FRAME_SUBSCRIBED}).to_string(), &mut state).is_err());
+    }
+
+    /// A manual compaction invocation with its summarize request accepted.
+    fn summarizing_turn() -> AdapterState {
+        let mut request = request(PermissionMode::Default);
+        request.prompt = "/compact".into();
+        request.model = Some("anthropic/claude-sonnet-4-5".into());
+        let mut state = AdapterState::default();
+        prepare_turn(&request, &mut state, 4242);
+        for frame in [
+            json!({"type": FRAME_READY}),
+            json!({"type": FRAME_RESPONSE, "id": ID_SESSION, "status": 200, "body": {"id": "session-1"}}),
+            json!({"type": FRAME_SUBSCRIBED}),
+            json!({"type": FRAME_RESPONSE, "id": ID_PROMPT, "status": 200, "body": true}),
+        ] {
+            parse_line(&frame.to_string(), &mut state).unwrap();
+        }
+        state
+    }
+
+    #[test]
+    fn a_confirmed_manual_compaction_ends_the_invocation_without_a_reply() {
+        let mut state = summarizing_turn();
+        let started = parse_line(
+            &sse(
+                "message.part.updated",
+                json!({"sessionID": "session-1", "part": {
+                    "id": "prt-c1", "messageID": "msg-u2", "sessionID": "session-1",
+                    "type": "compaction", "auto": false
+                }}),
+            ),
+            &mut state,
+        )
+        .unwrap();
+        assert!(!started.terminal);
+        let compacted = parse_line(
+            &sse("session.compacted", json!({"sessionID": "session-1"})),
+            &mut state,
+        )
+        .unwrap();
+        assert!(compacted.terminal);
+        assert!(compacted.events.iter().any(|event| matches!(
+            event,
+            TurnEvent::CompactionCompleted { compaction } if compaction.trigger == CompactionTrigger::Manual
+        )));
+        // An idle that follows is not "finished without producing a reply".
+        let idle = parse_line(
+            &sse("session.idle", json!({"sessionID": "session-1"})),
+            &mut state,
+        )
+        .unwrap();
+        assert!(!idle
+            .events
+            .iter()
+            .any(|event| matches!(event, TurnEvent::CompactionFailed { .. })));
+        assert!(state.terminal_failure.is_none());
+        assert_ne!(state.result.status, RunStatus::Failed);
+    }
+
+    #[test]
+    fn an_unconfirmed_manual_compaction_fails_clearly() {
+        let mut state = summarizing_turn();
+        let idle = parse_line(
+            &sse("session.idle", json!({"sessionID": "session-1"})),
+            &mut state,
+        )
+        .unwrap();
+        assert!(idle.terminal);
+        assert_eq!(state.result.status, RunStatus::Failed);
+        let failure = format!("{:?}", state.terminal_failure);
+        assert!(
+            failure.contains("without confirming the compaction"),
+            "{failure}"
+        );
     }
 
     fn permission_event(kind: &str) -> String {

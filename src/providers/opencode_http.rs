@@ -84,11 +84,41 @@ pub(super) const FRAME_ERROR: &str = "@error";
 /// missed, and only the bridge can know when the stream is actually open.
 pub(super) const FRAME_SUBSCRIBED: &str = "@subscribed";
 
+/// Where the bridge reaches one `opencode serve` process: its loopback port
+/// and the `Authorization` header value the server requires, if any.
+#[derive(Clone)]
+pub(super) struct Endpoint {
+    pub(super) port: u16,
+    pub(super) authorization: Option<String>,
+}
+
+impl std::fmt::Debug for Endpoint {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Endpoint")
+            .field("port", &self.port)
+            .field(
+                "authorization",
+                &self.authorization.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
+}
+
+impl Endpoint {
+    fn authorization_header(&self) -> String {
+        self.authorization
+            .as_deref()
+            .map(|value| format!("Authorization: {value}\r\n"))
+            .unwrap_or_default()
+    }
+}
+
 /// Start the bridge for a turn and hand the runtime its protocol streams.
 ///
 /// The returned streams are live immediately; the task behind them polls the
 /// server for readiness first and emits [`FRAME_READY`] once it answers.
-pub(super) fn connect(port: u16) -> ProtocolStreams {
+pub(super) fn connect(endpoint: Endpoint) -> ProtocolStreams {
     // Two independent pipes rather than the two halves of one. Splitting a
     // single duplex stream would keep it alive until *both* halves drop, so
     // the runtime closing its writer at the end of a turn would never reach
@@ -97,7 +127,7 @@ pub(super) fn connect(port: u16) -> ProtocolStreams {
     // direction close on its own.
     let (runtime_reader, bridge_writer) = tokio::io::duplex(BRIDGE_BUFFER_BYTES);
     let (bridge_reader, runtime_writer) = tokio::io::duplex(BRIDGE_BUFFER_BYTES);
-    tokio::spawn(run_bridge(port, bridge_reader, bridge_writer));
+    tokio::spawn(run_bridge(endpoint, bridge_reader, bridge_writer));
     ProtocolStreams {
         reader: Box::new(runtime_reader),
         writer: Box::new(runtime_writer),
@@ -110,10 +140,10 @@ fn address(port: u16) -> SocketAddr {
 
 /// Drive one turn's HTTP traffic until the state machine stops writing or the
 /// server stops answering.
-async fn run_bridge(port: u16, incoming: DuplexStream, outgoing: DuplexStream) {
+async fn run_bridge(endpoint: Endpoint, incoming: DuplexStream, outgoing: DuplexStream) {
     let outgoing = std::sync::Arc::new(tokio::sync::Mutex::new(outgoing));
 
-    if let Err(error) = wait_until_ready(port).await {
+    if let Err(error) = wait_until_ready(&endpoint).await {
         emit_error(&outgoing, &error).await;
         return;
     }
@@ -145,14 +175,20 @@ async fn run_bridge(port: u16, incoming: DuplexStream, outgoing: DuplexStream) {
         if command.method == "SUBSCRIBE" {
             if subscription.is_none() {
                 subscription = Some(tokio::spawn(stream_events(
-                    port,
+                    endpoint.clone(),
                     command.path,
                     std::sync::Arc::clone(&outgoing),
                 )));
             }
             continue;
         }
-        let outcome = perform(port, &command.method, &command.path, command.body.as_ref()).await;
+        let outcome = perform(
+            &endpoint,
+            &command.method,
+            &command.path,
+            command.body.as_ref(),
+        )
+        .await;
         let frame = match outcome {
             Ok((status, body)) => json!({
                 "type": FRAME_RESPONSE,
@@ -177,11 +213,11 @@ async fn run_bridge(port: u16, incoming: DuplexStream, outgoing: DuplexStream) {
 }
 
 /// Poll a cheap, always-safe endpoint until the server answers.
-async fn wait_until_ready(port: u16) -> std::result::Result<(), String> {
+async fn wait_until_ready(endpoint: &Endpoint) -> std::result::Result<(), String> {
     for attempt in 0..READINESS_ATTEMPTS {
         match tokio::time::timeout(
             Duration::from_secs(1),
-            perform(port, "GET", "/global/health", None),
+            perform(endpoint, "GET", "/global/health", None),
         )
         .await
         {
@@ -201,13 +237,15 @@ async fn wait_until_ready(port: u16) -> std::result::Result<(), String> {
 
 /// Perform one request on its own connection and read the whole response.
 async fn perform(
-    port: u16,
+    endpoint: &Endpoint,
     method: &str,
     path: &str,
     body: Option<&Value>,
 ) -> std::io::Result<(u16, Value)> {
+    let port = endpoint.port;
     let mut stream = TcpStream::connect(address(port)).await?;
     stream.set_nodelay(true).ok();
+    let authorization = endpoint.authorization_header();
     let encoded = body.map(ToString::to_string).unwrap_or_default();
     let content_type = if body.is_some() {
         "Content-Type: application/json\r\n"
@@ -215,7 +253,7 @@ async fn perform(
         ""
     };
     let head = format!(
-        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\
+        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{authorization}\
          Accept: application/json\r\nConnection: close\r\n{content_type}\
          Content-Length: {}\r\n\r\n",
         encoded.len()
@@ -244,10 +282,11 @@ async fn perform(
 /// and the turn is failed with a real diagnostic instead of hanging until the
 /// turn deadline.
 async fn stream_events(
-    port: u16,
+    endpoint: Endpoint,
     path: String,
     outgoing: std::sync::Arc<tokio::sync::Mutex<DuplexStream>>,
 ) {
+    let port = endpoint.port;
     let stream = match TcpStream::connect(address(port)).await {
         Ok(stream) => stream,
         Err(error) => {
@@ -262,7 +301,8 @@ async fn stream_events(
     stream.set_nodelay(true).ok();
     let mut reader = BufReader::new(stream);
     let head = format!(
-        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAccept: text/event-stream\r\nCache-Control: no-cache\r\n\r\n"
+        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{}Accept: text/event-stream\r\nCache-Control: no-cache\r\n\r\n",
+        endpoint.authorization_header()
     );
     {
         let inner = reader.get_mut();
@@ -642,7 +682,9 @@ mod tests {
                     let mut reader = BufReader::new(&mut socket);
                     let mut request = String::new();
                     reader.read_line(&mut request).await.unwrap();
-                    // Drain headers.
+                    // Drain headers; like `opencode serve` with a server
+                    // password, answer nothing without the credential.
+                    let mut authorized = false;
                     loop {
                         let mut header = String::new();
                         if reader.read_line(&mut header).await.unwrap() == 0
@@ -650,8 +692,11 @@ mod tests {
                         {
                             break;
                         }
+                        authorized |= header.trim_end() == "Authorization: Basic Zml4dHVyZQ==";
                     }
-                    let response: &[u8] = if request.contains("/event") {
+                    let response: &[u8] = if !authorized {
+                        b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n"
+                    } else if request.contains("/event") {
                         b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n\
                           1E\r\ndata: {\"type\":\"session.idle\"}\n\r\n\
                           1\r\n\n\r\n"
@@ -668,7 +713,10 @@ mod tests {
             }
         });
 
-        let streams = connect(port);
+        let streams = connect(Endpoint {
+            port,
+            authorization: Some("Basic Zml4dHVyZQ==".into()),
+        });
         let mut writer = streams.writer;
         let mut lines = BufReader::new(streams.reader).lines();
 
@@ -739,7 +787,10 @@ mod tests {
             }
         });
 
-        let streams = connect(port);
+        let streams = connect(Endpoint {
+            port,
+            authorization: None,
+        });
         let mut writer = streams.writer;
         let mut lines = BufReader::new(streams.reader).lines();
         assert!(lines.next_line().await.unwrap().is_some(), "ready frame");

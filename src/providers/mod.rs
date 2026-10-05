@@ -73,3 +73,54 @@ fn merge_usage(target: &mut Usage, incoming: &Usage) {
         .or_else(|| target.context_window.clone());
     target.cost_usd = incoming.cost_usd.or(target.cost_usd);
 }
+
+/// Whether a turn prompt is a manual compaction request (`/compact` plus
+/// optional instructions), the form `CompactionInput` produces.
+pub(crate) fn is_manual_compaction_prompt(prompt: &str) -> bool {
+    let prompt = prompt.trim_start();
+    prompt
+        .strip_prefix("/compact")
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+}
+
+/// Refuse a manual compaction request carrying summary instructions on an
+/// adapter whose native compaction cannot take them, instead of dropping them.
+#[cfg(any(feature = "codex", feature = "opencode"))]
+pub(crate) fn refuse_compaction_instructions(
+    provider: crate::Provider,
+    prompt: &str,
+) -> crate::Result<()> {
+    let has_instructions = prompt
+        .trim_start()
+        .strip_prefix("/compact")
+        .is_some_and(|rest| !rest.trim().is_empty());
+    if is_manual_compaction_prompt(prompt) && has_instructions {
+        return Err(crate::RuntimeError::InvalidRequest {
+            field: "prompt",
+            message: format!(
+                "{provider} compacts natively without summary instructions; omit them"
+            ),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(all(test, any(feature = "codex", feature = "opencode")))]
+mod compaction_prompt_tests {
+    use super::*;
+
+    #[test]
+    fn only_a_bare_compact_is_accepted_without_instruction_support() {
+        assert!(is_manual_compaction_prompt("/compact"));
+        assert!(is_manual_compaction_prompt("  /compact keep the API notes"));
+        assert!(!is_manual_compaction_prompt("/compaction please"));
+        assert!(refuse_compaction_instructions(crate::Provider::Codex, "/compact").is_ok());
+        assert!(refuse_compaction_instructions(crate::Provider::Codex, "/compact   ").is_ok());
+        assert!(refuse_compaction_instructions(crate::Provider::Codex, "hello").is_ok());
+        let error =
+            refuse_compaction_instructions(crate::Provider::OpenCode, "/compact keep notes")
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("without summary instructions"), "{error}");
+    }
+}

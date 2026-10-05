@@ -337,7 +337,22 @@ impl SshTransport {
     }
 
     fn base_command(&self) -> Command {
+        self.base_command_forwarding(&[])
+    }
+
+    /// `base_command` plus `-L` for each loopback port the remote process
+    /// serves, so the SDK host reaches it at the same local port. A failed
+    /// forward fails the connection instead of leaving the client unable to
+    /// reach the server.
+    fn base_command_forwarding(&self, loopback_ports: &[u16]) -> Command {
         let mut command = Command::new(&self.executable);
+        for port in loopback_ports {
+            command
+                .arg("-o")
+                .arg("ExitOnForwardFailure=yes")
+                .arg("-L")
+                .arg(format!("127.0.0.1:{port}:127.0.0.1:{port}"));
+        }
         command
             .arg("-o")
             .arg(format!(
@@ -682,7 +697,7 @@ impl ExecutionTransport for SshTransport {
         let control_directory = self.stage_remote_launcher(launcher.as_bytes()).await?;
         let pid_file = format!("{control_directory}/pid");
         let remote_command = build_remote_command(&request, &control_directory)?;
-        let mut command = self.base_command();
+        let mut command = self.base_command_forwarding(&request.command.loopback_ports);
         command
             .arg(remote_command)
             .stdin(std::process::Stdio::piped())
@@ -1369,6 +1384,33 @@ mod tests {
             path: "/opt/homebrew/bin:/Users/agent/.bun/bin:/usr/bin:/bin".into(),
             shell: "/bin/zsh".into(),
         }
+    }
+
+    #[test]
+    fn loopback_ports_are_forwarded_before_the_destination() {
+        let transport = SshTransport::builder("example.test")
+            .user("fleet")
+            .build()
+            .unwrap();
+        let command = transport.base_command_forwarding(&[4242]);
+        let args: Vec<String> = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        let forward = args.iter().position(|arg| arg == "-L").expect("forward");
+        assert_eq!(args[forward + 1], "127.0.0.1:4242:127.0.0.1:4242");
+        assert!(args.contains(&"ExitOnForwardFailure=yes".to_string()));
+        let destination = args
+            .iter()
+            .position(|arg| arg == "fleet@example.test")
+            .unwrap();
+        assert!(forward < destination);
+        assert!(!transport
+            .base_command()
+            .as_std()
+            .get_args()
+            .any(|arg| arg == "-L"));
     }
 
     #[test]

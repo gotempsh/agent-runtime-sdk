@@ -46,6 +46,58 @@ pub enum OpenCodeTurnMode {
     Serve,
 }
 
+/// Username `opencode serve` checks alongside `OPENCODE_SERVER_PASSWORD`.
+const SERVER_USERNAME: &str = "opencode";
+
+/// The password `opencode serve` requires on `port`. Derived from a secret this
+/// SDK process draws once, so the later turns of a retained server recompute
+/// it from the port alone and no credential is stored in turn state.
+fn server_password(port: u16) -> Result<String> {
+    use sha2::Digest;
+    static SECRET: std::sync::OnceLock<Option<[u8; 32]>> = std::sync::OnceLock::new();
+    let secret = SECRET
+        .get_or_init(|| {
+            let mut secret = [0_u8; 32];
+            getrandom::fill(&mut secret).ok().map(|()| secret)
+        })
+        .ok_or_else(|| RuntimeError::Protocol {
+            provider: Provider::OpenCode,
+            message: "could not draw a random password for the OpenCode server".into(),
+        })?;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(secret);
+    hasher.update(b"opencode-serve-password");
+    hasher.update(port.to_be_bytes());
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+/// `Authorization` header value for HTTP Basic credentials.
+fn basic_authorization(password: &str) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let raw = format!("{SERVER_USERNAME}:{password}");
+    let bytes = raw.as_bytes();
+    let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let triple = (u32::from(chunk[0]) << 16)
+            | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
+            | u32::from(*chunk.get(2).unwrap_or(&0));
+        for index in 0..4 {
+            if index <= chunk.len() {
+                encoded.push(char::from(
+                    ALPHABET[((triple >> (18 - 6 * index)) & 0x3f) as usize],
+                ));
+            } else {
+                encoded.push('=');
+            }
+        }
+    }
+    format!("Basic {encoded}")
+}
+
 /// OpenCode CLI adapter using `opencode run --format json` or `opencode serve`.
 #[derive(Debug, Clone, Default)]
 pub struct OpenCode {
@@ -96,12 +148,24 @@ impl OpenCode {
             "--port".into(),
             port.to_string().into(),
         ]);
+        // The client below talks to this port on the SDK host's loopback;
+        // a remote transport forwards it there.
+        spec.loopback_ports.push(port);
         // The policy travels in the environment rather than argv because it is
         // this turn's entire enforcement boundary, and `clear_environment`
         // means nothing reaches the child that was not put here deliberately.
         spec.environment.insert(
             "OPENCODE_CONFIG_CONTENT".into(),
             super::opencode_serve::permission_config(request)?.into(),
+        );
+        // The server answers only requests carrying this process's password,
+        // so another local process (or one reaching a forwarded port on the
+        // SDK host) cannot drive the session.
+        spec.environment
+            .insert("OPENCODE_SERVER_USERNAME".into(), SERVER_USERNAME.into());
+        spec.environment.insert(
+            "OPENCODE_SERVER_PASSWORD".into(),
+            server_password(port)?.into(),
         );
         Ok(spec)
     }
@@ -129,6 +193,8 @@ impl AgentAdapter for OpenCode {
             // summary message, and `session.compacted` over its event stream;
             // `opencode run --format json` does not.
             compaction_lifecycle: self.serve_mode(),
+            // `/session/{id}/summarize` is a server request.
+            manual_compaction: self.serve_mode(),
             ..TurnCapabilities::default()
         }
     }
@@ -292,6 +358,7 @@ impl AgentAdapter for OpenCode {
         if !self.serve_mode() {
             return Ok(());
         }
+        super::refuse_compaction_instructions(Provider::OpenCode, &request.prompt)?;
         // Bind a throwaway listener so the OS picks a free port, then drop it
         // so the server can bind the same one. `opencode serve --port 0` does
         // not do this: it falls back to its fixed default port instead.
@@ -315,6 +382,7 @@ impl AgentAdapter for OpenCode {
         if !self.serve_mode() {
             return self.prepare_turn(request, state);
         }
+        super::refuse_compaction_instructions(Provider::OpenCode, &request.prompt)?;
         let port = process_hint
             .and_then(|port| u16::try_from(port).ok())
             .ok_or_else(|| RuntimeError::Protocol {
@@ -347,9 +415,16 @@ impl AgentAdapter for OpenCode {
         _request: &TurnRequest,
         state: &AdapterState,
     ) -> Result<Option<crate::ProtocolStreams>> {
-        Ok(super::opencode_serve::turn_port(state)
-            .filter(|_| self.serve_mode())
-            .map(super::opencode_http::connect))
+        let Some(port) = super::opencode_serve::turn_port(state).filter(|_| self.serve_mode())
+        else {
+            return Ok(None);
+        };
+        Ok(Some(super::opencode_http::connect(
+            super::opencode_http::Endpoint {
+                port,
+                authorization: Some(basic_authorization(&server_password(port)?)),
+            },
+        )))
     }
 
     fn interrupt_request(&self, state: &AdapterState) -> Option<Vec<u8>> {
@@ -603,6 +678,40 @@ impl AgentAdapter for OpenCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn basic_authorization_encodes_the_server_username_and_password() {
+        // `opencode:s3cret` in Base64, as `curl -u` sends it.
+        assert_eq!(basic_authorization("s3cret"), "Basic b3BlbmNvZGU6czNjcmV0");
+        assert_eq!(basic_authorization(""), "Basic b3BlbmNvZGU6");
+    }
+
+    #[test]
+    fn the_serve_command_requires_a_per_port_server_password() {
+        let first = server_password(4100).unwrap();
+        assert_eq!(first.len(), 64);
+        assert_eq!(
+            first,
+            server_password(4100).unwrap(),
+            "stable for a retained server"
+        );
+        assert_ne!(first, server_password(4101).unwrap());
+
+        let adapter = OpenCode::serve();
+        let request = TurnRequest::new(Provider::OpenCode, "/tmp/work", "hi");
+        let spec = adapter.serve_command(&request, 4100).unwrap();
+        assert_eq!(
+            spec.environment
+                .get(std::ffi::OsStr::new("OPENCODE_SERVER_PASSWORD")),
+            Some(&std::ffi::OsString::from(first))
+        );
+        assert_eq!(
+            spec.environment
+                .get(std::ffi::OsStr::new("OPENCODE_SERVER_USERNAME")),
+            Some(&std::ffi::OsString::from("opencode"))
+        );
+        assert_eq!(spec.loopback_ports, vec![4100]);
+    }
 
     #[test]
     fn accumulates_step_usage() {
