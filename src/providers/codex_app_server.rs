@@ -300,6 +300,15 @@ pub(super) fn parse_line(line: &str, state: &mut AdapterState) -> Result<Adapter
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
+    // `thread/compact/start` answers with an empty result; the compaction's
+    // turn id first appears on `turn/started`, so a manual compaction adopts
+    // it there instead of discarding its own turn as uncorrelated.
+    if turn.manual_compaction && turn.turn_id.is_none() && method == "turn/started" {
+        if let Some(started) = reported_turn_id(&value) {
+            turn.turn_id = Some(started.to_string());
+            store(state, &turn);
+        }
+    }
     if turn.retained
         && !method.is_empty()
         && value.get("id").is_none()

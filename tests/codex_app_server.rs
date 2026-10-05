@@ -291,6 +291,25 @@ async fn serve(
                 )
                 .await;
             }
+            // Played exactly as `codex app-server` 0.159 answers it: an empty
+            // result, then a turn of its own wrapping one compaction item.
+            Some("thread/compact/start") => {
+                send(&mut output, json!({"jsonrpc":"2.0","id":id,"result":{}})).await;
+                for frame in [
+                    json!({"jsonrpc":"2.0","method":"turn/started","params":{
+                        "threadId":"thread-fixture","turn":{"id":"turn-compact","status":"inProgress"}}}),
+                    json!({"jsonrpc":"2.0","method":"item/started","params":{
+                        "threadId":"thread-fixture","turnId":"turn-compact",
+                        "item":{"type":"contextCompaction","id":"compact-1"}}}),
+                    json!({"jsonrpc":"2.0","method":"item/completed","params":{
+                        "threadId":"thread-fixture","turnId":"turn-compact",
+                        "item":{"type":"contextCompaction","id":"compact-1"}}}),
+                    json!({"jsonrpc":"2.0","method":"turn/completed","params":{
+                        "threadId":"thread-fixture","turn":{"id":"turn-compact","status":"completed"}}}),
+                ] {
+                    send(&mut output, frame).await;
+                }
+            }
             Some("turn/start") => {
                 send(
                     &mut output,
@@ -896,6 +915,82 @@ async fn a_retained_process_that_dies_mid_compaction_never_leaves_it_open() {
                 TurnEvent::CompactionStarted { .. },
                 TurnEvent::CompactionFailed { .. }
             ]
+        ),
+        "{compaction:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_manual_compaction_compacts_the_thread_once() {
+    let events = Collector::default();
+    let mut request = request();
+    request.prompt = "/compact".into();
+    request.session_id = Some("thread-fixture".into());
+    let transport = AppServer::new(Script::AsyncQuestion);
+    runtime(transport.clone())
+        .run(request, &events, None)
+        .await
+        .unwrap();
+    assert_eq!(transport.method_count("thread/compact/start"), 1);
+    assert_eq!(transport.method_count("turn/start"), 0);
+    let compaction = compaction_events(&events.events());
+    assert!(
+        matches!(
+            compaction.as_slice(),
+            [
+                TurnEvent::CompactionStarted { .. },
+                TurnEvent::CompactionCompleted { .. }
+            ]
+        ),
+        "{compaction:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_retained_process_compacts_its_thread_after_a_turn() {
+    let transport = AppServer::new(Script::AsyncQuestion);
+    let runtime = retained_runtime(transport.clone(), Duration::from_secs(30));
+    let (_client, handle) = retained_handle(runtime).await;
+    assert!(handle.driver_capabilities().manual_compaction);
+    handle
+        .start_turn(TurnInput::new(
+            InvocationId::new("before").unwrap(),
+            "first",
+        ))
+        .await
+        .unwrap()
+        .wait()
+        .await
+        .unwrap();
+
+    let (mut stream, completion) = handle
+        .compact(temps_agent_runtime::retained::CompactionInput::new(
+            InvocationId::new("compact").unwrap(),
+        ))
+        .await
+        .unwrap()
+        .into_parts();
+    let mut observed = Vec::new();
+    let collect = async {
+        while let Some(envelope) = stream.next().await {
+            if let temps_agent_runtime::retained::RuntimeEvent::ProviderEvent { event } =
+                envelope.event
+            {
+                observed.push(event);
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(10), collect)
+        .await
+        .expect("the compaction invocation must finish");
+    completion.wait().await.unwrap();
+    assert_eq!(transport.method_count("thread/compact/start"), 1);
+    assert_eq!(transport.spawn_count(), 1);
+    let compaction = compaction_events(&observed);
+    assert!(
+        matches!(
+            compaction.last(),
+            Some(TurnEvent::CompactionCompleted { .. })
         ),
         "{compaction:?}"
     );
