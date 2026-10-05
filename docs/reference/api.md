@@ -455,12 +455,15 @@ non-recursive autocomplete inside the configured transport. It returns the
 transport user's home directory, at most 50 matching directories, and an
 `exact_match` flag that applications can use before enabling a turn. Absolute
 paths, `~` paths, and relative prefixes are resolved by the target—not by the
-SDK host. `LocalTransport` and `SshTransport` implement this operation. Custom
+SDK host. `LocalTransport`, `SshTransport`, and `DockerTransport` implement this operation. Custom
 transports can implement `ExecutionTransport::suggest_working_directories`;
 the default is a typed `Unsupported` error.
 
 `SshTransport` is the interactive remote implementation. It supports writable
-stdin and remote process-group termination. `TempsSandboxTransport` is the
+stdin and remote process-group termination. `DockerTransport` runs the same
+remote-shell machinery inside an existing container through `docker exec -i`;
+the application creates and removes the container, and loopback ports
+(`OpenCode::serve()`) are not supported there yet. `TempsSandboxTransport` is the
 reattachable HTTP implementation for an existing Temps sandbox; it supports
 staged initial stdin but not live interactive stdin.
 

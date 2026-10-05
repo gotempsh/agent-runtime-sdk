@@ -60,7 +60,7 @@ APIs, own credentials, or silently fall back to an unsandboxed process.
 - Trait-based managed profile resolution and optimistic revision updates, with
   approved, bounded same-session retry after a classified sandbox denial
 - Public adapter trait for richer protocols or additional providers
-- Built-in `LocalTransport` and interactive `SshTransport`, optional
+- Built-in `LocalTransport`, interactive `SshTransport` and `DockerTransport`, optional
   `TempsSandboxTransport`, plus the public transport trait for hosted microVMs
 - Transport-aware aggregate harness discovery for bounded local, SSH, and
   hosted-sandbox onboarding
