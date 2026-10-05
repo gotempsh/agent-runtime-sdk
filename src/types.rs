@@ -1037,6 +1037,13 @@ pub enum TurnEvent {
         /// Replaceable point-in-time account quota snapshot.
         usage: AccountUsageSnapshot,
     },
+    /// The provider finished its reply, but background tasks it started keep
+    /// the turn open until they end. The turn completes when the last one
+    /// does; until then a host can say what the conversation is waiting on.
+    ReplyFinishedWithBackgroundTasks {
+        /// Provider-native ids of the tasks still running.
+        task_ids: Vec<String>,
+    },
     /// Recoverable diagnostic safe to show to the user.
     Warning {
         /// Human-readable diagnostic.

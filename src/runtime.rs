@@ -3442,6 +3442,12 @@ impl AgentRuntime {
             if key == "service_tier" && provider == Provider::Codex {
                 continue;
             }
+            if key == "fast_mode"
+                && provider == Provider::Claude
+                && matches!(value.as_str(), "true" | "false")
+            {
+                continue;
+            }
             let Some(group) = control_groups.iter().find(|group| group.id == *key) else {
                 return Err(RuntimeError::InvalidRequest {
                     field: "harness_options",

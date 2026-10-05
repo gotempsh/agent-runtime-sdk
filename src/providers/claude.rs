@@ -1261,8 +1261,6 @@ impl AgentAdapter for Claude {
                 "off" => spec.args.extend(["--thinking".into(), "disabled".into()]),
                 "ultracode" => {
                     spec.args.extend(["--effort".into(), "xhigh".into()]);
-                    spec.args
-                        .extend(["--settings".into(), r#"{"ultracode":true}"#.into()]);
                 }
                 "low" | "medium" | "high" | "xhigh" | "max" => {
                     spec.args.extend(["--effort".into(), reasoning.into()]);
@@ -1274,6 +1272,29 @@ impl AgentAdapter for Claude {
                     });
                 }
             }
+        }
+        let mut settings = serde_json::Map::new();
+        if request.reasoning.as_deref() == Some("ultracode") {
+            settings.insert("ultracode".into(), serde_json::Value::Bool(true));
+        }
+        if let Some(fast) = request.harness_options.get("fast_mode") {
+            let enabled = match fast.as_str() {
+                "true" => true,
+                "false" => false,
+                _ => {
+                    return Err(RuntimeError::InvalidRequest {
+                        field: "harness_options.fast_mode",
+                        message: "Claude Fast mode must be true or false".into(),
+                    })
+                }
+            };
+            settings.insert("fastMode".into(), serde_json::Value::Bool(enabled));
+        }
+        if !settings.is_empty() {
+            spec.args.extend([
+                "--settings".into(),
+                serde_json::Value::Object(settings).to_string().into(),
+            ]);
         }
         if let Some(model) = request.model.as_deref() {
             spec.args.extend(["--model".into(), model.into()]);
@@ -1384,6 +1405,18 @@ impl AgentAdapter for Claude {
                 }
             }
             "stream_event" => {
+                // A new text block (after a tool call, or Claude's follow-up
+                // once background tasks report back) starts a new paragraph
+                // instead of running into the previous block's last word.
+                if value.pointer("/event/type").and_then(Value::as_str)
+                    == Some("content_block_start")
+                    && value
+                        .pointer("/event/content_block/type")
+                        .and_then(Value::as_str)
+                        == Some("text")
+                {
+                    separate_text_block(&mut state.result.text, &mut output.events);
+                }
                 let delta = value.pointer("/event/delta");
                 match delta
                     .and_then(|delta| delta.get("type"))
@@ -1436,6 +1469,12 @@ impl AgentAdapter for Claude {
                         match block.get("type").and_then(Value::as_str) {
                             Some("text") if !state.saw_text_delta => {
                                 if let Some(text) = block.get("text").and_then(Value::as_str) {
+                                    if !text.is_empty() {
+                                        separate_text_block(
+                                            &mut state.result.text,
+                                            &mut output.events,
+                                        );
+                                    }
                                     state.result.text.push_str(text);
                                     output.events.push(TurnEvent::TextDelta {
                                         text: text.to_string(),
@@ -1622,6 +1661,13 @@ impl AgentAdapter for Claude {
                 // answered by this result or by a later exchange.
                 output.terminal = native.background_task_ids.is_empty()
                     && (!native.retained_turn || native.own_commands_done());
+                if !native.background_task_ids.is_empty() {
+                    output
+                        .events
+                        .push(TurnEvent::ReplyFinishedWithBackgroundTasks {
+                            task_ids: native.background_task_ids.iter().cloned().collect(),
+                        });
+                }
                 let failed = value.get("is_error").and_then(Value::as_bool) == Some(true);
                 state.result.status = if failed {
                     let diagnostic = value
@@ -2438,6 +2484,14 @@ fn task_usage(value: Option<&Value>) -> Option<AgentTaskUsage> {
     })
 }
 
+/// Statuses after which a native task can no longer hold a turn open.
+fn is_terminal_task_status(status: &str) -> bool {
+    matches!(
+        status,
+        "completed" | "failed" | "killed" | "stopped" | "ended" | "cancelled" | "interrupted"
+    )
+}
+
 /// Finish a turn whose background work just drained after its result.
 ///
 /// A one-shot process closes stdin now and keeps reading until Claude exits,
@@ -2611,6 +2665,13 @@ fn translate_system_task(
                 }
                 None => {}
             }
+            // A terminal patch is the task's last word: Claude may never send
+            // a `task_notification` for it (killed tasks), so holding its id
+            // would keep a finished reply's turn open with nothing running.
+            if status.as_deref().is_some_and(is_terminal_task_status) {
+                native.background_task_ids.remove(task_id);
+                background_work_drained(native, output);
+            }
             output.events.push(TurnEvent::TaskActivity {
                 activity: AgentTaskActivity {
                     task_id: task_id.to_string(),
@@ -2649,16 +2710,28 @@ fn translate_system_task(
             } else {
                 task.kind = task_kind(Some(&task.kind), agent_type.as_deref());
             }
+            // A progress `description` is what the task is doing right now
+            // ("Waiting for command"), not what the task is. It is recorded on
+            // the activity below; it only names the task when the task has no
+            // real description yet (no `task_started` was seen), otherwise a
+            // finished task would keep showing its last progress phrase.
+            let adopt_description = description.as_ref().is_some_and(|_| {
+                task.description.is_empty()
+                    || task.description == fallback_task(task_id).description
+            });
             let mut changed = native.tasks.get(task_id).is_none_or(|known| {
                 known.kind != task.kind
-                    || description
-                        .as_ref()
-                        .is_some_and(|description| *description != known.description)
+                    || (adopt_description
+                        && description
+                            .as_ref()
+                            .is_some_and(|description| *description != known.description))
                     || known.agent_type != agent_type
                     || (summary.is_some() && known.summary != summary)
             });
-            if let Some(description) = &description {
-                task.description.clone_from(description);
+            if adopt_description {
+                if let Some(description) = &description {
+                    task.description.clone_from(description);
+                }
             }
             task.agent_type.clone_from(&agent_type);
             if let Some(summary) = &summary {
@@ -2817,10 +2890,7 @@ fn translate_system_task(
             }
             for task_id in native.background_task_ids.difference(&live_ids) {
                 if let Some(task) = native.tasks.get_mut(task_id) {
-                    if !matches!(
-                        task.status.as_str(),
-                        "completed" | "failed" | "killed" | "stopped" | "ended"
-                    ) {
+                    if !is_terminal_task_status(&task.status) {
                         task.status = "ended".to_string();
                     }
                 }
@@ -2831,6 +2901,19 @@ fn translate_system_task(
         }
         _ => {}
     }
+}
+
+/// Ends the reply text so far with a blank line before another text block is
+/// appended, and streams the same separator so live and persisted text match.
+fn separate_text_block(text: &mut String, events: &mut Vec<TurnEvent>) {
+    if text.trim().is_empty() || text.ends_with("\n\n") {
+        return;
+    }
+    let separator = if text.ends_with('\n') { "\n" } else { "\n\n" };
+    text.push_str(separator);
+    events.push(TurnEvent::TextDelta {
+        text: separator.to_string(),
+    });
 }
 
 fn tool_result_text(content: Option<&Value>, tool_use_result: Option<&Value>) -> String {
@@ -3143,6 +3226,29 @@ mod tests {
         assert_eq!(advertised_context_window(&one_million), Some(1_000_000));
         assert_eq!(advertised_context_window(&explicit), Some(320_000));
         assert_eq!(advertised_context_window(&unknown), None);
+    }
+
+    #[test]
+    fn fast_mode_settings_merge_with_thinking_and_reset_explicitly() {
+        let adapter = Claude::default();
+        let mut request = TurnRequest::new(Provider::Claude, ".", "test");
+        request.reasoning = Some("ultracode".into());
+        for enabled in [true, false] {
+            request
+                .harness_options
+                .insert("fast_mode".into(), enabled.to_string());
+            let command = adapter.command(&request).unwrap();
+            let settings: Vec<_> = command
+                .args
+                .windows(2)
+                .filter(|args| args[0] == "--settings")
+                .collect();
+            assert_eq!(settings.len(), 1);
+            let value: serde_json::Value =
+                serde_json::from_str(&settings[0][1].to_string_lossy()).unwrap();
+            assert_eq!(value["fastMode"], enabled);
+            assert_eq!(value["ultracode"], true);
+        }
     }
 
     #[test]
@@ -3789,6 +3895,164 @@ mod tests {
     }
 
     #[test]
+    fn a_result_with_no_background_tasks_ends_the_turn_without_a_waiting_event() {
+        let adapter = Claude::default();
+        let mut state = AdapterState::default();
+        let result = adapter
+            .parse_line(
+                r#"{"type":"result","subtype":"success","is_error":false,"result":"Done"}"#,
+                &mut state,
+            )
+            .unwrap();
+        assert!(result.terminal);
+        assert!(!result
+            .events
+            .iter()
+            .any(|event| matches!(event, TurnEvent::ReplyFinishedWithBackgroundTasks { .. })));
+    }
+
+    #[test]
+    fn a_background_shell_holds_the_turn_open_after_the_reply() {
+        let adapter = Claude::default();
+        let mut state = AdapterState::default();
+        adapter
+            .parse_line(
+                r#"{"type":"system","subtype":"task_started","task_id":"shell-9","tool_use_id":"toolu_bash","description":"Find routes","task_type":"local_bash","is_backgrounded":true}"#,
+                &mut state,
+            )
+            .unwrap();
+        let result = adapter
+            .parse_line(
+                r#"{"type":"result","subtype":"success","is_error":false,"result":"Here is the plan"}"#,
+                &mut state,
+            )
+            .unwrap();
+        assert!(!result.terminal);
+        assert!(result.events.iter().any(|event| matches!(
+            event,
+            TurnEvent::ReplyFinishedWithBackgroundTasks { task_ids }
+                if task_ids == &vec!["shell-9".to_string()]
+        )));
+    }
+
+    /// Claude reports a killed background task only as a `task_updated`
+    /// patch; no `task_notification` follows. Each terminal status must
+    /// release the held turn on its own.
+    #[test]
+    fn a_terminal_task_update_releases_the_held_turn() {
+        for status in ["completed", "failed", "killed", "stopped"] {
+            let adapter = Claude::default();
+            let mut state = AdapterState::default();
+            parse_all(
+                &adapter,
+                &mut state,
+                &[
+                    r#"{"type":"system","subtype":"task_started","task_id":"shell-9","tool_use_id":"toolu_bash","description":"Watch tests","task_type":"local_bash","is_backgrounded":true}"#,
+                    r#"{"type":"system","subtype":"task_started","task_id":"agent-2","tool_use_id":"toolu_agent","description":"Review","task_type":"local_agent","is_backgrounded":true}"#,
+                ],
+            );
+            let result = adapter
+                .parse_line(
+                    r#"{"type":"result","subtype":"success","is_error":false,"result":"Started"}"#,
+                    &mut state,
+                )
+                .unwrap();
+            assert!(!result.terminal, "{status}: two tasks still hold the turn");
+
+            let first = adapter
+                .parse_line(
+                    &format!(
+                        r#"{{"type":"system","subtype":"task_updated","task_id":"shell-9","patch":{{"status":"{status}"}}}}"#
+                    ),
+                    &mut state,
+                )
+                .unwrap();
+            assert!(!first.terminal, "{status}: agent-2 still holds the turn");
+            let second = adapter
+                .parse_line(
+                    &format!(
+                        r#"{{"type":"system","subtype":"task_updated","task_id":"agent-2","patch":{{"status":"{status}"}}}}"#
+                    ),
+                    &mut state,
+                )
+                .unwrap();
+            assert!(second.terminal, "{status}: no background task is left");
+            assert!(second.events.iter().any(|event| matches!(
+                event,
+                TurnEvent::TasksChanged { tasks }
+                    if tasks.iter().all(|task| task.status == status)
+            )));
+        }
+    }
+
+    #[test]
+    fn a_non_terminal_task_update_keeps_the_turn_held() {
+        let adapter = Claude::default();
+        let mut state = AdapterState::default();
+        parse_all(
+            &adapter,
+            &mut state,
+            &[
+                r#"{"type":"system","subtype":"task_started","task_id":"shell-9","tool_use_id":"toolu_bash","description":"Watch tests","task_type":"local_bash","is_backgrounded":true}"#,
+                r#"{"type":"result","subtype":"success","is_error":false,"result":"Started"}"#,
+            ],
+        );
+        let update = adapter
+            .parse_line(
+                r#"{"type":"system","subtype":"task_updated","task_id":"shell-9","patch":{"status":"running","description":"Still watching"}}"#,
+                &mut state,
+            )
+            .unwrap();
+        assert!(!update.terminal);
+    }
+
+    fn streamed_text(events: &[TurnEvent]) -> String {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                TurnEvent::TextDelta { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_follow_up_text_block_starts_a_new_paragraph_when_streamed() {
+        let adapter = Claude::default();
+        let mut state = AdapterState::default();
+        let mut events = Vec::new();
+        for line in [
+            r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"launched"}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"The secret word is PINEAPPLE-42."}}}"#,
+        ] {
+            events.extend(adapter.parse_line(line, &mut state).unwrap().events);
+        }
+        assert_eq!(
+            state.result.text,
+            "launched\n\nThe secret word is PINEAPPLE-42."
+        );
+        assert_eq!(streamed_text(&events), state.result.text);
+    }
+
+    #[test]
+    fn text_blocks_split_by_a_tool_call_do_not_run_together() {
+        let adapter = Claude::default();
+        let mut state = AdapterState::default();
+        let mut events = Vec::new();
+        for line in [
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Checking."}]}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"pwd"}}]}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Done."}]}}"#,
+        ] {
+            events.extend(adapter.parse_line(line, &mut state).unwrap().events);
+        }
+        assert_eq!(state.result.text, "Checking.\n\nDone.");
+        assert_eq!(streamed_text(&events), state.result.text);
+    }
+
+    #[test]
     fn streams_native_subagent_lifecycle_and_nests_tool_calls() {
         let adapter = Claude::default();
         let mut state = AdapterState::default();
@@ -3842,6 +4106,15 @@ mod tests {
                         duration_ms: 1200,
                     })
         ));
+        // The progress phrase is the current activity, not the task's name:
+        // the task keeps the description it started with.
+        assert_eq!(
+            peek_native_state(&state).and_then(|native| native
+                .tasks
+                .get("agent-native-1")
+                .map(|task| task.description.clone())),
+            Some("Explore the repo".to_string())
+        );
 
         let result = adapter
             .parse_line(
@@ -3852,6 +4125,14 @@ mod tests {
         assert!(
             !result.terminal,
             "background task keeps stdin and stream alive"
+        );
+        assert!(
+            result.events.iter().any(|event| matches!(
+                event,
+                TurnEvent::ReplyFinishedWithBackgroundTasks { task_ids }
+                    if task_ids == &vec!["agent-native-1".to_string()]
+            )),
+            "the host learns the reply is done and what holds the turn open"
         );
 
         let finished = adapter
