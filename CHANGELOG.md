@@ -16,6 +16,13 @@ Versioning and Keep a Changelog conventions.
 
 ### Added
 
+- Claude Fast mode: `harness_options.fast_mode` (`true`/`false`) sets Claude
+  Code's `fastMode`, merged with `ultracode` into a single `--settings`
+  argument. Any other value is an `InvalidRequest`.
+- `TurnEvent::ReplyFinishedWithBackgroundTasks { task_ids }`: Claude finished
+  its reply but background tasks it started keep the turn open; the turn
+  completes when the last one ends.
+
 - Manual compaction for Codex and OpenCode. `RuntimeHandle::compact` now runs
   `thread/compact/start` on the Codex app server and `/session/{id}/summarize`
   on `opencode serve` (which needs a pinned model), reporting the same manual
@@ -142,6 +149,14 @@ Versioning and Keep a Changelog conventions.
   Saved provider context is preserved.
 
 ### Changed
+
+- Claude: consecutive assistant text blocks are separated by a blank line;
+  background tasks ending as `cancelled` or `interrupted` count as finished;
+  a task's first real description replaces its fallback description.
+- Claude account usage on macOS prefers the Keychain login over a
+  credentials file, which can hold an expired token from an older login.
+- Only JPEG, PNG, GIF and WebP attachments are native image inputs. Other
+  image types (SVG, TIFF, ...) are described as host files instead.
 
 - `SshTransport` and `DockerTransport` share one remote-shell implementation.
   Remote termination now also signals descendants it finds under `/proc`, so a
