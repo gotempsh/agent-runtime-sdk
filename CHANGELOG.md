@@ -28,6 +28,18 @@ Versioning and Keep a Changelog conventions.
   compaction takes summary instructions; `RuntimeHandle::compact` with
   instructions on Codex or OpenCode fails with `CapabilityUnavailable` instead
   of compacting without them.
+- `DockerTransport` (default `docker` feature) runs provider CLIs inside an
+  existing, running container through `docker exec -i`, with interactive stdin,
+  secrets kept out of argv by the same private launcher as SSH, and
+  termination of the whole process tree inside the container. The application
+  owns the container (image, mounts, environment, limits). Processes that
+  declare `CommandSpec::loopback_ports` are refused with `Unsupported`, so
+  `OpenCode::serve()` does not run in a container yet.
+  With `.user(...)` the selected user's home comes from the container's
+  `/etc/passwd`, and a status is classified as Docker's only with Docker's own
+  diagnostic, so a provider's exit 125 stays its own. The container's login
+  environment is resolved once per transport; build a new transport after
+  replacing the container.
 - `CommandSpec::loopback_ports`: loopback ports a provider process serves that
   the SDK host must reach. `SshTransport` forwards each one (`ssh -L`, with
   `ExitOnForwardFailure`), so `OpenCode::serve()` works on SSH targets; local
@@ -131,6 +143,10 @@ Versioning and Keep a Changelog conventions.
 
 ### Changed
 
+- `SshTransport` and `DockerTransport` share one remote-shell implementation.
+  Remote termination now also signals descendants it finds under `/proc`, so a
+  process tree is stopped even when the launcher is not a process-group leader;
+  with neither, termination fails instead of leaving children running.
 - Add opt-in bounded native process reuse for Claude streaming and OpenCode serve,
   alongside Codex app-server reuse. Retained processes use provider-specific
   preflight checks, strict session/configuration isolation, idle expiry, and

@@ -35,6 +35,10 @@ pub mod transport;
 mod types;
 mod url_security;
 
+#[cfg(feature = "docker")]
+mod docker;
+#[cfg(any(feature = "ssh", feature = "docker"))]
+mod remote_shell;
 #[cfg(feature = "ssh")]
 mod ssh;
 
@@ -66,6 +70,8 @@ pub use discovery::{
     HarnessReadiness, HarnessReasoningEffort, HarnessServiceTier, HarnessStatus,
     ProviderProbeContext,
 };
+#[cfg(feature = "docker")]
+pub use docker::{DockerTransport, DockerTransportBuilder};
 pub use error::{ProviderProcessErrorKind, Result, RuntimeError};
 pub use extensions::{
     HarnessExtensionAccess, HarnessExtensionDenialKind, HarnessExtensionInventory,

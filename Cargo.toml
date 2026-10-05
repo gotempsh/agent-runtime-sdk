@@ -29,13 +29,15 @@ include = [
 ]
 
 [features]
-default = ["claude", "codex", "opencode", "pi", "nono", "ssh", "tailnet"]
+default = ["claude", "codex", "opencode", "pi", "nono", "ssh", "docker", "tailnet"]
 claude = []
 codex = []
 opencode = []
 pi = []
 nono = []
 ssh = []
+# Run provider CLIs inside an existing container through `docker exec`.
+docker = []
 # Per-agent Tailscale identities: supervised userspace tailscaled + split proxy.
 tailnet = []
 temps-sandbox = ["dep:base64", "dep:reqwest"]
