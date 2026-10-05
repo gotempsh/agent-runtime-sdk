@@ -150,6 +150,10 @@ Versioning and Keep a Changelog conventions.
 
 ### Changed
 
+- Claude account usage honors `CLAUDE_CONFIG_DIR` (then `CLAUDE_HOME`): it
+  reads that directory's credentials file and the Keychain entry Claude Code
+  keys to it (`Claude Code-credentials-<path hash>`), never the host's
+  default login, so a selected account reports its own quota.
 - Claude: consecutive assistant text blocks are separated by a blank line;
   background tasks ending as `cancelled` or `interrupted` count as finished;
   a task's first real description replaces its fallback description.

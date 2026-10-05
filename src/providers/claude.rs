@@ -58,6 +58,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const childProcess = require("node:child_process");
+const crypto = require("node:crypto");
 
 const marker = "temps_agent_runtime_account_usage";
 const maxCredentialBytes = 1024 * 1024;
@@ -82,7 +83,7 @@ function parseCredential(raw) {
 }
 
 function fileCredential() {
-  const root = process.env.CLAUDE_HOME || path.join(os.homedir(), ".claude");
+  const root = process.env.CLAUDE_CONFIG_DIR || process.env.CLAUDE_HOME || path.join(os.homedir(), ".claude");
   const file = path.join(root, ".credentials.json");
   try {
     const stat = fs.statSync(file);
@@ -96,9 +97,16 @@ function fileCredential() {
 function keychainCredential() {
   if (process.platform !== "darwin") return null;
   const account = os.userInfo().username;
+  // Claude Code keys a non-default config directory's login by a suffix of
+  // its path hash. An explicit profile must never borrow the host's
+  // unsuffixed Keychain login.
+  const selector = process.env.CLAUDE_CONFIG_DIR || process.env.CLAUDE_HOME;
+  const service = selector
+    ? "Claude Code-credentials-" + crypto.createHash("sha256").update(path.resolve(selector).normalize("NFC")).digest("hex").slice(0, 8)
+    : "Claude Code-credentials";
   const lookups = [
-    ["find-generic-password", "-a", account, "-w", "-s", "Claude Code-credentials"],
-    ["find-generic-password", "-w", "-s", "Claude Code-credentials"],
+    ["find-generic-password", "-a", account, "-w", "-s", service],
+    ["find-generic-password", "-w", "-s", service],
   ];
   for (const args of lookups) {
     try {
@@ -2969,6 +2977,43 @@ fn tool_result_text(content: Option<&Value>, tool_use_result: Option<&Value>) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn account_profiles_usage_never_reads_default_keychain_or_credential_file() {
+        let script = serde_json::to_string(CLAUDE_ACCOUNT_USAGE_SCRIPT).unwrap();
+        let harness = r"
+const vm = require('node:vm'), assert = require('node:assert/strict');
+const crypto = require('node:crypto'), path = require('node:path');
+const root = '/accounts/work';
+const expected = 'Claude Code-credentials-' + crypto.createHash('sha256').update(root).digest('hex').slice(0,8);
+const services = [], files = [], output = [];
+const sandbox = {
+  require(name) {
+    if (name === 'node:fs') return { statSync(file) { files.push(file); throw Error('missing'); } };
+    if (name === 'node:os') return { homedir: () => '/default-home', userInfo: () => ({username:'fixture'}) };
+    if (name === 'node:child_process') return { spawnSync(binary,args) { services.push(args.at(-1)); return {status:1}; } };
+    return require(name);
+  },
+  process: { platform: 'darwin', env: { CLAUDE_CONFIG_DIR:root }, stdout:{write(text){ output.push(text); }} },
+  fetch(){ throw Error('no account token should be sent'); },
+};
+vm.runInNewContext(SCRIPT, sandbox);
+setTimeout(() => {
+  assert.deepEqual(services,[expected,expected]);
+  assert.deepEqual(files,[path.join(root,'.credentials.json')]);
+  assert.equal(JSON.parse(output[0]).status,'unavailable');
+},0);
+".replace("SCRIPT", &script);
+        let result = std::process::Command::new("node")
+            .args(["-e", &harness])
+            .output()
+            .expect("Node is required for Claude account-usage probes");
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
 
     #[test]
     fn account_usage_prefers_the_current_macos_keychain_login_over_a_stale_file() {
