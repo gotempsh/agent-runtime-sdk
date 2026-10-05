@@ -98,19 +98,17 @@ function keychainCredential() {
   if (process.platform !== "darwin") return null;
   const account = os.userInfo().username;
   // Claude Code keys a non-default config directory's login by a suffix of
-  // the directory's hash: the configured value first, then its resolved
-  // absolute form when that differs (a relative path or a trailing slash).
-  // An explicit profile must never borrow the host's unsuffixed login.
+  // the configured value's hash, exactly as configured (NFC, not resolved):
+  // a resolved form could match another profile's login. An explicit profile
+  // never borrows the host's unsuffixed login either.
   const selector = process.env.CLAUDE_CONFIG_DIR || process.env.CLAUDE_HOME;
-  const suffixed = (value) => "Claude Code-credentials-"
-    + crypto.createHash("sha256").update(value.normalize("NFC")).digest("hex").slice(0, 8);
-  const services = selector
-    ? [...new Set([suffixed(selector), suffixed(path.resolve(selector))])]
-    : ["Claude Code-credentials"];
-  const lookups = services.flatMap((service) => [
+  const service = selector
+    ? "Claude Code-credentials-" + crypto.createHash("sha256").update(selector.normalize("NFC")).digest("hex").slice(0, 8)
+    : "Claude Code-credentials";
+  const lookups = [
     ["find-generic-password", "-a", account, "-w", "-s", service],
     ["find-generic-password", "-w", "-s", service],
-  ]);
+  ];
   for (const args of lookups) {
     try {
       const result = childProcess.spawnSync("/usr/bin/security", args, {
@@ -3002,10 +3000,7 @@ const sandbox = {
 };
 vm.runInNewContext(SCRIPT, sandbox);
 setTimeout(() => {
-  // The configured value's service comes first; a differing resolved form
-  // (a Windows host resolves '/accounts/work' to a drive path) may follow.
-  assert.deepEqual(services.slice(0,2),[expected,expected]);
-  assert.ok(services.every(service => service.startsWith('Claude Code-credentials-')), services.join());
+  assert.deepEqual(services,[expected,expected]);
   assert.deepEqual(files,[path.join(root,'.credentials.json')]);
   assert.equal(JSON.parse(output[0]).status,'unavailable');
 },0);
@@ -3022,7 +3017,7 @@ setTimeout(() => {
     }
 
     #[test]
-    fn a_profile_path_is_looked_up_as_configured_then_resolved() {
+    fn a_profile_path_is_looked_up_exactly_as_configured() {
         let script = serde_json::to_string(CLAUDE_ACCOUNT_USAGE_SCRIPT).unwrap();
         let harness = r"
 const vm = require('node:vm'), assert = require('node:assert/strict');
@@ -3042,9 +3037,8 @@ const sandbox = {
 };
 vm.runInNewContext(SCRIPT, sandbox);
 setTimeout(() => {
-  assert.deepEqual(services.slice(0,2),[hash(configured),hash(configured)]);
-  assert.ok(services.includes(hash(path.resolve(configured))), services.join());
-  assert.ok(!services.includes('Claude Code-credentials'));
+  // Never the resolved form, which could be another profile's login.
+  assert.deepEqual(services,[hash(configured),hash(configured)]);
 },0);
 ".replace("SCRIPT", &script);
         let result = std::process::Command::new("node")
