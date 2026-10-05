@@ -19,7 +19,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use tokio::process::Command;
 
-use crate::remote_shell::{bounded_diagnostic, RemoteShell, ShellCarrier};
+use crate::remote_shell::{bounded_diagnostic, RemoteShell, ShellCarrier, UNSUPPORTED_REMOTE_EXIT};
 use crate::{
     ExecutionTransport, ProviderReadiness, SandboxCapabilities, TransportCapabilities,
     TransportError, TransportErrorKind, TransportProcess, TransportReadinessRequest,
@@ -142,12 +142,22 @@ impl ShellCarrier for DockerCarrier {
     }
 
     fn login_prelude(&self) -> String {
+        // `docker exec` does not make the launcher a process-group leader, so
+        // stopping a provider's children needs /proc. Refuse a container
+        // without it before anything is launched there.
+        let proc_check = format!(
+            "if [ ! -d /proc ]; then \
+               echo 'the container has no /proc, so its processes could not be stopped' >&2; \
+               exit {UNSUPPORTED_REMOTE_EXIT}; \
+             fi; "
+        );
         // `docker exec -u` keeps the container's `HOME`, which belongs to the
         // image's user. Use the selected user's home from /etc/passwd.
         if self.user.is_none() {
-            return String::new();
+            return proc_check;
         }
-        "runtime_uid=$(id -u); \
+        proc_check
+            + "runtime_uid=$(id -u); \
          if [ -r /etc/passwd ]; then \
            while IFS=: read -r _ _ runtime_entry_uid _ _ runtime_entry_home _; do \
              if [ \"$runtime_entry_uid\" = \"$runtime_uid\" ] && [ -n \"$runtime_entry_home\" ]; then \
@@ -155,7 +165,6 @@ impl ShellCarrier for DockerCarrier {
              fi; \
            done < /etc/passwd; \
          fi; "
-            .to_string()
     }
 
     fn location(&self) -> &'static str {
@@ -205,7 +214,10 @@ impl ShellCarrier for DockerCarrier {
 /// `docker exec` passes the command's own exit status through, so a status
 /// is Docker's only when Docker's own diagnostic accompanies it: a daemon
 /// error with 125, an OCI runtime failure with 126/127, or a CLI that cannot
-/// reach the daemon (status 1).
+/// reach the daemon (status 1). A provider's exit (`wait`) is never read as
+/// an unreachable daemon: its stderr is the provider's, which may itself
+/// report a Docker it failed to reach; a daemon that was unreachable fails
+/// the launch before the provider starts.
 fn classify_docker_failure(
     operation: &'static str,
     code: Option<i32>,
@@ -214,9 +226,10 @@ fn classify_docker_failure(
     let diagnostic = bounded_diagnostic(stderr);
     let lower = diagnostic.to_ascii_lowercase();
     let cli = lower.strip_prefix("docker: ").unwrap_or(&lower);
-    let unreachable = cli.starts_with("cannot connect to the docker daemon")
-        || cli.starts_with("error during connect")
-        || cli.starts_with("permission denied while trying to connect to the docker daemon");
+    let unreachable = operation != "wait"
+        && (cli.starts_with("cannot connect to the docker daemon")
+            || cli.starts_with("error during connect")
+            || cli.starts_with("permission denied while trying to connect to the docker daemon"));
     let daemon_error = cli.starts_with("error response from daemon")
         || cli.starts_with("error: no such container");
     let oci_failure = matches!(code, Some(126 | 127)) && lower.contains("oci runtime");
@@ -390,7 +403,9 @@ mod tests {
         assert!(prelude.contains("/etc/passwd"));
         assert!(prelude.contains("export HOME"));
         let default_user = DockerTransport::builder("c").build().unwrap();
-        assert_eq!(default_user.shell.carrier.login_prelude(), "");
+        let prelude = default_user.shell.carrier.login_prelude();
+        assert!(!prelude.contains("/etc/passwd"));
+        assert!(prelude.contains("[ ! -d /proc ]"), "{prelude}");
     }
 
     #[test]
@@ -445,6 +460,14 @@ mod tests {
             classify_docker_failure("spawn", Some(1), b"error: build failed").is_none(),
             "exit 1 without Docker's diagnostic is the command's own status"
         );
+        // A provider whose own stderr reports an unreachable Docker keeps its
+        // exit status.
+        assert!(classify_docker_failure(
+            "wait",
+            Some(1),
+            b"Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?",
+        )
+        .is_none());
         // A provider that exits 125 itself keeps its status.
         assert!(classify_docker_failure("spawn", Some(125), b"fatal: provider crashed").is_none());
         let socket = classify_docker_failure(

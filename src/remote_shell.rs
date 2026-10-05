@@ -55,6 +55,10 @@ const SAFE_REMOTE_ENVIRONMENT: &[&str] = &[
 ];
 
 /// How a remote shell is reached from the SDK host.
+/// Exit status a carrier's login prelude uses to refuse a remote it cannot
+/// operate safely, with the reason on stderr.
+pub(crate) const UNSUPPORTED_REMOTE_EXIT: i32 = 66;
+
 pub(crate) trait ShellCarrier: Clone + Debug + Send + Sync + 'static {
     /// Stable transport name used in errors and process handles.
     fn transport_name(&self) -> &'static str;
@@ -153,6 +157,12 @@ impl<C: ShellCarrier> RemoteShell<C> {
                         (
                             TransportErrorKind::Unsupported,
                             format!("the {location} user needs Bash or Zsh to resolve its login PATH"),
+                        )
+                    } else if output.status.code() == Some(UNSUPPORTED_REMOTE_EXIT) {
+                        // A carrier prelude refused this remote; it says why.
+                        (
+                            TransportErrorKind::Unsupported,
+                            bounded_diagnostic(&output.stderr),
                         )
                     } else {
                         let diagnostic = bounded_diagnostic(&output.stderr);

@@ -1,9 +1,8 @@
 //! `DockerTransport` against a real Docker daemon.
 //!
-//! Opt-in: set `TEMPS_AGENT_RUNTIME_DOCKER_TESTS=1` (and optionally
-//! `TEMPS_AGENT_RUNTIME_DOCKER_TEST_IMAGE`, default `ubuntu:24.04`, which must
-//! provide Bash). Each test starts a throwaway container and removes
-//! it afterwards.
+//! Opt-in: set `TEMPS_AGENT_RUNTIME_DOCKER_TESTS=1`. Each test starts a
+//! throwaway `ubuntu:24.04` container and removes it afterwards; the tests
+//! rely on that image's Bash, `pgrep`, and `ubuntu` user.
 #![cfg(feature = "docker")]
 
 use std::ffi::OsString;
@@ -16,6 +15,8 @@ use temps_agent_runtime::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+const IMAGE: &str = "ubuntu:24.04";
+
 struct Container(String);
 
 impl Container {
@@ -27,12 +28,10 @@ impl Container {
         if std::env::var("TEMPS_AGENT_RUNTIME_DOCKER_TESTS").as_deref() != Ok("1") {
             return None;
         }
-        let image = std::env::var("TEMPS_AGENT_RUNTIME_DOCKER_TEST_IMAGE")
-            .unwrap_or_else(|_| "ubuntu:24.04".into());
         let output = tokio::process::Command::new("docker")
             .args(["run", "-d", "--rm", "--init"])
             .args(options)
-            .args([image.as_str(), "sleep", "300"])
+            .args([IMAGE, "sleep", "300"])
             .output()
             .await
             .expect("docker run");
