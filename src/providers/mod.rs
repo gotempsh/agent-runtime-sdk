@@ -85,6 +85,7 @@ pub(crate) fn is_manual_compaction_prompt(prompt: &str) -> bool {
 
 /// Refuse a manual compaction request carrying summary instructions on an
 /// adapter whose native compaction cannot take them, instead of dropping them.
+#[cfg(any(feature = "codex", feature = "opencode"))]
 pub(crate) fn refuse_compaction_instructions(
     provider: crate::Provider,
     prompt: &str,
@@ -104,7 +105,7 @@ pub(crate) fn refuse_compaction_instructions(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "codex", feature = "opencode")))]
 mod compaction_prompt_tests {
     use super::*;
 

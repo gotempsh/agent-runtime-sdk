@@ -1662,7 +1662,7 @@ mod tests {
         )
         .unwrap();
         assert!(!stray.terminal);
-        assert!(stray.events.is_empty());
+        assert_eq!(stray.events, [] as [crate::TurnEvent; 0]);
 
         parse_line(
             r#"{"method":"turn/started","params":{"threadId":"thread-9","turn":{"id":"turn-c"}}}"#,
