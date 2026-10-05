@@ -188,7 +188,11 @@ function normalizedWindows(body) {
 }
 
 async function main() {
-  const oauth = fileCredential() || keychainCredential();
+  // Match Claude Code on macOS: its current login lives in Keychain. A
+  // leftover credentials file can contain an expired token from an old login.
+  const oauth = process.platform === "darwin"
+    ? keychainCredential() || fileCredential()
+    : fileCredential();
   if (!oauth) {
     unavailable("Claude Code is not authenticated on this execution host", false);
     return;
@@ -2943,6 +2947,59 @@ fn tool_result_text(content: Option<&Value>, tool_use_result: Option<&Value>) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn account_usage_prefers_the_current_macos_keychain_login_over_a_stale_file() {
+        let script = serde_json::to_string(CLAUDE_ACCOUNT_USAGE_SCRIPT).unwrap();
+        let harness = r"
+const vm = require('node:vm'), assert = require('node:assert/strict');
+const files = [], services = [], output = [], requests = [];
+const sandbox = {
+  require(name) {
+    if (name === 'node:fs') return {
+      statSync(file) { files.push(file); return { isFile: () => true, size: 100 }; },
+      readFileSync() { return JSON.stringify({claudeAiOauth:{accessToken:'expired-file-token'}}); },
+    };
+    if (name === 'node:os') return { homedir: () => '/fixture-home', userInfo: () => ({username:'fixture'}) };
+    if (name === 'node:child_process') return { spawnSync(binary,args) {
+      services.push(args.at(-1));
+      return {status:0,stdout:JSON.stringify({claudeAiOauth:{accessToken:'current-keychain-token',subscriptionType:'max'}})};
+    } };
+    return require(name);
+  },
+  process: { platform: 'darwin', env: {}, stdout:{write(text){ output.push(JSON.parse(text)); }} },
+  AbortSignal,
+  TextDecoder,
+  async fetch(url, options) {
+    requests.push(options.headers.Authorization);
+    if (options.headers.Authorization !== 'Bearer current-keychain-token') return {status:401,ok:false};
+    const bytes = new TextEncoder().encode(JSON.stringify({five_hour:{utilization:12,resets_at:'2026-10-06T00:00:00Z'}}));
+    let sent = false;
+    return {status:200,ok:true,headers:{get(){return null;}},body:{getReader(){return {async read(){
+      if(sent)return {done:true};sent=true;return {done:false,value:bytes};
+    }};}}};
+  },
+};
+vm.runInNewContext(SCRIPT, sandbox);
+setTimeout(() => {
+  assert.deepEqual(services,['Claude Code-credentials']);
+  assert.deepEqual(files,[]);
+  assert.deepEqual(requests,['Bearer current-keychain-token']);
+  assert.equal(output.length,1);
+  assert.equal(output[0].status,'available');
+  assert.equal(output[0].usage.windows[0].used_percent,12);
+},0);
+".replace("SCRIPT", &script);
+        let result = std::process::Command::new("node")
+            .args(["-e", &harness])
+            .output()
+            .expect("Node is required for Claude account-usage probes");
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
 
     #[test]
     fn exposes_and_maps_auto_permission_mode() {

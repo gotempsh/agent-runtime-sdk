@@ -1832,15 +1832,15 @@ fn render_prompt(input: &TurnInput, native_images: bool) -> String {
     prompt
 }
 
-/// Whether an attachment declares an image media type.
-///
-/// Only an explicit `image/*` media type counts: guessing from a file
-/// extension would hand a provider a file it cannot decode.
+/// Whether an attachment declares a supported native image media type.
+/// Other image formats stay in the host-file prompt for provider tools.
 pub(crate) fn is_image(attachment: &TurnAttachment) -> bool {
-    attachment
-        .media_type
-        .as_deref()
-        .is_some_and(|media_type| media_type.starts_with("image/"))
+    attachment.media_type.as_deref().is_some_and(|media_type| {
+        matches!(
+            media_type,
+            "image/jpeg" | "image/png" | "image/gif" | "image/webp"
+        )
+    })
 }
 
 struct ChannelEventSink {
@@ -3322,6 +3322,49 @@ mod tests {
         assert!(requests[0].prompt.contains("Quarterly report"));
         assert!(requests[0].prompt.contains("application/pdf"));
         assert_eq!(requests[0].attachments.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn non_native_media_reaches_the_provider_as_host_file_context() {
+        let executor = Arc::new(RecordingExecutor::new());
+        let client = InProcessRuntimeClient::from_executor(executor.clone());
+        let handle = client
+            .acquire(runtime_spec("runtime-generic-attachments"))
+            .await
+            .unwrap();
+        let mut input = turn_input("turn-generic", "Inspect the attached files");
+        for (name, mime) in [
+            ("clip.mp4", "video/mp4"),
+            ("voice.mp3", "audio/mpeg"),
+            ("bundle.zip", "application/zip"),
+            ("drawing.svg", "image/svg+xml"),
+            ("photo.tiff", "image/tiff"),
+            ("unknown.dat", "application/octet-stream"),
+        ] {
+            input.attachments.push(TurnAttachment {
+                path: PathBuf::from(format!("uploads/{name}")),
+                display_name: Some(name.into()),
+                media_type: Some(mime.into()),
+            });
+        }
+        handle
+            .start_turn(input)
+            .await
+            .unwrap()
+            .wait()
+            .await
+            .unwrap();
+        let requests = executor.requests.lock().unwrap();
+        assert_eq!(requests[0].attachments.len(), 6);
+        for attachment in &requests[0].attachments {
+            assert!(requests[0]
+                .prompt
+                .contains(attachment.path.to_str().unwrap()));
+            assert!(requests[0]
+                .prompt
+                .contains(attachment.media_type.as_deref().unwrap()));
+            assert!(!is_image(attachment));
+        }
     }
 
     #[tokio::test]
