@@ -189,27 +189,37 @@ function normalizedWindows(body) {
 
 async function main() {
   // Match Claude Code on macOS: its current login lives in Keychain. A
-  // leftover credentials file can contain an expired token from an old login.
-  const oauth = process.platform === "darwin"
-    ? keychainCredential() || fileCredential()
-    : fileCredential();
+  // leftover credentials file can contain an expired token from an old login,
+  // so it is tried only if the Keychain login is missing or rejected.
+  const sources = process.platform === "darwin"
+    ? [keychainCredential, fileCredential]
+    : [fileCredential];
+  const tried = new Set();
+  let oauth;
+  let response;
+  for (const source of sources) {
+    const candidate = source();
+    if (!candidate || tried.has(candidate.accessToken)) continue;
+    tried.add(candidate.accessToken);
+    oauth = candidate;
+    try {
+      response = await fetch("https://api.anthropic.com/api/oauth/usage", {
+        headers: {
+          Authorization: `Bearer ${oauth.accessToken}`,
+          Accept: "application/json",
+          "anthropic-beta": "oauth-2025-04-20",
+        },
+        redirect: "error",
+        signal: AbortSignal.timeout(10000),
+      });
+    } catch {
+      unavailable("The Claude account-usage endpoint could not be reached", true);
+      return;
+    }
+    if (response.status !== 401 && response.status !== 403) break;
+  }
   if (!oauth) {
     unavailable("Claude Code is not authenticated on this execution host", false);
-    return;
-  }
-  let response;
-  try {
-    response = await fetch("https://api.anthropic.com/api/oauth/usage", {
-      headers: {
-        Authorization: `Bearer ${oauth.accessToken}`,
-        Accept: "application/json",
-        "anthropic-beta": "oauth-2025-04-20",
-      },
-      redirect: "error",
-      signal: AbortSignal.timeout(10000),
-    });
-  } catch {
-    unavailable("The Claude account-usage endpoint could not be reached", true);
     return;
   }
   if (response.status === 401 || response.status === 403) {
@@ -1411,7 +1421,8 @@ impl AgentAdapter for Claude {
             "stream_event" => {
                 // A new text block (after a tool call, or Claude's follow-up
                 // once background tasks report back) starts a new paragraph
-                // instead of running into the previous block's last word.
+                // instead of running into the previous block's last word --
+                // once it produces text, so an empty block adds nothing.
                 if value.pointer("/event/type").and_then(Value::as_str)
                     == Some("content_block_start")
                     && value
@@ -1419,7 +1430,9 @@ impl AgentAdapter for Claude {
                         .and_then(Value::as_str)
                         == Some("text")
                 {
-                    separate_text_block(&mut state.result.text, &mut output.events);
+                    state
+                        .extensions
+                        .insert(TEXT_BLOCK_PENDING.into(), Value::Bool(true));
                 }
                 let delta = value.pointer("/event/delta");
                 match delta
@@ -1431,6 +1444,11 @@ impl AgentAdapter for Claude {
                             .and_then(|delta| delta.get("text"))
                             .and_then(Value::as_str)
                         {
+                            if !text.is_empty()
+                                && state.extensions.remove(TEXT_BLOCK_PENDING).is_some()
+                            {
+                                separate_text_block(&mut state.result.text, &mut output.events);
+                            }
                             state.saw_text_delta = true;
                             state.result.text.push_str(text);
                             output.events.push(TurnEvent::TextDelta {
@@ -2909,6 +2927,10 @@ fn translate_system_task(
 
 /// Ends the reply text so far with a blank line before another text block is
 /// appended, and streams the same separator so live and persisted text match.
+/// `AdapterState::extensions` key: a streamed text block started and has not
+/// produced text yet.
+const TEXT_BLOCK_PENDING: &str = "claude.text_block_pending";
+
 fn separate_text_block(text: &mut String, events: &mut Vec<TurnEvent>) {
     if text.trim().is_empty() || text.ends_with("\n\n") {
         return;
@@ -2988,6 +3010,56 @@ setTimeout(() => {
   assert.equal(output.length,1);
   assert.equal(output[0].status,'available');
   assert.equal(output[0].usage.windows[0].used_percent,12);
+},0);
+".replace("SCRIPT", &script);
+        let result = std::process::Command::new("node")
+            .args(["-e", &harness])
+            .output()
+            .expect("Node is required for Claude account-usage probes");
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+
+    #[test]
+    fn account_usage_falls_back_to_the_file_login_when_the_keychain_token_is_rejected() {
+        let script = serde_json::to_string(CLAUDE_ACCOUNT_USAGE_SCRIPT).unwrap();
+        let harness = r"
+const vm = require('node:vm'), assert = require('node:assert/strict');
+const output = [], requests = [];
+const sandbox = {
+  require(name) {
+    if (name === 'node:fs') return {
+      statSync() { return { isFile: () => true, size: 100 }; },
+      readFileSync() { return JSON.stringify({claudeAiOauth:{accessToken:'valid-file-token'}}); },
+    };
+    if (name === 'node:os') return { homedir: () => '/fixture-home', userInfo: () => ({username:'fixture'}) };
+    if (name === 'node:child_process') return { spawnSync() {
+      return {status:0,stdout:JSON.stringify({claudeAiOauth:{accessToken:'expired-keychain-token'}})};
+    } };
+    return require(name);
+  },
+  process: { platform: 'darwin', env: {}, stdout:{write(text){ output.push(JSON.parse(text)); }} },
+  AbortSignal,
+  TextDecoder,
+  async fetch(url, options) {
+    requests.push(options.headers.Authorization);
+    if (options.headers.Authorization !== 'Bearer valid-file-token') return {status:401,ok:false};
+    const bytes = new TextEncoder().encode(JSON.stringify({five_hour:{utilization:7,resets_at:'2026-10-06T00:00:00Z'}}));
+    let sent = false;
+    return {status:200,ok:true,headers:{get(){return null;}},body:{getReader(){return {async read(){
+      if(sent)return {done:true};sent=true;return {done:false,value:bytes};
+    }};}}};
+  },
+};
+vm.runInNewContext(SCRIPT, sandbox);
+setTimeout(() => {
+  assert.deepEqual(requests,['Bearer expired-keychain-token','Bearer valid-file-token']);
+  assert.equal(output.length,1);
+  assert.equal(output[0].status,'available');
+  assert.equal(output[0].usage.windows[0].used_percent,7);
 },0);
 ".replace("SCRIPT", &script);
         let result = std::process::Command::new("node")
@@ -4091,6 +4163,24 @@ setTimeout(() => {
             "launched\n\nThe secret word is PINEAPPLE-42."
         );
         assert_eq!(streamed_text(&events), state.result.text);
+    }
+
+    #[test]
+    fn an_empty_streamed_text_block_adds_no_blank_paragraph() {
+        let adapter = Claude::default();
+        let mut state = AdapterState::default();
+        let mut events = Vec::new();
+        for line in [
+            r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Done."}}}"#,
+            // Interrupted before it produced text.
+            r#"{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":""}}}"#,
+        ] {
+            events.extend(adapter.parse_line(line, &mut state).unwrap().events);
+        }
+        assert_eq!(state.result.text, "Done.");
+        assert_eq!(streamed_text(&events), "Done.");
     }
 
     #[test]
