@@ -20,8 +20,8 @@ use crate::{
     HarnessModel, HarnessModelCatalog, HarnessReasoningEffort, InteractionRequest,
     LaunchContextCapabilities, McpServerConfig, PermissionMode, PermissionSupport, Provider,
     ProviderReadiness, ProviderTerminalFailure, QuestionAnswer, QuestionRequest, Result, RunStatus,
-    RuntimeError, ToolCallStatus, TransportExitStatus, TurnCapabilities, TurnEvent, TurnRequest,
-    Usage,
+    RuntimeError, ToolCallStatus, ToolImage, TransportExitStatus, TurnCapabilities, TurnEvent,
+    TurnRequest, Usage,
 };
 
 const CLAUDE_STATE_KEY: &str = "claude.native_tasks";
@@ -1530,6 +1530,7 @@ impl AgentAdapter for Claude {
                                     output: None,
                                     error: None,
                                     task_id: task_id.clone(),
+                                    images: Vec::new(),
                                 });
                             }
                             _ => {}
@@ -1571,7 +1572,7 @@ impl AgentAdapter for Claude {
                             continue;
                         };
                         let failed = block.get("is_error").and_then(Value::as_bool) == Some(true);
-                        let text =
+                        let (text, images) =
                             tool_result_text(block.get("content"), value.get("tool_use_result"));
                         // Each call reports one result; forgetting it keeps
                         // the map to calls still in flight.
@@ -1604,6 +1605,7 @@ impl AgentAdapter for Claude {
                             output: (!failed).then(|| text.clone()),
                             error: failed.then_some(text),
                             task_id: owning_task,
+                            images,
                         });
                         if !failed {
                             match tool_name.as_str() {
@@ -2577,6 +2579,7 @@ fn translate_system_task(
                         .unwrap_or("Permission denied."),
                 )),
                 task_id: task_id_for(native, value.get("agent_id").and_then(Value::as_str)),
+                images: Vec::new(),
             });
         }
         Some("task_started") => {
@@ -2951,28 +2954,136 @@ fn separate_text_block(text: &mut String, events: &mut Vec<TurnEvent>) {
     });
 }
 
-fn tool_result_text(content: Option<&Value>, tool_use_result: Option<&Value>) -> String {
-    if let Some(result) = tool_use_result.and_then(Value::as_object) {
-        if let Some(stdout) = result.get("stdout").and_then(Value::as_str) {
-            let stderr = result
-                .get("stderr")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let combined = format!("{stdout}{stderr}");
-            if !combined.trim().is_empty() {
-                return bounded(&combined);
-            }
+/// A tool result's display text and the images it returned. Image blocks
+/// never reach the text: base64 there is unreadable and would be cut
+/// mid-image by the output bound.
+/// Most `[Image not shown: …]` notes listed for one result; the rest are
+/// counted in one more line.
+const MAX_IMAGE_NOTES: usize = 8;
+
+/// A tool result's display text and the images it returned. Image blocks
+/// never reach the text: base64 there is unreadable and would be cut
+/// mid-image by the output bound. Notes for images that cannot be reported
+/// are appended after the bound, whichever text source is used, so they are
+/// never dropped.
+fn tool_result_text(
+    content: Option<&Value>,
+    tool_use_result: Option<&Value>,
+) -> (String, Vec<ToolImage>) {
+    let (content_text, notes, images) = tool_result_content(content);
+    let mut text = bounded(&preferred_result_text(tool_use_result).unwrap_or(content_text));
+    for note in notes {
+        if !text.is_empty() {
+            text.push('\n');
         }
-        if let Some(file) = result.get("file").and_then(Value::as_object) {
-            if let Some(content) = file.get("content").and_then(Value::as_str) {
-                return bounded(content);
-            }
+        text.push_str(&note);
+    }
+    (text, images)
+}
+
+/// The richer text Claude reports beside some results: a shell's output, or
+/// a read text file's content.
+fn preferred_result_text(tool_use_result: Option<&Value>) -> Option<String> {
+    let result = tool_use_result.and_then(Value::as_object)?;
+    if let Some(stdout) = result.get("stdout").and_then(Value::as_str) {
+        let stderr = result
+            .get("stderr")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let combined = format!("{stdout}{stderr}");
+        if !combined.trim().is_empty() {
+            return Some(combined);
         }
     }
-    if let Some(content) = content.and_then(Value::as_str) {
-        return bounded(content);
+    result
+        .get("file")
+        .and_then(Value::as_object)
+        .and_then(|file| file.get("content"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
+/// Splits a `tool_result` content value into its text, a note for each image
+/// that cannot be reported, and the images. Content is a string or an array
+/// of `text`/`image` blocks.
+fn tool_result_content(content: Option<&Value>) -> (String, Vec<String>, Vec<ToolImage>) {
+    let Some(blocks) = content.and_then(Value::as_array) else {
+        return match content {
+            Some(Value::String(text)) => (text.clone(), Vec::new(), Vec::new()),
+            other => (
+                other.cloned().unwrap_or(Value::Null).to_string(),
+                Vec::new(),
+                Vec::new(),
+            ),
+        };
+    };
+    let mut text = Vec::new();
+    let mut notes = Vec::new();
+    let mut unlisted = 0usize;
+    let mut images = Vec::new();
+    for block in blocks {
+        match block.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                if let Some(value) = block.get("text").and_then(Value::as_str) {
+                    text.push(value.to_string());
+                }
+            }
+            Some("image") => {
+                let source = block.get("source");
+                let media_type = source
+                    .and_then(|source| source.get("media_type"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("image");
+                let data = source
+                    .filter(|source| source.get("type").and_then(Value::as_str) == Some("base64"))
+                    .and_then(|source| source.get("data"))
+                    .and_then(Value::as_str);
+                let omitted = if images.len() >= ToolImage::MAX_PER_TOOL_CALL {
+                    Some(format!(
+                        "more than {} images in one result",
+                        ToolImage::MAX_PER_TOOL_CALL
+                    ))
+                } else if data.is_some_and(|data| data.len() > ToolImage::MAX_DATA_CHARS) {
+                    Some("larger than 5 MiB".to_string())
+                } else if data.is_some_and(|data| !crate::types::is_standard_base64(data)) {
+                    Some("its data is not valid base64".to_string())
+                } else {
+                    match data.and_then(|data| ToolImage::new(media_type, data)) {
+                        Some(image) => {
+                            images.push(image);
+                            None
+                        }
+                        None => Some(format!("{media_type} is not a displayable image")),
+                    }
+                };
+                if let Some(reason) = omitted {
+                    if notes.len() < MAX_IMAGE_NOTES {
+                        notes.push(format!("[Image not shown: {}]", bounded_note(&reason)));
+                    } else {
+                        unlisted += 1;
+                    }
+                }
+            }
+            _ => text.push(block.to_string()),
+        }
     }
-    bounded(&content.cloned().unwrap_or(Value::Null).to_string())
+    if unlisted > 0 {
+        notes.push(format!("[{unlisted} more images not shown]"));
+    }
+    (text.join("\n"), notes, images)
+}
+
+/// Caps a provider-supplied reason (it can carry a media type) so notes stay
+/// short.
+fn bounded_note(reason: &str) -> String {
+    const MAX_NOTE_CHARS: usize = 120;
+    if reason.chars().count() <= MAX_NOTE_CHARS {
+        reason.to_string()
+    } else {
+        let mut text: String = reason.chars().take(MAX_NOTE_CHARS).collect();
+        text.push('…');
+        text
+    }
 }
 
 #[cfg(test)]
@@ -4103,6 +4214,109 @@ setTimeout(() => {
             TurnEvent::ToolCall { task_id: Some(id), output: Some(output), .. }
                 if id == "shell-1" && output == "/tmp"
         ));
+    }
+
+    #[test]
+    fn an_image_tool_result_reports_the_image_instead_of_base64_text() {
+        let adapter = Claude::default();
+        let mut state = AdapterState::default();
+        adapter
+            .parse_line(
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_read","name":"Read","input":{"file_path":"/tmp/shot.png"}}]}}"#,
+                &mut state,
+            )
+            .unwrap();
+        let svg = "PHN2Zz4=";
+        let completed = adapter
+            .parse_line(
+                &json!({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_read","content":[
+                    {"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBORw0KGgo="}},
+                    {"type":"text","text":"Screenshot taken"},
+                    {"type":"image","source":{"type":"base64","media_type":"image/svg+xml","data":svg}}
+                ]}]},"tool_use_result":{"type":"image","file":{"base64":"iVBORw0KGgo=","type":"image/png"}}})
+                .to_string(),
+                &mut state,
+            )
+            .unwrap();
+        let TurnEvent::ToolCall {
+            name,
+            output: Some(output),
+            images,
+            ..
+        } = &completed.events[0]
+        else {
+            panic!("expected a completed tool call, got {:?}", completed.events);
+        };
+        assert_eq!(name, "Read");
+        assert_eq!(
+            output,
+            "Screenshot taken\n[Image not shown: image/svg+xml is not a displayable image]"
+        );
+        assert!(!output.contains("iVBOR"));
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].media_type, "image/png");
+        assert_eq!(images[0].data, "iVBORw0KGgo=");
+        assert_eq!(images[0].sha256.len(), 64);
+    }
+
+    #[test]
+    fn an_oversized_tool_image_is_named_in_the_output() {
+        let data = "A".repeat(ToolImage::MAX_DATA_CHARS + 4);
+        let content = json!([{"type":"image","source":{"type":"base64","media_type":"image/jpeg","data":data}}]);
+        let (text, images) = tool_result_text(Some(&content), None);
+        assert_eq!(images, Vec::<ToolImage>::new());
+        assert_eq!(text, "[Image not shown: larger than 5 MiB]");
+    }
+
+    #[test]
+    fn an_unshown_image_is_named_even_when_richer_text_wins() {
+        let content = json!([
+            {"type":"text","text":"ignored"},
+            {"type":"image","source":{"type":"base64","media_type":"image/svg+xml","data":"PHN2Zz4="}}
+        ]);
+        let (text, images) =
+            tool_result_text(Some(&content), Some(&json!({"stdout":"done","stderr":""})));
+        assert_eq!(images, Vec::<ToolImage>::new());
+        assert_eq!(
+            text,
+            "done\n[Image not shown: image/svg+xml is not a displayable image]"
+        );
+    }
+
+    #[test]
+    fn an_unshown_image_is_named_after_long_text_is_bounded() {
+        let long = "x".repeat(MAX_TASK_FIELD_CHARS * 2);
+        let mut blocks = vec![json!({"type":"text","text":long})];
+        blocks.extend((0..ToolImage::MAX_PER_TOOL_CALL + 10).map(|_| {
+            json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBORw0KGgo="}})
+        }));
+        blocks.push(json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":"not base64!"}}));
+        let (text, images) = tool_result_text(Some(&Value::Array(blocks)), None);
+        assert_eq!(images.len(), ToolImage::MAX_PER_TOOL_CALL);
+        assert!(text.contains("… [truncated]"));
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.starts_with("[Image not shown"))
+                .count(),
+            MAX_IMAGE_NOTES
+        );
+        assert!(text.ends_with("[3 more images not shown]"), "{text}");
+    }
+
+    #[test]
+    fn tool_images_must_be_canonical_standard_base64() {
+        assert!(ToolImage::new("image/png", "iVBORw0KGgo=").is_some());
+        for data in [
+            "",
+            "not-base64!",
+            "iVBORw0KGg",
+            "iVBORw0KGgp=",
+            "iVBO\nRw0K",
+            "QQ===",
+            "QQ==QQ==",
+        ] {
+            assert!(ToolImage::new("image/png", data).is_none(), "{data:?}");
+        }
     }
 
     #[test]

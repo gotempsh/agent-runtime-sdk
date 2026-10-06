@@ -922,6 +922,87 @@ pub struct AgentTaskActivity {
     pub workflow_agent: Option<Box<AgentWorkflowAgent>>,
 }
 
+/// An image a tool returned to the model.
+///
+/// Only JPEG, PNG, GIF and WebP are reported, each bounded by
+/// [`ToolImage::MAX_DATA_CHARS`]. A consumer that stores the bytes elsewhere
+/// can clear `data` and keep `sha256` as the reference.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct ToolImage {
+    /// `image/jpeg`, `image/png`, `image/gif` or `image/webp`.
+    pub media_type: String,
+    /// Standard base64 of the image bytes, exactly as the provider sent it.
+    pub data: String,
+    /// Lowercase hex SHA-256 of `data`'s base64 text.
+    pub sha256: String,
+}
+
+impl ToolImage {
+    /// Largest base64 payload reported for one image (5 MiB, the provider
+    /// image limit); larger images are described in the tool output instead.
+    pub const MAX_DATA_CHARS: usize = 5 * 1024 * 1024;
+    /// Most images reported for one tool call.
+    pub const MAX_PER_TOOL_CALL: usize = 8;
+
+    /// An image of a supported media type, or `None` for any other type, a
+    /// payload over [`Self::MAX_DATA_CHARS`], or data that is not canonical
+    /// standard base64 (so every host can decode what it receives).
+    pub fn new(media_type: impl Into<String>, data: impl Into<String>) -> Option<Self> {
+        use sha2::Digest;
+
+        let media_type = media_type.into().to_ascii_lowercase();
+        let data = data.into();
+        if !matches!(
+            media_type.as_str(),
+            "image/jpeg" | "image/png" | "image/gif" | "image/webp"
+        ) || data.len() > Self::MAX_DATA_CHARS
+            || !is_standard_base64(&data)
+        {
+            return None;
+        }
+        let sha256 = sha2::Sha256::digest(data.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        Some(Self {
+            media_type,
+            data,
+            sha256,
+        })
+    }
+}
+
+/// Whether `data` is non-empty, canonical standard base64 with padding: the
+/// encoding strict decoders accept. Checked without decoding.
+pub(crate) fn is_standard_base64(data: &str) -> bool {
+    let bytes = data.as_bytes();
+    if bytes.is_empty() || !bytes.len().is_multiple_of(4) {
+        return false;
+    }
+    let padding = bytes.iter().rev().take_while(|byte| **byte == b'=').count();
+    if padding > 2 {
+        return false;
+    }
+    let mut last = 0;
+    for &byte in &bytes[..bytes.len() - padding] {
+        last = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return false,
+        };
+    }
+    // The bits after the last whole byte must be zero.
+    match padding {
+        1 => last.trailing_zeros() >= 2,
+        2 => last.trailing_zeros() >= 4,
+        _ => true,
+    }
+}
+
 /// Provider-neutral streaming event.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -969,6 +1050,10 @@ pub enum TurnEvent {
         error: Option<String>,
         /// Native task/subagent that owns this tool call, when reported.
         task_id: Option<String>,
+        /// Images the tool returned to the model (a read image file, a
+        /// browser screenshot), in result order. Never part of `output`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<ToolImage>,
     },
     /// Replaceable snapshot of provider-native tasks and subagents.
     TasksChanged {
