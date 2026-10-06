@@ -1030,6 +1030,7 @@ fn tool_event(part: &Value) -> Option<TurnEvent> {
         output: out,
         error,
         task_id: None,
+        images: Vec::new(),
     })
 }
 

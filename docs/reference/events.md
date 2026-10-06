@@ -86,8 +86,18 @@ assistant `TextDelta`.
 ## Tool execution
 
 `ToolCall` carries a provider-native ID when available, a name, status, input,
-output, error, and optional native `task_id`. Inputs and outputs may contain
-user data or secrets. Redact them before logs or telemetry.
+output, error, optional native `task_id`, and `images`. Inputs and outputs may
+contain user data or secrets. Redact them before logs or telemetry.
+
+`images` lists the images a tool returned to the model, such as Claude's Read
+of a PNG or an MCP screenshot, as `ToolImage { media_type, data, sha256 }`:
+JPEG, PNG, GIF or WebP, standard base64 up to `ToolImage::MAX_DATA_CHARS`
+(5 MiB), at most `ToolImage::MAX_PER_TOOL_CALL` (8) per call. They never
+appear in `output`. An image that cannot be reported is named there instead,
+for example `[Image not shown: larger than 5 MiB]`. `sha256` is the hex
+SHA-256 of `data`, so a host that stores the bytes elsewhere can clear `data`
+and keep `sha256` as its reference. Only the Claude adapter reports images
+today; the others send an empty list, which serialization omits.
 
 `ToolCallStatus` is `Started`, `Succeeded`, or `Failed`. Use the provider ID to
 update one durable tool-call record rather than inserting a new record for each

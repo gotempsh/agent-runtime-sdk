@@ -113,8 +113,8 @@ pub use types::{
     EventSink, InteractionHandler, LaunchContext, LaunchContextCapabilities, McpServerConfig,
     NoopEventSink, PermissionMode, PermissionSupport, Provider, ProviderProcessStatus,
     ProviderReadiness, QuestionAnswer, QuestionOption, QuestionPrompt, QuestionRequest, RunStatus,
-    SecretString, ToolCallStatus, ToolProcessPolicy, TurnCapabilities, TurnEvent, TurnProvenance,
-    TurnRequest, TurnResult, Usage,
+    SecretString, ToolCallStatus, ToolImage, ToolProcessPolicy, TurnCapabilities, TurnEvent,
+    TurnProvenance, TurnRequest, TurnResult, Usage,
 };
 
 pub use startup::{StartupObserver, StartupStage, StartupTiming};

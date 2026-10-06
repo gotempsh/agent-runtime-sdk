@@ -1172,6 +1172,7 @@ mod tests {
             output: None,
             error: Some("cat: /Users/example/private/key: Operation not permitted".into()),
             task_id: None,
+            images: Vec::new(),
         };
 
         let violation = execution.classify_event(&event).unwrap();

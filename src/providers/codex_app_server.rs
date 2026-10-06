@@ -995,6 +995,7 @@ fn tool_event(item: &Value, completed: bool) -> Option<TurnEvent> {
         output,
         error,
         task_id: None,
+        images: Vec::new(),
     })
 }
 

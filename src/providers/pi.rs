@@ -809,6 +809,7 @@ impl AgentAdapter for Pi {
                     output: None,
                     error: None,
                     task_id: None,
+                    images: Vec::new(),
                 });
             }
             "tool_execution_end" => {
@@ -843,6 +844,7 @@ impl AgentAdapter for Pi {
                         None
                     },
                     task_id: None,
+                    images: Vec::new(),
                 });
             }
             "compaction_start" => {
@@ -1104,6 +1106,7 @@ fn oversized_tool_end(frame: OversizedFrame<'_>, state: &mut AdapterState) -> Ad
             output,
             error,
             task_id: None,
+            images: Vec::new(),
         }],
         ..AdapterOutput::default()
     }
@@ -1669,6 +1672,7 @@ mod tests {
             output: None,
             error: None,
             task_id: None,
+            images: Vec::new(),
         }));
         assert!(events.contains(&TurnEvent::ToolCall {
             id: Some("call-1".into()),
@@ -1678,6 +1682,7 @@ mod tests {
             output: Some("hi\n".into()),
             error: None,
             task_id: None,
+            images: Vec::new(),
         }));
 
         let settled = adapter
@@ -1833,6 +1838,7 @@ mod tests {
                 output: None,
                 error: Some("oldText not found".into()),
                 task_id: None,
+                images: Vec::new(),
             }]
         );
     }

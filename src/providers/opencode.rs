@@ -558,6 +558,7 @@ impl AgentAdapter for OpenCode {
                         .and_then(Value::as_str)
                         .map(str::to_owned),
                     task_id: None,
+                    images: Vec::new(),
                 });
             }
             "step_start" => {

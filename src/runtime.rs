@@ -7133,6 +7133,7 @@ mod tests {
                         output: None,
                         error: Some("cat: /private/input: Operation not permitted".into()),
                         task_id: None,
+                        images: Vec::new(),
                     });
                 }
                 if let Some(session_id) = value.get("session").and_then(Value::as_str) {
