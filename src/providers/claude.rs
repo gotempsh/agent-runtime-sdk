@@ -4218,7 +4218,7 @@ setTimeout(() => {
         let data = "A".repeat(ToolImage::MAX_DATA_CHARS + 4);
         let content = json!([{"type":"image","source":{"type":"base64","media_type":"image/jpeg","data":data}}]);
         let (text, images) = tool_result_text(Some(&content), None);
-        assert!(images.is_empty());
+        assert_eq!(images, Vec::<ToolImage>::new());
         assert_eq!(text, "[Image not shown: larger than 5 MiB]");
     }
 

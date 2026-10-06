@@ -3014,6 +3014,7 @@ impl AgentAdapter for DemoAdapter {
                     output: value["output"].as_str().map(str::to_string),
                     error: value["error"].as_str().map(str::to_string),
                     task_id: None,
+                    images: Vec::new(),
                 });
             }
             "text" => {
@@ -3379,6 +3380,7 @@ mod upload_tests {
             output: None,
             error: None,
             task_id: None,
+            images: Vec::new(),
         })
         .await
         .expect("emit question tool");
