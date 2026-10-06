@@ -945,8 +945,9 @@ impl ToolImage {
     /// Most images reported for one tool call.
     pub const MAX_PER_TOOL_CALL: usize = 8;
 
-    /// An image of a supported media type, or `None` for any other type or a
-    /// payload over [`Self::MAX_DATA_CHARS`].
+    /// An image of a supported media type, or `None` for any other type, a
+    /// payload over [`Self::MAX_DATA_CHARS`], or data that is not canonical
+    /// standard base64 (so every host can decode what it receives).
     pub fn new(media_type: impl Into<String>, data: impl Into<String>) -> Option<Self> {
         use sha2::Digest;
 
@@ -955,8 +956,8 @@ impl ToolImage {
         if !matches!(
             media_type.as_str(),
             "image/jpeg" | "image/png" | "image/gif" | "image/webp"
-        ) || data.is_empty()
-            || data.len() > Self::MAX_DATA_CHARS
+        ) || data.len() > Self::MAX_DATA_CHARS
+            || !is_standard_base64(&data)
         {
             return None;
         }
@@ -969,6 +970,36 @@ impl ToolImage {
             data,
             sha256,
         })
+    }
+}
+
+/// Whether `data` is non-empty, canonical standard base64 with padding: the
+/// encoding strict decoders accept. Checked without decoding.
+pub(crate) fn is_standard_base64(data: &str) -> bool {
+    let bytes = data.as_bytes();
+    if bytes.is_empty() || !bytes.len().is_multiple_of(4) {
+        return false;
+    }
+    let padding = bytes.iter().rev().take_while(|byte| **byte == b'=').count();
+    if padding > 2 {
+        return false;
+    }
+    let mut last = 0;
+    for &byte in &bytes[..bytes.len() - padding] {
+        last = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return false,
+        };
+    }
+    // The bits after the last whole byte must be zero.
+    match padding {
+        1 => last.trailing_zeros() >= 2,
+        2 => last.trailing_zeros() >= 4,
+        _ => true,
     }
 }
 

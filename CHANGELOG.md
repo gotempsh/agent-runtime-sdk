@@ -20,8 +20,9 @@ Versioning and Keep a Changelog conventions.
   to the model (Claude's Read of an image file, an MCP screenshot) arrive as
   structured JPEG/PNG/GIF/WebP payloads with a SHA-256 of their base64,
   instead of base64 text in `output`, which the output bound cut mid-image.
-  Unsupported or oversized images, and images past eight per result, are
-  named in `output`. Adapters without image results report an empty list,
+  Unsupported, oversized or non-base64 images, and images past eight per
+  result, are named in `output` after its bound, even when a shell's output
+  or a file's content is the reported text. Adapters without image results report an empty list,
   and the field is omitted from serialized events when empty, so recorded
   events still deserialize. Code that constructs `TurnEvent::ToolCall` with
   struct syntax must now set `images` (usually `Vec::new()`).
