@@ -16,6 +16,18 @@ Versioning and Keep a Changelog conventions.
 
 ### Added
 
+- Background follow-ups: `AgentRuntime::subscribe_background_follow_ups`
+  announces a runtime whose parked process started answering background work
+  on its own, and `RuntimeInvocationKind::Continuation` (`TurnRequest::continuation`)
+  streams that answer as an invocation without submitting a prompt. A
+  continuation with nothing to deliver fails with `NothingToContinue`
+  (`InvalidRequest`, `NotSent`) before writing to the provider. Adapters opt
+  in through `AgentAdapter::retained_follow_up_pending`; Claude does.
+- `AgentRuntime::parked_background_tasks` lists the provider task ids still
+  running in a runtime's parked process (`AgentAdapter::retained_background_task_ids`),
+  so an application can tell the tasks that outlived a finished or
+  interrupted turn from those that ended with it.
+
 - `TurnEvent::ToolCall { images }` and `ToolImage`: images a tool returned
   to the model (Claude's Read of an image file, an MCP screenshot) arrive as
   structured JPEG/PNG/GIF/WebP payloads with a SHA-256 of their base64,
@@ -160,6 +172,13 @@ Versioning and Keep a Changelog conventions.
   Saved provider context is preserved.
 
 ### Changed
+
+- A retained Claude turn now ends at its answer when only background shells
+  are still running (a dev server or watcher never ends), instead of staying
+  open until they finish. The process is parked with the shells; Claude's
+  answer when one ends is announced for a continuation, or delivered at the
+  start of the next turn. Background subagents still hold the turn open, and
+  one-shot processes are unchanged.
 
 - Claude account usage honors `CLAUDE_CONFIG_DIR` (then `CLAUDE_HOME`): it
   reads that directory's credentials file and the Keychain entry Claude Code

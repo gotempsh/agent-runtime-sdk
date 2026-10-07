@@ -534,6 +534,26 @@ pub trait AgentAdapter: Send + Sync {
         false
     }
 
+    /// Whether the provider is answering, or about to answer, background work
+    /// that finished after the turn ended, on its own and without a prompt.
+    ///
+    /// Read while a process is parked. The runtime announces it through
+    /// [`crate::AgentRuntime::subscribe_background_follow_ups`] so the application
+    /// can start a continuation that streams the answer. The default `false`
+    /// means the provider never answers on its own.
+    fn retained_follow_up_pending(&self, state: &AdapterState) -> bool {
+        let _ = state;
+        false
+    }
+
+    /// Provider ids of the background tasks
+    /// [`retained_background_work`](Self::retained_background_work) reports
+    /// as still running, for [`crate::AgentRuntime::parked_background_tasks`].
+    fn retained_background_task_ids(&self, state: &AdapterState) -> Vec<String> {
+        let _ = state;
+        Vec::new()
+    }
+
     /// Short descriptions of the background work
     /// [`retained_background_work`](Self::retained_background_work) reports,
     /// for telling a caller what replacing the process would stop.

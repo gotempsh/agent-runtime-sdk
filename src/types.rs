@@ -371,6 +371,13 @@ pub struct TurnRequest {
     /// Controls that must be enforced by the execution transport, the optional
     /// sandbox backend, or their combination.
     pub required_sandbox_capabilities: crate::SandboxCapabilities,
+    /// Resume the provider's own answer to background work that finished
+    /// after the previous turn ended, instead of submitting [`Self::prompt`].
+    ///
+    /// Only a retained process parked with such an answer can continue;
+    /// anything else fails with [`crate::RuntimeError::NothingToContinue`]
+    /// before writing to the provider.
+    pub continuation: bool,
 }
 
 impl fmt::Debug for TurnRequest {
@@ -402,6 +409,7 @@ impl fmt::Debug for TurnRequest {
             "required_sandbox_capabilities",
             &self.required_sandbox_capabilities,
         );
+        debug.field("continuation", &self.continuation);
         debug.finish_non_exhaustive()
     }
 }
@@ -434,6 +442,7 @@ impl TurnRequest {
             cancellation: CancellationToken::new(),
             sandbox: None,
             required_sandbox_capabilities: crate::SandboxCapabilities::NONE,
+            continuation: false,
         }
     }
 }
