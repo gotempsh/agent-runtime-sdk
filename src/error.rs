@@ -160,6 +160,14 @@ pub enum RuntimeError {
         /// describes it.
         tasks: Vec<String>,
     },
+    /// A continuation found no answer to background work waiting for it: no
+    /// process is parked for this runtime, or another invocation already
+    /// delivered that answer. Nothing was written to the provider.
+    #[error("{provider} has no answer to background work waiting for a continuation")]
+    NothingToContinue {
+        /// Provider asked to continue.
+        provider: Provider,
+    },
 }
 
 pub(crate) fn classify_provider_failure(diagnostic: &str) -> ProviderProcessErrorKind {

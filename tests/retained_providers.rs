@@ -3,11 +3,11 @@
 
 use std::{fs, os::unix::fs::PermissionsExt, time::Duration};
 use temps_agent_runtime::{
-    lifecycle::{InvocationId, RuntimeFailure, RuntimeFailureKind, RuntimeId},
+    lifecycle::{DeliveryState, InvocationId, RuntimeFailure, RuntimeFailureKind, RuntimeId},
     providers::Claude,
     retained::{
         CompactionInput, InProcessRuntimeClient, RuntimeClient, RuntimeEvent, RuntimeHandle,
-        RuntimeSpec, TurnHandle, TurnInput,
+        RuntimeInvocationKind, RuntimeSpec, TurnHandle, TurnInput,
     },
     AgentRuntime, AgentTaskActivityKind, PermissionMode, Provider, ProviderProcessRetention,
     TurnEvent, TurnResult,
@@ -41,6 +41,18 @@ def subagent(follow_up):
   emit({'type':'system','subtype':'init','session_id':'fixture-session'})
   emit({'type':'assistant','parent_tool_use_id':None,'message':{'content':[{'type':'text','text':'FOLLOWUP'}]}})
   result('FOLLOWUP')
+def shell(follow_up):
+ # A background shell (`run_in_background`), as Claude reports one: nothing
+ # while it runs, then a notification that wakes the parent agent.
+ log('shell-start')
+ while not os.path.exists(RELEASE):time.sleep(.02)
+ emit({'type':'system','subtype':'background_tasks_changed','tasks':[]})
+ emit({'type':'system','subtype':'task_notification','task_id':'sh-1','status':'completed','summary':'server exited'})
+ log('shell-finished')
+ if follow_up:
+  emit({'type':'system','subtype':'init','session_id':'fixture-session'})
+  emit({'type':'assistant','parent_tool_use_id':None,'message':{'content':[{'type':'text','text':'SHELL-FOLLOWUP'}]}})
+  result('SHELL-FOLLOWUP')
 log('spawn')
 for line in sys.stdin:
  frame=json.loads(line)
@@ -68,6 +80,14 @@ for line in sys.stdin:
    thread=threading.Thread(target=subagent,args=(prompt=='spawn-bg',),daemon=True)
    BACKGROUND.append(thread);thread.start()
    continue
+  if prompt=='spawn-shell':
+   emit({'type':'system','subtype':'task_started','task_id':'sh-1','tool_use_id':'toolu_sh','description':'Run dev server','task_type':'local_bash','is_backgrounded':True})
+   emit({'type':'system','subtype':'background_tasks_changed','tasks':[{'task_id':'sh-1','task_type':'local_bash','description':'Run dev server'}]})
+   emit({'type':'assistant','parent_tool_use_id':None,'message':{'content':[{'type':'text','text':'SERVING'}]}})
+   result('SERVING')
+   thread=threading.Thread(target=shell,args=(True,),daemon=True)
+   BACKGROUND.append(thread);thread.start()
+   continue
   result('reply:'+prompt)
 # stdin closed. Let released background work finish, then exit holding the
 # output lock: interpreter shutdown while a daemon thread is inside print()
@@ -81,6 +101,7 @@ struct Fixture {
     _dir: tempfile::TempDir,
     log: std::path::PathBuf,
     release: std::path::PathBuf,
+    runtime: AgentRuntime,
     client: InProcessRuntimeClient,
     handle: RuntimeHandle,
 }
@@ -140,7 +161,8 @@ impl Fixture {
                 active_inactivity_timeout: Some(Duration::from_secs(2)),
             });
         }
-        let client = InProcessRuntimeClient::new(builder.build().unwrap());
+        let runtime = builder.build().unwrap();
+        let client = InProcessRuntimeClient::new(runtime.clone());
         let handle = client
             .acquire(RuntimeSpec::new(
                 RuntimeId::new("claude-native").unwrap(),
@@ -153,12 +175,18 @@ impl Fixture {
             _dir: dir,
             log,
             release,
+            runtime,
             client,
             handle,
         }
     }
     fn input(id: &str, prompt: &str) -> TurnInput {
         TurnInput::new(InvocationId::new(id).unwrap(), prompt)
+    }
+    fn continuation(id: &str) -> TurnInput {
+        let mut input = TurnInput::new(InvocationId::new(id).unwrap(), "");
+        input.invocation_kind = RuntimeInvocationKind::Continuation;
+        input
     }
     /// Let the fixture's background subagent finish.
     fn release_background(&self) {
@@ -592,5 +620,122 @@ async fn claude_background_work_without_retention_keeps_rejecting_overlap() {
     // follow-up before stdin closes is a race outside this test's scope
     // (the fixture finishes its background work and exits cleanly either way).
     assert!(result.unwrap().text.starts_with("LAUNCHED"));
+    f.dispose().await;
+}
+
+#[tokio::test]
+async fn claude_background_shell_does_not_hold_its_turn() {
+    let f = Fixture::new(true, Duration::from_secs(30)).await;
+    // A dev server never ends: the turn ends at its answer instead of
+    // waiting for it, and the shell keeps running in the parked process.
+    let result = f.turn("one", "spawn-shell").await.unwrap();
+    assert_eq!(result.text, "SERVING");
+    f.wait_for_log("shell-start").await;
+    assert_eq!(f.logged("shell-finished"), 0, "the shell is still running");
+
+    // The next turn takes over the same process, shell included.
+    let second = f.turn("two", "second").await.unwrap();
+    assert!(second.text.contains("reply:second"), "{}", second.text);
+    assert_eq!(f.spawns().len(), 1, "{:?}", f.events());
+    assert_eq!(
+        f.logged("shell-finished"),
+        0,
+        "the shell survived the new turn"
+    );
+    f.dispose().await;
+}
+
+#[tokio::test]
+async fn claude_answer_to_a_finished_shell_is_announced_and_continued() {
+    let f = Fixture::new(true, Duration::from_secs(30)).await;
+    let mut follow_ups = f.runtime.subscribe_background_follow_ups();
+    assert_eq!(f.turn("one", "spawn-shell").await.unwrap().text, "SERVING");
+    f.wait_for_log("shell-start").await;
+
+    f.release_background();
+    let announced = tokio::time::timeout(Duration::from_secs(10), follow_ups.recv())
+        .await
+        .expect("Claude's answer to the finished shell must be announced")
+        .unwrap();
+    assert_eq!(announced, RuntimeId::new("claude-native").unwrap());
+
+    let (events, result) = Running::new(
+        f.handle
+            .start_turn(Fixture::continuation("cont"))
+            .await
+            .unwrap(),
+    )
+    .finish()
+    .await;
+    assert_eq!(result.unwrap().text, "SHELL-FOLLOWUP");
+    assert!(events.iter().any(|event| matches!(
+        event,
+        TurnEvent::TaskActivity { activity }
+            if activity.task_id == "sh-1" && activity.kind == AgentTaskActivityKind::Completed
+    )));
+    assert!(
+        f.events()
+            .iter()
+            .all(|v| v["kind"] != "prompt" || v["prompt"] == "spawn-shell"),
+        "a continuation writes no prompt: {:?}",
+        f.events()
+    );
+
+    // Delivered once: nothing is left to continue, and the process is reused.
+    let again = f
+        .handle
+        .start_turn(Fixture::continuation("cont-again"))
+        .await
+        .unwrap()
+        .wait()
+        .await
+        .expect_err("the answer was already delivered");
+    assert_eq!(again.kind, RuntimeFailureKind::InvalidRequest);
+    assert_eq!(again.delivery, DeliveryState::NotSent);
+    assert_eq!(f.turn("two", "second").await.unwrap().text, "reply:second");
+    assert_eq!(f.spawns().len(), 1, "{:?}", f.events());
+    f.dispose().await;
+}
+
+#[tokio::test]
+async fn claude_continuation_without_a_parked_answer_sends_nothing() {
+    let f = Fixture::new(true, Duration::from_secs(30)).await;
+    assert_eq!(f.turn("one", "first").await.unwrap().text, "reply:first");
+    let failure = f
+        .handle
+        .start_turn(Fixture::continuation("cont"))
+        .await
+        .unwrap()
+        .wait()
+        .await
+        .expect_err("an idle process has nothing to continue");
+    assert_eq!(failure.kind, RuntimeFailureKind::InvalidRequest);
+    assert_eq!(failure.delivery, DeliveryState::NotSent);
+    assert_eq!(f.logged("prompt"), 1);
+    assert_eq!(f.turn("two", "second").await.unwrap().text, "reply:second");
+    assert_eq!(f.spawns().len(), 1, "{:?}", f.events());
+    f.dispose().await;
+}
+
+#[tokio::test]
+async fn claude_answer_to_a_finished_shell_reaches_the_next_turn_without_a_continuation() {
+    let f = Fixture::new(true, Duration::from_secs(30)).await;
+    assert_eq!(f.turn("one", "spawn-shell").await.unwrap().text, "SERVING");
+    f.wait_for_log("shell-start").await;
+    f.release_background();
+    f.wait_for_log("shell-finished").await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let (events, result) = Running::new(f.start_retrying("two", "second").await)
+        .finish()
+        .await;
+    assert!(result.unwrap().text.contains("reply:second"));
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            TurnEvent::TextDelta { text } if text.contains("SHELL-FOLLOWUP")
+        )),
+        "{events:?}"
+    );
+    assert_eq!(f.spawns().len(), 1, "{:?}", f.events());
     f.dispose().await;
 }

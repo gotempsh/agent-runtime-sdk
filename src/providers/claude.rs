@@ -460,6 +460,25 @@ impl ClaudeNativeState {
     fn answered(&self) -> bool {
         self.result_seen && !self.follow_up_active && self.own_commands_done()
     }
+
+    /// Background work that keeps this turn open after its answer.
+    ///
+    /// A one-shot process dies with its turn, so all of it does. A retained
+    /// process outlives the turn and is parked with whatever still runs, so
+    /// only background subagents (and kinds this adapter does not know) hold
+    /// the turn: their results are part of the answer. A background shell
+    /// does not -- a dev server or watcher never ends, and holding the turn
+    /// for it left the conversation "running" with nothing to show. When a
+    /// shell ends, Claude's answer to its notification arrives while the
+    /// process is parked and is resumed as a continuation.
+    fn holds_turn_open(&self) -> bool {
+        if !self.retained_turn {
+            return !self.background_task_ids.is_empty();
+        }
+        self.background_task_ids
+            .iter()
+            .any(|id| self.tasks.get(id).is_none_or(|task| task.kind != "shell"))
+    }
 }
 
 /// Generate a random RFC 4122 version 4 UUID for a submitted user message.
@@ -1137,6 +1156,11 @@ impl AgentAdapter for Claude {
         })
     }
 
+    fn retained_follow_up_pending(&self, state: &AdapterState) -> bool {
+        peek_native_state(state)
+            .is_some_and(|native| native.follow_up_active || native.awaiting_follow_up)
+    }
+
     fn retained_background_summary(&self, state: &AdapterState) -> Vec<String> {
         let Some(native) = peek_native_state(state) else {
             return Vec::new();
@@ -1216,7 +1240,7 @@ impl AgentAdapter for Claude {
             .is_some_and(|native| {
                 native.retained_turn
                     && native.awaiting_follow_up
-                    && native.background_task_ids.is_empty()
+                    && !native.holds_turn_open()
                     && native.own_commands_done()
             })
             .then_some(FOLLOW_UP_GRACE)
@@ -1692,9 +1716,9 @@ impl AgentAdapter for Claude {
                 // clears and the provider exits. A retained turn also waits for
                 // every message it submitted: a message sent mid-turn may be
                 // answered by this result or by a later exchange.
-                output.terminal = native.background_task_ids.is_empty()
+                output.terminal = !native.holds_turn_open()
                     && (!native.retained_turn || native.own_commands_done());
-                if !native.background_task_ids.is_empty() {
+                if native.holds_turn_open() {
                     output
                         .events
                         .push(TurnEvent::ReplyFinishedWithBackgroundTasks {
@@ -1803,7 +1827,7 @@ impl AgentAdapter for Claude {
                         && !native.interrupting
                         && !native.awaiting_follow_up
                         && native.answered()
-                        && native.background_task_ids.is_empty()
+                        && !native.holds_turn_open()
                     {
                         output.terminal = true;
                     }
@@ -2531,15 +2555,21 @@ fn is_terminal_task_status(status: &str) -> bool {
 /// so a follow-up answer is still captured. A retained process outlives the
 /// turn: Claude answers each task notification with a follow-up
 /// `init`…`result` exchange, so the turn ends at that result instead of here,
-/// or after [`FOLLOW_UP_GRACE`] if Claude stays silent.
-fn background_work_drained(native: &mut ClaudeNativeState, output: &mut AdapterOutput) {
-    if !native.result_seen || !native.background_task_ids.is_empty() {
+/// or after [`FOLLOW_UP_GRACE`] if Claude stays silent. That includes a shell
+/// ending while other shells still run, since shells never hold a retained
+/// turn -- so only a task that actually `ended` here starts that wait.
+fn background_work_drained(
+    native: &mut ClaudeNativeState,
+    output: &mut AdapterOutput,
+    ended: bool,
+) {
+    if !native.result_seen || native.holds_turn_open() {
         return;
     }
-    if native.retained_turn {
-        native.awaiting_follow_up = !native.follow_up_active;
-    } else {
+    if !native.retained_turn {
         output.terminal = true;
+    } else if ended {
+        native.awaiting_follow_up = !native.follow_up_active;
     }
 }
 
@@ -2703,8 +2733,8 @@ fn translate_system_task(
             // a `task_notification` for it (killed tasks), so holding its id
             // would keep a finished reply's turn open with nothing running.
             if status.as_deref().is_some_and(is_terminal_task_status) {
-                native.background_task_ids.remove(task_id);
-                background_work_drained(native, output);
+                let ended = native.background_task_ids.remove(task_id);
+                background_work_drained(native, output, ended);
             }
             output.events.push(TurnEvent::TaskActivity {
                 activity: AgentTaskActivity {
@@ -2872,8 +2902,8 @@ fn translate_system_task(
             }
             let agent_type = task.agent_type.clone();
             native.tasks.insert(task_id.to_string(), task);
-            native.background_task_ids.remove(task_id);
-            background_work_drained(native, output);
+            let ended = native.background_task_ids.remove(task_id);
+            background_work_drained(native, output, ended);
             let kind = match status.as_str() {
                 "failed" => AgentTaskActivityKind::Failed,
                 "stopped" | "killed" => AgentTaskActivityKind::Stopped,
@@ -2929,8 +2959,12 @@ fn translate_system_task(
                     }
                 }
             }
+            let ended = native
+                .background_task_ids
+                .iter()
+                .any(|task_id| !live_ids.contains(task_id));
             native.background_task_ids = live_ids;
-            background_work_drained(native, output);
+            background_work_drained(native, output, ended);
             emit_tasks(native, output);
         }
         _ => {}

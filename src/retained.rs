@@ -162,6 +162,12 @@ pub enum RuntimeInvocationKind {
     Turn,
     /// A provider-native manual context compaction.
     ManualCompaction,
+    /// The provider's own answer to background work that finished after the
+    /// previous invocation ended, announced by
+    /// [`crate::AgentRuntime::subscribe_background_follow_ups`]. Submits no prompt;
+    /// fails with `InvalidRequest` and [`DeliveryState::NotSent`] when there
+    /// is nothing to continue.
+    Continuation,
 }
 
 /// One invocation submitted to a retained runtime.
@@ -1662,6 +1668,7 @@ impl RuntimeEntry {
             cancellation,
             sandbox: self.spec.sandbox.clone(),
             required_sandbox_capabilities: self.spec.required_sandbox_capabilities,
+            continuation: input.invocation_kind == RuntimeInvocationKind::Continuation,
         }
     }
 
@@ -1670,6 +1677,14 @@ impl RuntimeEntry {
         input: &TurnInput,
         has_interaction_handler: bool,
     ) -> RetainedRuntimeResult<()> {
+        if input.invocation_kind == RuntimeInvocationKind::Continuation
+            && (!input.prompt.is_empty() || !input.attachments.is_empty())
+        {
+            return Err(self.invalid_input(
+                &input.invocation_id,
+                "a continuation submits no prompt or attachments",
+            ));
+        }
         if input.invocation_kind == RuntimeInvocationKind::ManualCompaction {
             if !input.attachments.is_empty() {
                 return Err(self.invalid_input(
@@ -2035,7 +2050,7 @@ fn runtime_error_to_failure(
 ) -> RuntimeFailure {
     let message = error.to_string();
     let (kind, retry, delivery, provider_code) = match error {
-        RuntimeError::InvalidRequest { .. } => (
+        RuntimeError::InvalidRequest { .. } | RuntimeError::NothingToContinue { .. } => (
             RuntimeFailureKind::InvalidRequest,
             RetryAdvice::Never,
             DeliveryState::NotSent,

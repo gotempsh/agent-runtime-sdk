@@ -137,7 +137,12 @@ struct CodexProcessSupervisorInner {
     config: ProviderProcessRetention,
     permits: Arc<Semaphore>,
     processes: AsyncMutex<HashMap<crate::lifecycle::RuntimeId, Arc<RetainedCodexProcess>>>,
+    /// Runtimes whose parked process started answering background work.
+    follow_ups: tokio::sync::broadcast::Sender<crate::lifecycle::RuntimeId>,
 }
+
+/// Announcements a slow subscriber may fall behind by before missing some.
+const FOLLOW_UP_ANNOUNCEMENTS: usize = 64;
 
 impl CodexProcessSupervisor {
     fn new(config: ProviderProcessRetention) -> Self {
@@ -146,6 +151,7 @@ impl CodexProcessSupervisor {
                 config,
                 permits: Arc::new(Semaphore::new(config.max_processes)),
                 processes: AsyncMutex::new(HashMap::new()),
+                follow_ups: tokio::sync::broadcast::channel(FOLLOW_UP_ANNOUNCEMENTS).0,
             }),
         }
     }
@@ -507,6 +513,10 @@ struct ParkedOutput {
     /// Requests refused because too many were already waiting.
     declined_interactions: u64,
     interactions: Vec<InteractionRequest>,
+    /// The provider started answering background work on its own while
+    /// parked ([`AgentAdapter::retained_follow_up_pending`]), so a
+    /// continuation has an answer to deliver even if it already finished.
+    follow_up: bool,
 }
 
 impl ParkedOutput {
@@ -625,8 +635,9 @@ impl RetainedHandoff {
 
 /// How a retained turn released its process.
 enum RetainedTurnEnd {
-    /// The turn reached its terminal frame.
-    Completed(TurnResult),
+    /// The turn reached its terminal frame, with the parser state to park
+    /// when background work outlives it.
+    Completed(TurnResult, Option<Box<AdapterState>>),
     /// The turn yielded its live process to the next turn.
     HandedOff(TurnResult, Box<AdapterState>),
     /// The turn was interrupted and its provider unwound cooperatively, so
@@ -800,6 +811,23 @@ impl RetainedCodexProcess {
         let io = self.io.lock().await;
         (io.is_some() && self.usable.load(Ordering::Acquire))
             .then(|| self.generation.fetch_add(1, Ordering::AcqRel) + 1)
+    }
+
+    /// Whether this process is parked with the provider's own answer to
+    /// background work, started or already finished, for a continuation.
+    fn continuation_ready(&self, adapter: &dyn AgentAdapter) -> bool {
+        let answered_while_parked = self
+            .handoff
+            .parked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .follow_up;
+        self.handoff
+            .inherited
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|state| answered_while_parked || adapter.retained_follow_up_pending(state))
     }
 
     /// Mark the process unusable unless a turn claimed it after `generation`.
@@ -1146,6 +1174,7 @@ async fn supervise_parked_retained_process(
     };
     let mut idle_since: Option<tokio::time::Instant> = None;
     let mut last_frame = tokio::time::Instant::now();
+    let mut announced = false;
     loop {
         let healthy = {
             let mut io = retained.io.lock().await;
@@ -1164,6 +1193,18 @@ async fn supervise_parked_retained_process(
         };
         if !healthy {
             break;
+        }
+        if !announced
+            && retained
+                .handoff
+                .parked
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .follow_up
+        {
+            announced = true;
+            // No subscriber is fine: the next turn delivers the answer.
+            let _ = supervisor.inner.follow_ups.send(runtime_id.clone());
         }
         let background = retained
             .handoff
@@ -1202,7 +1243,7 @@ async fn park_frame(
     io: &mut RetainedCodexIo,
     line: &str,
 ) -> bool {
-    let output = {
+    let (output, follow_up) = {
         let mut inherited = handoff
             .inherited
             .lock()
@@ -1211,7 +1252,7 @@ async fn park_frame(
             return false;
         };
         match adapter.parse_line(line, state) {
-            Ok(output) => output,
+            Ok(output) => (output, adapter.retained_follow_up_pending(state)),
             Err(_) => return false,
         }
     };
@@ -1221,6 +1262,7 @@ async fn park_frame(
             .parked
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        parked.follow_up |= follow_up;
         let mut declined = false;
         if let Some(interaction) = output.interaction {
             if parked.interactions.len() < MAX_PARKED_INTERACTIONS {
@@ -1304,7 +1346,7 @@ async fn finish_retained_turn(
     adapter: &dyn AgentAdapter,
     request: &TurnRequest,
     events: &dyn EventSink,
-    mut state: AdapterState,
+    state: &mut AdapterState,
 ) -> Result<TurnResult> {
     let provider = request.provider;
     if let Some(failure) = state.terminal_failure.take() {
@@ -1324,7 +1366,26 @@ async fn finish_retained_turn(
             })
             .await?;
     }
-    Ok(state.result)
+    let result = std::mem::take(&mut state.result);
+    state.result.session_id.clone_from(&result.session_id);
+    Ok(result)
+}
+
+/// End a retained turn at its terminal frame. Background work the provider
+/// lets outlive the turn (Claude's background shells) keeps the process
+/// parked with the parser state, which a continuation or the next turn
+/// picks up; otherwise the process waits idle for the next turn.
+async fn complete_retained_turn(
+    adapter: &dyn AgentAdapter,
+    request: &TurnRequest,
+    events: &dyn EventSink,
+    mut state: AdapterState,
+) -> Result<RetainedTurnEnd> {
+    let result = finish_retained_turn(adapter, request, events, &mut state).await?;
+    let carried = adapter
+        .retained_background_work(&state)
+        .then(|| Box::new(state));
+    Ok(RetainedTurnEnd::Completed(result, carried))
 }
 
 /// Stop a running provider, preferring its own cooperative interrupt.
@@ -2034,6 +2095,25 @@ impl AgentRuntime {
     /// Create a runtime builder.
     pub fn builder() -> AgentRuntimeBuilder {
         AgentRuntimeBuilder::new()
+    }
+
+    /// Announces runtimes whose parked process started answering background
+    /// work on its own, after the turn that started that work ended.
+    ///
+    /// A retained Claude turn ends at its answer while background shells keep
+    /// running in the parked process. When one ends, Claude answers its
+    /// notification without a prompt. Start a
+    /// [`crate::retained::RuntimeInvocationKind::Continuation`] for the announced runtime
+    /// to stream that answer; otherwise it is delivered at the start of the
+    /// next turn, or dropped if the process expires first. Announced once per
+    /// parked period. Without process retention nothing is ever announced.
+    pub fn subscribe_background_follow_ups(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<crate::lifecycle::RuntimeId> {
+        match &self.codex_process_retention {
+            Some(supervisor) => supervisor.inner.follow_ups.subscribe(),
+            None => tokio::sync::broadcast::channel(1).1,
+        }
     }
 
     /// Inspect one compiled adapter inside the configured execution transport.
@@ -3414,6 +3494,12 @@ impl AgentRuntime {
         self.validate(&request)?;
         self.validate_working_directory(&request).await?;
         let provider = request.provider;
+        // Only a retained process can be parked with something to continue.
+        if request.continuation
+            && (retained_runtime_id.is_none() || !self.process_retention_enabled(provider))
+        {
+            return Err(RuntimeError::NothingToContinue { provider });
+        }
         let adapter = self
             .adapters
             .get(&provider)
@@ -3542,6 +3628,9 @@ impl AgentRuntime {
         self.validate(&request)?;
         self.validate_working_directory(&request).await?;
         let provider = request.provider;
+        if request.continuation {
+            return Err(RuntimeError::NothingToContinue { provider });
+        }
         let adapter = self
             .adapters
             .get(&provider)
@@ -3729,7 +3818,8 @@ impl AgentRuntime {
     }
 
     fn validate(&self, request: &TurnRequest) -> Result<()> {
-        if request.prompt.trim().is_empty() {
+        // A continuation submits no prompt.
+        if !request.continuation && request.prompt.trim().is_empty() {
             return Err(RuntimeError::InvalidRequest {
                 field: "prompt",
                 message: "must not be empty".to_string(),
@@ -3832,6 +3922,15 @@ impl AgentRuntime {
             .await
             .get(runtime_id)
             .cloned();
+        // Checked before anything is prepared: a continuation never starts,
+        // replaces or prompts a process.
+        if request.continuation
+            && !initial_process
+                .as_ref()
+                .is_some_and(|process| process.continuation_ready(adapter.as_ref()))
+        {
+            return Err(RuntimeError::NothingToContinue { provider });
+        }
         let reserved_permit = if initial_process.is_some() {
             None
         } else {
@@ -3937,7 +4036,11 @@ impl AgentRuntime {
             let mut processes = supervisor.inner.processes.lock().await;
             match processes.get(runtime_id) {
                 Some(process) if process.usable.load(Ordering::Acquire) => {
-                    let reuse = if process.fingerprint == fingerprint {
+                    // A continuation resumes the parked process as it is;
+                    // this turn's settings apply from the next prompt on.
+                    let reuse = if request.continuation {
+                        Ok(Vec::new())
+                    } else if process.fingerprint == fingerprint {
                         match (&process.claude_settings, &claude_live) {
                             (Some(settings), Some((wanted, _))) => settings.switch_to(wanted),
                             _ => Ok(Vec::new()),
@@ -4090,6 +4193,20 @@ impl AgentRuntime {
                     claimed_generation.and_then(|_| candidate.handoff.take_inherited());
                 if inherited_state.is_some() {
                     parked_output = candidate.handoff.take_parked();
+                }
+                if request.continuation && inherited_state.is_none() {
+                    // Retired or claimed since the check above.
+                    if let Some(generation) = claimed_generation {
+                        self.retain_idle_process(
+                            adapter.clone(),
+                            supervisor,
+                            runtime_id,
+                            Arc::clone(&candidate),
+                            generation,
+                            provider,
+                        );
+                    }
+                    return Err(RuntimeError::NothingToContinue { provider });
                 }
             }
             if let Some(candidate) = existing
@@ -4462,9 +4579,18 @@ impl AgentRuntime {
         })?;
         let reused = generation > 1;
         if let Some(previous) = inherited_state.take() {
-            adapter.inherit_retained_handoff(previous, &mut state);
+            if request.continuation {
+                // The answer belongs to the exchange the parked state tracks,
+                // and that state already holds what was parsed of it.
+                state = previous;
+                if state.result.session_id.is_none() {
+                    state.result.session_id.clone_from(&request.session_id);
+                }
+            } else {
+                adapter.inherit_retained_handoff(previous, &mut state);
+            }
         }
-        if reused {
+        if reused && !request.continuation {
             if provider == Provider::OpenCode {
                 if let Some((writer, reader)) = prepared_protocol_streams.take() {
                     io.stdin = writer;
@@ -4531,8 +4657,15 @@ impl AgentRuntime {
         for event in parked_output.events {
             events.emit(event).await?;
         }
-        let result = self
-            .drive_retained_codex_turn(
+        // A continuation whose answer finished while parked has nothing left
+        // to read: the events above were all of it.
+        let result = if request.continuation
+            && parked_output.interactions.is_empty()
+            && !adapter.retained_follow_up_pending(&state)
+        {
+            complete_retained_turn(adapter.as_ref(), request, events, state).await
+        } else {
+            self.drive_retained_codex_turn(
                 adapter.as_ref(),
                 request,
                 events,
@@ -4545,7 +4678,8 @@ impl AgentRuntime {
                 prefetched_lines,
                 parked_output.interactions,
             )
-            .await;
+            .await
+        };
         drop(io_guard);
         retained.handoff.ready.store(false, Ordering::Release);
         match result {
@@ -4592,17 +4726,29 @@ impl AgentRuntime {
                 }
                 Err(RuntimeError::Cancelled { provider })
             }
-            Ok(RetainedTurnEnd::Completed(result)) => {
+            Ok(RetainedTurnEnd::Completed(result, carried)) => {
                 *retained.session_id.lock().await = result.session_id.clone();
                 cleanup.disarm();
-                self.retain_idle_process(
-                    adapter.clone(),
-                    supervisor,
-                    runtime_id,
-                    retained,
-                    generation,
-                    provider,
-                );
+                if let Some(carried) = carried {
+                    self.park_retained_process(
+                        adapter.clone(),
+                        supervisor,
+                        runtime_id,
+                        retained,
+                        generation,
+                        provider,
+                        *carried,
+                    );
+                } else {
+                    self.retain_idle_process(
+                        adapter.clone(),
+                        supervisor,
+                        runtime_id,
+                        retained,
+                        generation,
+                        provider,
+                    );
+                }
                 Ok(result)
             }
             Err(error) => Err(error),
@@ -4737,7 +4883,9 @@ impl AgentRuntime {
     ) -> Result<RetainedTurnEnd> {
         let provider = request.provider;
         let mut first_output = true;
-        let mut saw_semantic_activity = false;
+        // A continuation resumes an exchange already under way, so it is
+        // past initialization from its first moment.
+        let mut saw_semantic_activity = request.continuation;
         let mut turn_submitted = provider != Provider::OpenCode;
         let mut last_semantic_activity = tokio::time::Instant::now();
         let mut first_text = true;
@@ -4819,9 +4967,7 @@ impl AgentRuntime {
                         continue;
                     }
                     () = tokio::time::sleep_until(quiet_completion.unwrap_or(deadline)), if quiet_completion.is_some() => {
-                        return finish_retained_turn(adapter, request, events, state)
-                            .await
-                            .map(RetainedTurnEnd::Completed);
+                        return complete_retained_turn(adapter, request, events, state).await;
                     }
                 }
                 // Finish a frame that has begun even if the turn is cancelled
@@ -4947,9 +5093,7 @@ impl AgentRuntime {
                 }
             }
             if output.terminal {
-                return finish_retained_turn(adapter, request, events, state)
-                    .await
-                    .map(RetainedTurnEnd::Completed);
+                return complete_retained_turn(adapter, request, events, state).await;
             }
             if request.cancellation.is_cancelled() {
                 return self
