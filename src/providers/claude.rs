@@ -2723,6 +2723,10 @@ fn translate_system_task(
             }
             let agent_type = task.agent_type.clone();
             native.tasks.insert(task_id.to_string(), task);
+            // Read before the patch moves the task in or out of the set, so a
+            // terminal patch that also clears `is_backgrounded` still counts
+            // as background work ending.
+            let was_background = native.background_task_ids.contains(task_id);
             match patch
                 .and_then(|patch| patch.get("is_backgrounded"))
                 .and_then(Value::as_bool)
@@ -2739,7 +2743,7 @@ fn translate_system_task(
             // a `task_notification` for it (killed tasks), so holding its id
             // would keep a finished reply's turn open with nothing running.
             if status.as_deref().is_some_and(is_terminal_task_status) {
-                let ended = native.background_task_ids.remove(task_id);
+                let ended = native.background_task_ids.remove(task_id) || was_background;
                 background_work_drained(native, output, ended);
             }
             output.events.push(TurnEvent::TaskActivity {
@@ -4663,6 +4667,63 @@ setTimeout(() => {
         let mut state = AdapterState::default();
         adapter.mark_retained_turn(&mut state);
         state
+    }
+
+    /// A killed or finished subagent can end with one `task_updated` patch
+    /// that also clears `is_backgrounded`. That patch removes the id before
+    /// the terminal check, which must still count it as background work
+    /// ending, or the retained turn waits for an answer that already came.
+    #[test]
+    fn a_terminal_patch_that_clears_backgrounding_still_drains_the_turn() {
+        let adapter = Claude::default();
+        let mut state = retained_state(&adapter);
+        for line in [BACKGROUND_STARTED, PARENT_RESULT] {
+            assert!(!adapter.parse_line(line, &mut state).unwrap().terminal);
+        }
+        assert!(adapter.retained_completion_grace(&state).is_none());
+        adapter
+            .parse_line(
+                r#"{"type":"system","subtype":"task_updated","task_id":"agent-bg-1","patch":{"status":"killed","is_backgrounded":false}}"#,
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            adapter.retained_completion_grace(&state).is_some(),
+            "the drained turn ends after the follow-up grace"
+        );
+        assert!(adapter.retained_follow_up_pending(&state));
+    }
+
+    /// Shells never hold a retained turn, and a parked process keeps them:
+    /// one ending (here, silently) must not let the others be retired.
+    #[test]
+    fn a_parked_process_reports_every_live_shell_after_one_ends() {
+        let adapter = Claude::default();
+        let mut state = retained_state(&adapter);
+        for line in [
+            r#"{"type":"system","subtype":"task_started","task_id":"sh-a","tool_use_id":"toolu_a","description":"Run tests","task_type":"local_bash","is_backgrounded":true}"#,
+            r#"{"type":"system","subtype":"task_started","task_id":"sh-b","tool_use_id":"toolu_b","description":"Run dev server","task_type":"local_bash","is_backgrounded":true}"#,
+        ] {
+            adapter.parse_line(line, &mut state).unwrap();
+        }
+        assert!(
+            adapter
+                .parse_line(PARENT_RESULT, &mut state)
+                .unwrap()
+                .terminal,
+            "shells alone do not hold a retained turn"
+        );
+        adapter
+            .parse_line(
+                r#"{"type":"system","subtype":"task_notification","task_id":"sh-a","status":"completed","summary":"Tests passed"}"#,
+                &mut state,
+            )
+            .unwrap();
+        assert!(adapter.retained_follow_up_pending(&state));
+        assert_eq!(
+            adapter.retained_background_task_ids(&state),
+            vec!["sh-b".to_string()]
+        );
     }
 
     #[test]

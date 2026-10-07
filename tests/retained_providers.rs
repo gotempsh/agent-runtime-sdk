@@ -53,6 +53,15 @@ def shell(follow_up):
   emit({'type':'system','subtype':'init','session_id':'fixture-session'})
   emit({'type':'assistant','parent_tool_use_id':None,'message':{'content':[{'type':'text','text':'SHELL-FOLLOWUP'}]}})
   result('SHELL-FOLLOWUP')
+def two_shells():
+ # Tests end silently on RELEASE (Claude does not answer), while the dev
+ # server keeps running until RELEASE+'-2'.
+ while not os.path.exists(RELEASE):time.sleep(.02)
+ emit({'type':'system','subtype':'task_notification','task_id':'sh-tests','status':'completed','summary':'tests passed'})
+ log('tests-finished')
+ while not os.path.exists(RELEASE+'-2'):time.sleep(.02)
+ emit({'type':'system','subtype':'task_notification','task_id':'sh-dev','status':'completed','summary':'server exited'})
+ log('dev-finished')
 log('spawn')
 for line in sys.stdin:
  frame=json.loads(line)
@@ -78,6 +87,13 @@ for line in sys.stdin:
    emit({'type':'assistant','parent_tool_use_id':None,'message':{'content':[{'type':'text','text':'LAUNCHED'}]}})
    result('LAUNCHED')
    thread=threading.Thread(target=subagent,args=(prompt=='spawn-bg',),daemon=True)
+   BACKGROUND.append(thread);thread.start()
+   continue
+  if prompt=='spawn-two-shells':
+   emit({'type':'system','subtype':'task_started','task_id':'sh-tests','tool_use_id':'toolu_t','description':'Run tests','task_type':'local_bash','is_backgrounded':True})
+   emit({'type':'system','subtype':'task_started','task_id':'sh-dev','tool_use_id':'toolu_d','description':'Run dev server','task_type':'local_bash','is_backgrounded':True})
+   result('STARTED-BOTH')
+   thread=threading.Thread(target=two_shells,daemon=True)
    BACKGROUND.append(thread);thread.start()
    continue
   if prompt=='spawn-shell':
@@ -750,5 +766,36 @@ async fn claude_answer_to_a_finished_shell_reaches_the_next_turn_without_a_conti
         "{events:?}"
     );
     assert_eq!(f.spawns().len(), 1, "{:?}", f.events());
+    f.dispose().await;
+}
+
+#[tokio::test]
+async fn claude_a_silent_shell_ending_never_retires_a_process_still_running_another() {
+    // A short idle timeout: once nothing runs, the parked process would be
+    // retired soon after Claude's follow-up grace.
+    let f = Fixture::new(true, Duration::from_millis(300)).await;
+    assert_eq!(
+        f.turn("one", "spawn-two-shells").await.unwrap().text,
+        "STARTED-BOTH"
+    );
+    f.release_background();
+    f.wait_for_log("tests-finished").await;
+    // Past the follow-up grace (3 s) and the idle timeout.
+    tokio::time::sleep(Duration::from_millis(4_500)).await;
+    let runtime_id = RuntimeId::new("claude-native").unwrap();
+    assert_eq!(
+        f.runtime.parked_background_tasks(&runtime_id).await,
+        vec!["sh-dev".to_string()],
+        "the dev server's process must still be parked"
+    );
+    assert_eq!(f.logged("dev-finished"), 0);
+    assert!(f
+        .turn("two", "second")
+        .await
+        .unwrap()
+        .text
+        .contains("reply:second"));
+    assert_eq!(f.spawns().len(), 1, "{:?}", f.events());
+    fs::write(format!("{}-2", f.release.display()), b"done").unwrap();
     f.dispose().await;
 }

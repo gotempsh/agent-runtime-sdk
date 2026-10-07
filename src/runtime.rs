@@ -554,17 +554,20 @@ impl ParkedOutput {
 
 /// Whether a parked process still has background work to wait for.
 ///
-/// Drained work only waits for the provider's answer to it, and only for the
-/// quiet grace a running turn would give it, measured from the last frame.
+/// A live background task always does: the grace below only bounds how long
+/// to wait for the provider's answer to work that already drained, measured
+/// from the last frame, and must never retire a process whose other shells
+/// (a dev server) still run.
 fn parked_work_remains(
     adapter: &dyn AgentAdapter,
     state: &AdapterState,
     since_last_frame: Duration,
 ) -> bool {
-    adapter.retained_background_work(state)
-        && adapter
-            .retained_completion_grace(state)
-            .is_none_or(|grace| since_last_frame < grace)
+    !adapter.retained_background_task_ids(state).is_empty()
+        || (adapter.retained_background_work(state)
+            && adapter
+                .retained_completion_grace(state)
+                .is_none_or(|grace| since_last_frame < grace))
 }
 
 /// Events buffered for the next turn while a process is parked.
@@ -4454,6 +4457,12 @@ impl AgentRuntime {
                 candidate.terminate().await?;
                 existing = None;
             }
+        }
+        // Whatever retired or replaced the parked process since the check on
+        // entry, a continuation never starts a new one: it would have nothing
+        // to resume and would send the provider an empty prompt.
+        if request.continuation && inherited_state.is_none() {
+            return Err(RuntimeError::NothingToContinue { provider });
         }
         let retained = if let Some(existing) = existing {
             existing
