@@ -458,6 +458,7 @@ async fn switch_claude_settings(
 }
 
 struct RetainedCodexProcess {
+    provider: Provider,
     fingerprint: RetainedCodexFingerprint,
     /// Claude's switchable settings; `None` for other providers.
     claude_settings: Option<ClaudeProcessSettings>,
@@ -2114,6 +2115,47 @@ impl AgentRuntime {
             Some(supervisor) => supervisor.inner.follow_ups.subscribe(),
             None => tokio::sync::broadcast::channel(1).1,
         }
+    }
+
+    /// Ids of the background tasks still running in `runtime_id`'s parked
+    /// process, as the provider reported them (Claude's task ids).
+    ///
+    /// Empty when no process is parked for the runtime: none was retained,
+    /// it was terminated, or a turn currently owns it. Read it after a turn
+    /// ends (an interrupt has settled once `interrupt` returns) to tell the
+    /// tasks that outlived the turn from those that ended with it.
+    pub async fn parked_background_tasks(
+        &self,
+        runtime_id: &crate::lifecycle::RuntimeId,
+    ) -> Vec<String> {
+        let Some(supervisor) = &self.codex_process_retention else {
+            return Vec::new();
+        };
+        let Some(process) = supervisor
+            .inner
+            .processes
+            .lock()
+            .await
+            .get(runtime_id)
+            .cloned()
+        else {
+            return Vec::new();
+        };
+        if !process.usable.load(Ordering::Acquire) {
+            return Vec::new();
+        }
+        let Some(adapter) = self.adapters.get(&process.provider) else {
+            return Vec::new();
+        };
+        let inherited = process
+            .handoff
+            .inherited
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inherited
+            .as_ref()
+            .map(|state| adapter.retained_background_task_ids(state))
+            .unwrap_or_default()
     }
 
     /// Inspect one compiled adapter inside the configured execution transport.
@@ -4530,6 +4572,7 @@ impl AgentRuntime {
                 }
             };
             let retained = Arc::new(RetainedCodexProcess {
+                provider,
                 fingerprint,
                 claude_settings: claude_live.map(|(launch, bypass_allowed)| {
                     ClaudeProcessSettings {

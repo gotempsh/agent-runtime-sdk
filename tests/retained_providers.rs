@@ -632,6 +632,12 @@ async fn claude_background_shell_does_not_hold_its_turn() {
     assert_eq!(result.text, "SERVING");
     f.wait_for_log("shell-start").await;
     assert_eq!(f.logged("shell-finished"), 0, "the shell is still running");
+    let runtime_id = RuntimeId::new("claude-native").unwrap();
+    assert_eq!(
+        f.runtime.parked_background_tasks(&runtime_id).await,
+        vec!["sh-1".to_string()],
+        "the application can tell which tasks outlived the turn"
+    );
 
     // The next turn takes over the same process, shell included.
     let second = f.turn("two", "second").await.unwrap();
@@ -692,6 +698,13 @@ async fn claude_answer_to_a_finished_shell_is_announced_and_continued() {
         .expect_err("the answer was already delivered");
     assert_eq!(again.kind, RuntimeFailureKind::InvalidRequest);
     assert_eq!(again.delivery, DeliveryState::NotSent);
+    assert!(
+        f.runtime
+            .parked_background_tasks(&announced)
+            .await
+            .is_empty(),
+        "nothing is left running once the shell ended"
+    );
     assert_eq!(f.turn("two", "second").await.unwrap().text, "reply:second");
     assert_eq!(f.spawns().len(), 1, "{:?}", f.events());
     f.dispose().await;

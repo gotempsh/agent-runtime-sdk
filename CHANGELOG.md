@@ -23,6 +23,10 @@ Versioning and Keep a Changelog conventions.
   continuation with nothing to deliver fails with `NothingToContinue`
   (`InvalidRequest`, `NotSent`) before writing to the provider. Adapters opt
   in through `AgentAdapter::retained_follow_up_pending`; Claude does.
+- `AgentRuntime::parked_background_tasks` lists the provider task ids still
+  running in a runtime's parked process (`AgentAdapter::retained_background_task_ids`),
+  so an application can tell the tasks that outlived a finished or
+  interrupted turn from those that ended with it.
 
 - `TurnEvent::ToolCall { images }` and `ToolImage`: images a tool returned
   to the model (Claude's Read of an image file, an MCP screenshot) arrive as

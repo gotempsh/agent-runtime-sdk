@@ -546,6 +546,14 @@ pub trait AgentAdapter: Send + Sync {
         false
     }
 
+    /// Provider ids of the background tasks
+    /// [`retained_background_work`](Self::retained_background_work) reports
+    /// as still running, for [`crate::AgentRuntime::parked_background_tasks`].
+    fn retained_background_task_ids(&self, state: &AdapterState) -> Vec<String> {
+        let _ = state;
+        Vec::new()
+    }
+
     /// Short descriptions of the background work
     /// [`retained_background_work`](Self::retained_background_work) reports,
     /// for telling a caller what replacing the process would stop.

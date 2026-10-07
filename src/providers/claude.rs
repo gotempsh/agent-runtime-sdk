@@ -1156,6 +1156,12 @@ impl AgentAdapter for Claude {
         })
     }
 
+    fn retained_background_task_ids(&self, state: &AdapterState) -> Vec<String> {
+        peek_native_state(state)
+            .map(|native| native.background_task_ids.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
     fn retained_follow_up_pending(&self, state: &AdapterState) -> bool {
         peek_native_state(state)
             .is_some_and(|native| native.follow_up_active || native.awaiting_follow_up)
