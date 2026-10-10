@@ -406,6 +406,12 @@ struct ClaudeNativeState {
     background_task_ids: BTreeSet<String>,
     tool_use_to_task: BTreeMap<String, String>,
     tool_names: BTreeMap<String, String>,
+    /// Inputs of `Bash` calls still in flight. A background shell's result
+    /// is filed under its task, apart from the call that carried the
+    /// command, so the result repeats it. Only `Bash` inputs are kept: they
+    /// are small, while other tools' inputs can hold whole files.
+    #[serde(default)]
+    bash_inputs: BTreeMap<String, Value>,
     effective_permission_mode: Option<PermissionMode>,
     permission_mode_before_plan: Option<PermissionMode>,
     result_seen: bool,
@@ -1235,6 +1241,7 @@ impl AgentAdapter for Claude {
         // Names are dropped once a tool reports its result, so these are the
         // calls still in flight, whose results may reach the next turn.
         native.tool_names = previous.tool_names;
+        native.bash_inputs = previous.bash_inputs;
         native.effective_permission_mode = previous.effective_permission_mode;
         native.permission_mode_before_plan = previous.permission_mode_before_plan;
         native.lifecycle_seen = previous.lifecycle_seen;
@@ -1551,6 +1558,11 @@ impl AgentAdapter for Claude {
                                     .to_string();
                                 if let Some(id) = &id {
                                     native.tool_names.insert(id.clone(), name.clone());
+                                    if name == "Bash" {
+                                        if let Some(input) = block.get("input") {
+                                            native.bash_inputs.insert(id.clone(), input.clone());
+                                        }
+                                    }
                                 }
                                 output.events.push(TurnEvent::ToolCall {
                                     id,
@@ -1610,11 +1622,12 @@ impl AgentAdapter for Claude {
                             .tool_names
                             .remove(tool_use_id)
                             .unwrap_or_else(|| "tool".to_string());
+                        let bash_input = native.bash_inputs.remove(tool_use_id);
                         // Claude reports a local_bash task after its Bash
                         // tool_use; task_started links the tool ID to the
                         // task, so the result belongs to that shell task.
                         // Nested subagent calls keep their parent.
-                        let owning_task = task_id.clone().or_else(|| {
+                        let shell_task = if task_id.is_none() {
                             native.tool_use_to_task.get(tool_use_id).and_then(|id| {
                                 native
                                     .tasks
@@ -1622,7 +1635,13 @@ impl AgentAdapter for Claude {
                                     .filter(|task| task.kind == "shell")
                                     .map(|_| id.clone())
                             })
-                        });
+                        } else {
+                            None
+                        };
+                        // The started call carried no task, so the shell
+                        // task's history only learns its command here.
+                        let input = shell_task.as_ref().and(bash_input);
+                        let owning_task = task_id.clone().or(shell_task);
                         output.events.push(TurnEvent::ToolCall {
                             id: Some(tool_use_id.to_string()),
                             name: tool_name.clone(),
@@ -1631,7 +1650,7 @@ impl AgentAdapter for Claude {
                             } else {
                                 ToolCallStatus::Succeeded
                             },
-                            input: None,
+                            input,
                             output: (!failed).then(|| text.clone()),
                             error: failed.then_some(text),
                             task_id: owning_task,
@@ -4255,9 +4274,37 @@ setTimeout(() => {
             .unwrap();
         assert!(matches!(
             &completed.events[0],
-            TurnEvent::ToolCall { task_id: Some(id), output: Some(output), .. }
-                if id == "shell-1" && output == "/tmp"
+            TurnEvent::ToolCall { task_id: Some(id), output: Some(output), input: Some(input), .. }
+                if id == "shell-1" && output == "/tmp" && input["command"] == "pwd"
         ));
+        assert!(peek_native_state(&state).unwrap().bash_inputs.is_empty());
+    }
+
+    #[test]
+    fn a_foreground_bash_result_does_not_repeat_its_input() {
+        let adapter = Claude::default();
+        let mut state = AdapterState::default();
+        adapter
+            .parse_line(
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_bash","name":"Bash","input":{"command":"pwd"}}]}}"#,
+                &mut state,
+            )
+            .unwrap();
+        let completed = adapter
+            .parse_line(
+                r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_bash","content":"/tmp"}]}}"#,
+                &mut state,
+            )
+            .unwrap();
+        assert!(matches!(
+            &completed.events[0],
+            TurnEvent::ToolCall {
+                task_id: None,
+                input: None,
+                ..
+            }
+        ));
+        assert!(peek_native_state(&state).unwrap().bash_inputs.is_empty());
     }
 
     #[test]
