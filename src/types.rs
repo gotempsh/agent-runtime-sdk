@@ -699,6 +699,11 @@ pub struct AgentTask {
     pub status: String,
     /// Provider-native subagent type when reported.
     pub agent_type: Option<String>,
+    /// Model a subagent runs on, as the provider reports it in the
+    /// subagent's own messages. `None` until its first message arrives, and
+    /// for tasks that are not model-driven, such as shells.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     /// Terminal failure summary when reported.
     pub error: Option<String>,
     /// Latest bounded progress or terminal summary.

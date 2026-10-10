@@ -1532,6 +1532,9 @@ impl AgentAdapter for Claude {
                     &native,
                     value.get("parent_tool_use_id").and_then(Value::as_str),
                 );
+                if record_subagent_model(&mut native, task_id.as_deref(), &value) {
+                    emit_tasks(&native, &mut output);
+                }
                 if let Some(blocks) = value.pointer("/message/content").and_then(Value::as_array) {
                     for block in blocks {
                         match block.get("type").and_then(Value::as_str) {
@@ -2286,6 +2289,32 @@ fn translate_compaction(value: &Value, state: &mut AdapterState, output: &mut Ad
     }
 }
 
+/// Records the model a subagent's message reports on its task. Claude Code
+/// names the model on every message, including a subagent that inherits the
+/// parent's, so this is exact where the `Agent` call's `model` input is only
+/// an alias or absent. Returns whether the task changed.
+fn record_subagent_model(
+    native: &mut ClaudeNativeState,
+    task_id: Option<&str>,
+    message: &Value,
+) -> bool {
+    let Some(task) = task_id.and_then(|id| native.tasks.get_mut(id)) else {
+        return false;
+    };
+    let Some(model) = message
+        .pointer("/message/model")
+        .and_then(Value::as_str)
+        .filter(|model| !model.is_empty() && *model != "<synthetic>")
+    else {
+        return false;
+    };
+    if task.model.as_deref() == Some(model) {
+        return false;
+    }
+    task.model = Some(bounded(model));
+    true
+}
+
 fn task_id_for(native: &ClaudeNativeState, tool_use_id: Option<&str>) -> Option<String> {
     tool_use_id.map(|id| {
         native
@@ -2329,6 +2358,7 @@ fn fallback_task(id: &str) -> AgentTask {
         description: "Background task".to_string(),
         status: "running".to_string(),
         agent_type: None,
+        model: None,
         error: None,
         summary: None,
         workflow: None,
@@ -2661,10 +2691,9 @@ fn translate_system_task(
             let task_type = value.get("task_type").and_then(Value::as_str);
             // The Workflow tool's result can arrive first and already record
             // where the run writes its transcripts.
-            let mut workflow = native
-                .tasks
-                .get(task_id)
-                .and_then(|task| task.workflow.clone());
+            let known = native.tasks.get(task_id);
+            let mut workflow = known.and_then(|task| task.workflow.clone());
+            let model = known.and_then(|task| task.model.clone());
             if task_type == Some("local_workflow") {
                 let workflow = workflow.get_or_insert_with(AgentWorkflow::default);
                 if let Some(name) = value.get("workflow_name").and_then(Value::as_str) {
@@ -2679,6 +2708,7 @@ fn translate_system_task(
                     description: description.clone(),
                     status: "running".to_string(),
                     agent_type: agent_type.clone(),
+                    model,
                     error: None,
                     summary: None,
                     workflow,
@@ -4584,6 +4614,87 @@ setTimeout(() => {
         }
         assert_eq!(state.result.text, "Checking.\n\nDone.");
         assert_eq!(streamed_text(&events), state.result.text);
+    }
+
+    #[test]
+    fn a_subagent_task_reports_the_model_its_messages_name() {
+        let adapter = Claude::default();
+        let mut state = AdapterState::default();
+        let mut parse = |line: &str| adapter.parse_line(line, &mut state).unwrap().events;
+        let snapshot = |events: &[TurnEvent]| {
+            events.iter().find_map(|event| match event {
+                TurnEvent::TasksChanged { tasks } => Some(tasks.clone()),
+                _ => None,
+            })
+        };
+
+        parse(r#"{"type":"system","subtype":"init","session_id":"s","model":"claude-opus-5-5"}"#);
+        let started = parse(
+            r#"{"type":"system","subtype":"task_started","task_id":"agent-1","tool_use_id":"toolu_agent","description":"Explore","subagent_type":"Explore","task_type":"local_agent"}"#,
+        );
+        assert_eq!(snapshot(&started).unwrap()[0].model, None);
+
+        // The parent's own messages never name a task's model.
+        let parent = parse(
+            r#"{"type":"assistant","message":{"model":"claude-opus-5-5","content":[{"type":"text","text":"Delegating."}]}}"#,
+        );
+        assert!(snapshot(&parent).is_none());
+
+        let first = parse(
+            r#"{"type":"assistant","parent_tool_use_id":"toolu_agent","message":{"model":"claude-haiku-5-5","content":[{"type":"tool_use","id":"toolu_read","name":"Read","input":{}}]}}"#,
+        );
+        let tasks = snapshot(&first).expect("learning the model updates the task");
+        assert_eq!(tasks[0].model.as_deref(), Some("claude-haiku-5-5"));
+
+        // Later messages on the same model do not re-announce the task, and
+        // placeholder models never replace the real one.
+        let again = parse(
+            r#"{"type":"assistant","parent_tool_use_id":"toolu_agent","message":{"model":"claude-haiku-5-5","content":[]}}"#,
+        );
+        assert!(snapshot(&again).is_none());
+        let synthetic = parse(
+            r#"{"type":"assistant","parent_tool_use_id":"toolu_agent","message":{"model":"<synthetic>","content":[]}}"#,
+        );
+        assert!(snapshot(&synthetic).is_none());
+
+        // A message naming a different model (a fallback, say) updates it.
+        let switched = parse(
+            r#"{"type":"assistant","parent_tool_use_id":"toolu_agent","message":{"model":"claude-sonnet-5-5","content":[]}}"#,
+        );
+        let tasks = snapshot(&switched).expect("a new model updates the task");
+        assert_eq!(tasks[0].model.as_deref(), Some("claude-sonnet-5-5"));
+
+        // Claude can repeat task_started for a task it already reported; the
+        // learned model must survive the re-insert.
+        let restarted = parse(
+            r#"{"type":"system","subtype":"task_started","task_id":"agent-1","tool_use_id":"toolu_agent","description":"Explore","subagent_type":"Explore","task_type":"local_agent"}"#,
+        );
+        let tasks = snapshot(&restarted).expect("task_started reports the task");
+        assert_eq!(tasks[0].model.as_deref(), Some("claude-sonnet-5-5"));
+
+        // A message for a task the adapter does not track changes nothing.
+        let unknown = parse(
+            r#"{"type":"assistant","parent_tool_use_id":"toolu_other","message":{"model":"claude-sonnet-5-5","content":[]}}"#,
+        );
+        assert!(snapshot(&unknown).is_none());
+        assert_eq!(
+            state.result.model.as_deref(),
+            Some("claude-opus-5-5"),
+            "a subagent's model never becomes the turn's model"
+        );
+    }
+
+    #[test]
+    fn a_task_without_a_model_serializes_as_before() {
+        let task = fallback_task("t");
+        let json = serde_json::to_value(&task).unwrap();
+        assert!(json.get("model").is_none());
+        let older: AgentTask = serde_json::from_value(serde_json::json!({
+            "id": "t", "kind": "subagent", "description": "d", "status": "running",
+            "agent_type": null, "error": null, "summary": null
+        }))
+        .unwrap();
+        assert_eq!(older.model, None);
     }
 
     #[test]
