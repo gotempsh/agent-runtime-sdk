@@ -16,6 +16,13 @@ Versioning and Keep a Changelog conventions.
 
 ### Added
 
+- `AgentTask::model`: the model a Claude Code subagent runs on, as its own
+  messages report it (for example `claude-haiku-5-5`), including a subagent
+  that inherits the parent's model. It is `None` until the subagent's first
+  message, after which a `TasksChanged` snapshot carries it. A subagent's
+  model never becomes the turn's model. The field is omitted from serialized
+  tasks when unknown, so recorded events still deserialize. Code that
+  constructs `AgentTask` with struct syntax must now set `model`.
 - Background follow-ups: `AgentRuntime::subscribe_background_follow_ups`
   announces a runtime whose parked process started answering background work
   on its own, and `RuntimeInvocationKind::Continuation` (`TurnRequest::continuation`)
