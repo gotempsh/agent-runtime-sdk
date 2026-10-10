@@ -4657,6 +4657,21 @@ setTimeout(() => {
         );
         assert!(snapshot(&synthetic).is_none());
 
+        // A message naming a different model (a fallback, say) updates it.
+        let switched = parse(
+            r#"{"type":"assistant","parent_tool_use_id":"toolu_agent","message":{"model":"claude-sonnet-5-5","content":[]}}"#,
+        );
+        let tasks = snapshot(&switched).expect("a new model updates the task");
+        assert_eq!(tasks[0].model.as_deref(), Some("claude-sonnet-5-5"));
+
+        // Claude can repeat task_started for a task it already reported; the
+        // learned model must survive the re-insert.
+        let restarted = parse(
+            r#"{"type":"system","subtype":"task_started","task_id":"agent-1","tool_use_id":"toolu_agent","description":"Explore","subagent_type":"Explore","task_type":"local_agent"}"#,
+        );
+        let tasks = snapshot(&restarted).expect("task_started reports the task");
+        assert_eq!(tasks[0].model.as_deref(), Some("claude-sonnet-5-5"));
+
         // A message for a task the adapter does not track changes nothing.
         let unknown = parse(
             r#"{"type":"assistant","parent_tool_use_id":"toolu_other","message":{"model":"claude-sonnet-5-5","content":[]}}"#,
