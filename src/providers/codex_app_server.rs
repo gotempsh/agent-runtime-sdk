@@ -2512,7 +2512,7 @@ mod tests {
             config_read,
             json!({"config": {"model": "gpt-5-codex", "mcp_servers": {"github": {"url": "x"}}}}),
         );
-        assert!(started.events.is_empty());
+        assert_eq!(started.events.len(), 0);
         let [thread_start] = writes(&started).try_into().unwrap();
         assert_eq!(thread_start["method"], "thread/start");
         let params = &thread_start["params"];
@@ -2680,7 +2680,7 @@ mod tests {
                 }],
                 "retained: {retained}"
             );
-            assert!(state.result.text.is_empty());
+            assert_eq!(state.result.text.len(), 0);
             assert!(state.result.reasoning.is_none());
             assert_eq!(state.result.usage, Usage::default());
             assert_eq!(state.result.model.as_deref(), None);
@@ -2929,7 +2929,7 @@ mod tests {
                 json!({"jsonrpc": "2.0", "method": "thread/name/updated",
                     "params": {"threadId": "thread-other", "threadName": "Not ours"}}),
             );
-            assert!(other.events.is_empty());
+            assert_eq!(other.events.len(), 0);
 
             // The hand-written name wins over the generated one.
             feed(

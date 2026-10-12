@@ -4363,7 +4363,7 @@ setTimeout(() => {
                     &mut state,
                 )
                 .unwrap();
-            assert!(output.writes.is_empty());
+            assert_eq!(output.writes.len(), 0);
         }
     }
 
@@ -4395,7 +4395,7 @@ setTimeout(() => {
                 &mut state,
             )
             .unwrap();
-        assert!(repeated.events.is_empty());
+        assert_eq!(repeated.events.len(), 0);
         let renamed = adapter
             .parse_line(
                 r#"{"type":"system","subtype":"session_title_changed","title":"Safari OAuth loop"}"#,
@@ -4420,7 +4420,7 @@ setTimeout(() => {
                 &mut state,
             )
             .unwrap();
-        assert!(output.events.is_empty());
+        assert_eq!(output.events.len(), 0);
         assert!(state.result.session_title.is_none());
     }
 
