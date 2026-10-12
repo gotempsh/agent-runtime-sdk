@@ -52,6 +52,10 @@ enum Script {
     DelayedIdleFrame,
     /// Complete, then send a server request while the process is idle.
     IdleServerRequest,
+    /// Open an unnamed thread and answer the hidden session-title thread the
+    /// way `codex app-server` does; the user's turn completes only once the
+    /// hidden thread is unsubscribed.
+    Title,
 }
 
 #[derive(Clone)]
@@ -261,6 +265,9 @@ async fn serve(
         let _ = output.flush().await;
     }
     let mut lines = BufReader::new(input).lines();
+    // `Script::Title` holds only the first user turn open until the hidden
+    // title thread is done; later turns titled nothing and finish at once.
+    let mut user_turns = 0;
     while let Ok(Some(line)) = lines.next_line().await {
         let Ok(message) = serde_json::from_str::<Value>(&line) else {
             continue;
@@ -268,8 +275,73 @@ async fn serve(
         frames.lock().unwrap().push(message.clone());
         let id = message.get("id").cloned().unwrap_or(Value::Null);
         let params = message.get("params").cloned().unwrap_or(Value::Null);
+        let hidden = params.get("threadId").and_then(Value::as_str) == Some("title-thread");
         match message.get("method").and_then(Value::as_str) {
             Some("initialized") => {}
+            Some("config/read") => {
+                send(
+                    &mut output,
+                    json!({"jsonrpc":"2.0","id":id,"result":{"config":{},"origins":{}}}),
+                )
+                .await;
+            }
+            Some("thread/start") if params.get("ephemeral") == Some(&json!(true)) => {
+                for frame in [
+                    json!({"jsonrpc":"2.0","method":"thread/started",
+                        "params":{"thread":{"id":"title-thread","ephemeral":true}}}),
+                    json!({"jsonrpc":"2.0","id":id,"result":{
+                        "thread":{"id":"title-thread"},"sandbox":{"type":"readOnly"},
+                        "model":params["model"]}}),
+                ] {
+                    send(&mut output, frame).await;
+                }
+            }
+            Some("turn/start") if hidden => {
+                for frame in [
+                    json!({"jsonrpc":"2.0","id":id,"result":{"turn":{"id":"title-turn"}}}),
+                    json!({"jsonrpc":"2.0","method":"item/agentMessage/delta",
+                        "params":{"threadId":"title-thread","turnId":"title-turn",
+                            "itemId":"title-item","delta":"{\"title\""}}),
+                    json!({"jsonrpc":"2.0","method":"item/completed",
+                        "params":{"threadId":"title-thread","turnId":"title-turn",
+                            "item":{"id":"title-item","type":"agentMessage",
+                                "text":"{\"title\":\"Review the workspace\"}"}}}),
+                    json!({"jsonrpc":"2.0","method":"thread/tokenUsage/updated",
+                        "params":{"threadId":"title-thread","turnId":"title-turn",
+                            "tokenUsage":{"last":{"inputTokens":9,"totalTokens":9}}}}),
+                    json!({"jsonrpc":"2.0","method":"turn/completed","params":{
+                        "threadId":"title-thread",
+                        "turn":{"id":"title-turn","status":"completed"}}}),
+                ] {
+                    send(&mut output, frame).await;
+                }
+            }
+            Some("thread/name/set") => {
+                send(&mut output, json!({"jsonrpc":"2.0","id":id,"result":{}})).await;
+                send(
+                    &mut output,
+                    json!({"jsonrpc":"2.0","method":"thread/name/updated","params":{
+                        "threadId":params["threadId"],"threadName":params["name"]}}),
+                )
+                .await;
+            }
+            Some("thread/unsubscribe") => {
+                send(
+                    &mut output,
+                    json!({"jsonrpc":"2.0","id":id,"result":{"status":"unsubscribed"}}),
+                )
+                .await;
+                for frame in completion_frames(script) {
+                    send(&mut output, frame).await;
+                }
+            }
+            Some("thread/start") if script == Script::Title => {
+                send(
+                    &mut output,
+                    json!({"jsonrpc":"2.0","id":id,"result":{"thread":{"id":"thread-fixture"}}}),
+                )
+                .await;
+            }
             Some("thread/start") => {
                 send(
                     &mut output,
@@ -338,6 +410,12 @@ async fn serve(
                 .await;
                 for frame in opening_frames(script) {
                     send(&mut output, frame).await;
+                }
+                user_turns += 1;
+                if script == Script::Title && user_turns > 1 {
+                    for frame in completion_frames(script) {
+                        send(&mut output, frame).await;
+                    }
                 }
             }
             // A reply to one of our server-initiated requests.
@@ -446,7 +524,7 @@ fn opening_frames(script: Script) -> Vec<Value> {
                         "options":[{"label":"Dark","description":"Dim"}]}]}
             })]
         }
-        Script::Interrupt | Script::Crash | Script::CompactionCrash => Vec::new(),
+        Script::Interrupt | Script::Crash | Script::CompactionCrash | Script::Title => Vec::new(),
     }
 }
 
@@ -1552,4 +1630,87 @@ async fn developer_instructions_reach_new_and_resumed_threads() {
             instructions
         );
     }
+}
+
+#[tokio::test]
+async fn a_requested_session_title_is_generated_on_a_hidden_thread_without_leaking_into_the_turn() {
+    let transport = AppServer::new(Script::Title);
+    let events = Collector::default();
+    let runtime = runtime(transport.clone());
+    let mut request = request();
+    request.request_session_title = Some("Review the workspace for stale config".into());
+
+    let result = runtime.run(request, &events, None).await.unwrap();
+
+    assert_eq!(
+        result.session_title.as_deref(),
+        Some("Review the workspace")
+    );
+    assert_eq!(result.text, "Working");
+    let events = events.events();
+    let titles = events
+        .iter()
+        .filter_map(|event| match event {
+            TurnEvent::SessionTitle { title } => Some(title.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(titles, ["Review the workspace"], "{events:?}");
+    let deltas = events
+        .iter()
+        .filter_map(|event| match event {
+            TurnEvent::TextDelta { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(deltas, ["Working"], "the hidden thread's text leaked");
+    assert_eq!(result.usage.input_tokens, Some(120));
+
+    let frames = transport.frames();
+    let hidden = frames
+        .iter()
+        .find(|frame| {
+            frame["method"] == "thread/start" && frame["params"]["ephemeral"] == json!(true)
+        })
+        .expect("a hidden thread was started");
+    assert_eq!(hidden["params"]["sandbox"], "read-only");
+    assert_eq!(
+        params_of(&frames, "thread/name/set").unwrap(),
+        json!({"threadId": "thread-fixture", "name": "Review the workspace"})
+    );
+    assert_eq!(
+        params_of(&frames, "thread/unsubscribe").unwrap(),
+        json!({"threadId": "title-thread"})
+    );
+}
+
+#[tokio::test]
+async fn a_retained_process_titles_a_session_and_stays_reusable() {
+    let transport = AppServer::new(Script::Title);
+    let runtime = retained_runtime(transport.clone(), Duration::from_secs(30));
+    let (_client, handle) = retained_handle(runtime).await;
+    let mut input = TurnInput::new(InvocationId::new("titled").unwrap(), "first");
+    input.request_session_title = Some("Review the workspace".into());
+
+    let first = handle
+        .start_turn(input)
+        .await
+        .unwrap()
+        .wait()
+        .await
+        .unwrap();
+    assert_eq!(first.session_title.as_deref(), Some("Review the workspace"));
+
+    let second = handle
+        .start_turn(TurnInput::new(
+            InvocationId::new("untitled").unwrap(),
+            "second",
+        ))
+        .await
+        .unwrap()
+        .wait()
+        .await
+        .unwrap();
+    assert_eq!(second.session_id.as_deref(), Some("thread-fixture"));
+    assert_eq!(transport.spawn_count(), 1);
 }

@@ -24,6 +24,24 @@ pub use opencode::{OpenCode, OpenCodeTurnMode};
 #[cfg(feature = "pi")]
 pub use pi::Pi;
 
+/// Reports a harness-provided session title once per distinct value:
+/// whitespace is collapsed and an empty title is ignored.
+#[cfg(any(feature = "claude", feature = "codex", feature = "opencode"))]
+pub(crate) fn report_session_title(
+    title: &str,
+    state: &mut crate::adapter::AdapterState,
+    output: &mut crate::adapter::AdapterOutput,
+) {
+    let title = title.split_whitespace().collect::<Vec<_>>().join(" ");
+    if title.is_empty() || state.result.session_title.as_deref() == Some(title.as_str()) {
+        return;
+    }
+    state.result.session_title = Some(title.clone());
+    output
+        .events
+        .push(crate::types::TurnEvent::SessionTitle { title });
+}
+
 #[cfg(any(feature = "claude", feature = "codex"))]
 use serde_json::Value;
 
