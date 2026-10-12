@@ -2923,7 +2923,7 @@ mod tests {
                 }],
                 "retained: {retained}"
             );
-            assert!(feed(&mut state, renamed).events.is_empty());
+            assert_eq!(feed(&mut state, renamed).events.len(), 0);
             let other = feed(
                 &mut state,
                 json!({"jsonrpc": "2.0", "method": "thread/name/updated",
