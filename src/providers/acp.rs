@@ -82,6 +82,8 @@ const MAX_AGENT_ID_BYTES: usize = 64;
 /// the runtime stops it. Node-based agents commonly keep their event loop
 /// alive after end-of-input.
 const EXIT_GRACE: Duration = Duration::from_secs(3);
+/// How long a probe waits for a stopped agent's stderr to close.
+const STDERR_DRAIN: Duration = Duration::from_secs(2);
 
 /// One ACP agent command the application makes available.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -172,6 +174,34 @@ impl AcpAgent {
         spec.interactive_stdin = true;
         spec
     }
+}
+
+/// Whether `path` is absolute on the machine that will run the agent.
+///
+/// ACP requires `cwd` to be absolute, and the agent starts inside the working
+/// directory, so a relative one would resolve a second time from there
+/// (`workspace` becoming `workspace/workspace`). The adapter cannot resolve it
+/// for a remote transport, so it refuses one instead. The host and the
+/// transport may use different path syntaxes, hence the textual check.
+fn is_absolute_directory(path: &Path) -> bool {
+    if path.is_absolute() {
+        return true;
+    }
+    let text = path.to_string_lossy();
+    let bytes = text.as_bytes();
+    text.starts_with('/')
+        || text.starts_with("\\\\")
+        || (bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && matches!(bytes[2], b'\\' | b'/'))
+}
+
+fn relative_directory_message(path: &Path) -> String {
+    format!(
+        "ACP agents need an absolute working directory, but `{}` is relative; pass its full path",
+        path.display()
+    )
 }
 
 fn valid_agent_id(id: &str) -> bool {
@@ -295,7 +325,9 @@ impl Acp {
     /// supports and whether it can open a session without signing in.
     ///
     /// With `check_session` the probe also calls `session/new` in
-    /// `working_directory`; agents that require sign-in refuse it with
+    /// `working_directory`, which must then be absolute because ACP requires
+    /// an absolute `cwd` ([`AcpProbeErrorKind::Invalid`] otherwise); agents
+    /// that require sign-in refuse it with
     /// [`AUTH_REQUIRED_CODE`]. Agents may record that empty session in their
     /// own history, so applications should run this only on an explicit user
     /// action. The process is always stopped before this returns.
@@ -310,6 +342,12 @@ impl Acp {
         agent
             .validate()
             .map_err(|error| AcpProbeError::new(AcpProbeErrorKind::Invalid, error.to_string()))?;
+        if check_session && !is_absolute_directory(working_directory) {
+            return Err(AcpProbeError::new(
+                AcpProbeErrorKind::Invalid,
+                relative_directory_message(working_directory),
+            ));
+        }
         let spec = agent.command_spec();
         let mut child = crate::process::spawn(&spec, working_directory).map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
@@ -387,10 +425,17 @@ impl Acp {
         drop(stdin);
         guard.terminate();
         let _ = child.kill().await;
-        let stderr = match stderr_task {
-            Some(task) => task.await.ok().and_then(std::result::Result::ok),
-            None => None,
-        };
+        // Stopping the agent's process group does not close stderr when a
+        // descendant left the group and kept the pipe, so the read is bounded
+        // and abandoned instead of holding the probe past its timeout.
+        let mut stderr = None;
+        if let Some(mut task) = stderr_task {
+            if let Ok(joined) = tokio::time::timeout(STDERR_DRAIN, &mut task).await {
+                stderr = joined.ok().and_then(std::result::Result::ok);
+            } else {
+                task.abort();
+            }
+        }
         let with_stderr = |mut error: AcpProbeError| {
             if let Some(stderr) = stderr.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
                 error.message = format!("{} ({})", error.message, bounded(stderr, 400));
@@ -582,14 +627,15 @@ struct TurnState {
     supports_images: bool,
     /// Tool calls seen this turn.
     tools: Vec<TrackedTool>,
-    /// Permission requests not yet known to be answered, as
-    /// `(request id, tool call id)`.
+    /// Permission requests the client has not replied to, as
+    /// `(request id, tool call id)`. An interrupt refuses these; a request
+    /// leaves the list when its reply is written or its tool moves on.
     open_permissions: Vec<(Value, Option<String>)>,
     warned_noise: bool,
 }
 
-/// A tool call's stable name and, until it finishes, its latest input:
-/// updates may omit fields they did not change, and every emitted
+/// A tool call's stable name and, until it finishes, its latest input and
+/// output: updates may omit fields they did not change, and every emitted
 /// `ToolCall` event is a complete replacement.
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -597,6 +643,9 @@ struct TrackedTool {
     id: String,
     title: String,
     input: Option<Value>,
+    /// Latest bounded output an update carried; a final update that only
+    /// reports the status completes the call with it.
+    output: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -898,6 +947,12 @@ impl AgentAdapter for Acp {
 
     fn prepare_turn(&self, request: &TurnRequest, state: &mut AdapterState) -> Result<()> {
         let agent = self.agent_for(request)?;
+        if !is_absolute_directory(&request.working_directory) {
+            return Err(invalid(
+                "working_directory",
+                relative_directory_message(&request.working_directory),
+            ));
+        }
         let permission = match &request.permission_mode {
             PermissionMode::Default | PermissionMode::Custom(_) => Policy::Ask,
             PermissionMode::AcceptEdits => Policy::AcceptEdits,
@@ -967,6 +1022,20 @@ impl AgentAdapter for Acp {
             .collect::<Vec<_>>()
             .join("\n");
         Some(lines.into_bytes())
+    }
+
+    fn interaction_answered(&self, original: &Value, state: &mut AdapterState) {
+        let Some(id) = original.get("id") else {
+            return;
+        };
+        let mut turn = load(state);
+        let before = turn.open_permissions.len();
+        // The reply carries the user's decision, so a later cancellation must
+        // not answer the same request again.
+        turn.open_permissions.retain(|(open, _)| open != id);
+        if turn.open_permissions.len() != before {
+            store(state, &turn);
+        }
     }
 
     fn parse_line(&self, line: &str, state: &mut AdapterState) -> Result<AdapterOutput> {
@@ -1801,6 +1870,7 @@ fn tool_call(update: &Value, turn: &mut TurnState, output: &mut AdapterOutput, c
             id: id.to_string(),
             title,
             input: None,
+            output: None,
         });
         turn.tools.len() - 1
     };
@@ -1808,6 +1878,16 @@ fn tool_call(update: &Value, turn: &mut TurnState, output: &mut AdapterOutput, c
         let small =
             serde_json::to_vec(input).is_ok_and(|bytes| bytes.len() <= MAX_KEPT_INPUT_BYTES);
         turn.tools[index].input = small.then(|| input.clone());
+    }
+    // An agent may stream output in `in_progress` updates and finish with a
+    // bare `status: completed`; keep the latest so the final event is complete.
+    let reported_output = update
+        .get("content")
+        .and_then(tool_content_text)
+        .or_else(|| update.get("rawOutput").and_then(raw_output_text))
+        .map(|text| bounded(&text, MAX_TOOL_OUTPUT_CHARS));
+    if let Some(text) = &reported_output {
+        turn.tools[index].output = Some(text.clone());
     }
     let title = turn.tools[index].title.clone();
     let input = reported_input.or_else(|| turn.tools[index].input.clone());
@@ -1821,11 +1901,7 @@ fn tool_call(update: &Value, turn: &mut TurnState, output: &mut AdapterOutput, c
         Some("completed" | "failed") => {
             turn.tools[index].input = None;
             let failed = status == Some("failed");
-            let text = update
-                .get("content")
-                .and_then(tool_content_text)
-                .or_else(|| update.get("rawOutput").and_then(raw_output_text))
-                .map(|text| bounded(&text, MAX_TOOL_OUTPUT_CHARS));
+            let text = turn.tools[index].output.take();
             output.events.push(TurnEvent::ToolCall {
                 id: Some(id.to_string()),
                 name: title,
@@ -2580,5 +2656,134 @@ mod tests {
             servers[0]["env"][0],
             json!({"name": "TOKEN", "value": "secret"})
         );
+    }
+
+    #[test]
+    fn a_tool_completed_without_content_keeps_the_output_it_streamed() {
+        // Some agents stream the result in `in_progress` updates and finish
+        // with a bare status.
+        let adapter = Acp::new(agents());
+        let (mut state, _) = opened(&adapter, &turn("hi"), json!({"sessionId": "s"}));
+        let update = |update: Value| {
+            json!({"jsonrpc": "2.0", "method": "session/update",
+            "params": {"sessionId": "s", "update": update}})
+        };
+        feed(
+            &adapter,
+            &mut state,
+            update(
+                json!({"sessionUpdate": "tool_call", "toolCallId": "t", "title": "Run tests", "kind": "execute", "status": "pending"}),
+            ),
+        );
+        feed(
+            &adapter,
+            &mut state,
+            update(
+                json!({"sessionUpdate": "tool_call_update", "toolCallId": "t", "status": "in_progress",
+            "content": [{"type": "content", "content": {"type": "text", "text": "first"}}]}),
+            ),
+        );
+        feed(
+            &adapter,
+            &mut state,
+            update(
+                json!({"sessionUpdate": "tool_call_update", "toolCallId": "t", "status": "in_progress",
+            "content": [{"type": "content", "content": {"type": "text", "text": "12 passed, 1 failed"}}]}),
+            ),
+        );
+        let out = feed(
+            &adapter,
+            &mut state,
+            update(
+                json!({"sessionUpdate": "tool_call_update", "toolCallId": "t", "status": "failed"}),
+            ),
+        );
+        let Some(TurnEvent::ToolCall {
+            status,
+            output,
+            error,
+            ..
+        }) = out.events.first()
+        else {
+            panic!("expected the failed call");
+        };
+        assert_eq!(*status, ToolCallStatus::Failed);
+        assert_eq!(output, &None);
+        assert_eq!(error.as_deref(), Some("12 passed, 1 failed"));
+
+        // The kept output belongs to the call that finished.
+        feed(
+            &adapter,
+            &mut state,
+            update(
+                json!({"sessionUpdate": "tool_call", "toolCallId": "u", "title": "Read", "kind": "read", "status": "pending"}),
+            ),
+        );
+        let out = feed(
+            &adapter,
+            &mut state,
+            update(
+                json!({"sessionUpdate": "tool_call_update", "toolCallId": "u", "status": "completed"}),
+            ),
+        );
+        assert!(matches!(
+            out.events.first(),
+            Some(TurnEvent::ToolCall {
+                status: ToolCallStatus::Succeeded,
+                output: None,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn a_relative_working_directory_is_refused_before_spawning() {
+        let adapter = Acp::new(agents());
+        let mut request = turn("hi");
+        request.working_directory = PathBuf::from("workspace");
+        let error = adapter
+            .prepare_turn(&request, &mut AdapterState::default())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("absolute working directory"), "{error}");
+        assert!(error.contains("`workspace`"), "{error}");
+
+        // Remote transports use their own path syntax.
+        for absolute in [
+            std::env::temp_dir(),
+            "/workspace/a".into(),
+            "C:\\repo".into(),
+            "\\\\host\\share".into(),
+        ] {
+            assert!(is_absolute_directory(&absolute), "{}", absolute.display());
+        }
+        for relative in [".", "workspace", "../repo", "C:repo", ""] {
+            assert!(!is_absolute_directory(Path::new(relative)), "{relative}");
+        }
+    }
+
+    #[test]
+    fn an_answered_permission_is_not_cancelled_again() {
+        let adapter = Acp::new(agents());
+        let (mut state, _) = opened(&adapter, &turn("hi"), json!({"sessionId": "s"}));
+        let out = feed(&adapter, &mut state, permission_request("execute"));
+        let Some(InteractionRequest::Approval { original, .. }) = out.interaction else {
+            panic!("expected an approval");
+        };
+        // Cancelling while the user is still deciding refuses the request.
+        let frames = |state: &AdapterState| {
+            String::from_utf8(adapter.interrupt_request(state).unwrap())
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(frames(&state).len(), 2);
+        // Once the decision was sent, the agent has its answer; only the
+        // session is cancelled.
+        adapter.interaction_answered(&original, &mut state);
+        let frames = frames(&state);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0]["method"], "session/cancel");
     }
 }

@@ -25,14 +25,26 @@ use temps_agent_runtime::{
 };
 
 const AGENT: &str = r#"#!/bin/sh
-# Scripted ACP agent. MOCK_ACP_MODE: ok, auth, hang or linger.
+# Scripted ACP agent. MOCK_ACP_MODE: ok, auth, hang, linger, stall (never
+# reacts to a permission reply), split (streams a tool result, then completes
+# with a bare status) or orphan (never answers, and leaves a child of its own
+# process group that keeps stderr open).
 log="$MOCK_ACP_LOG"
 say() { printf '%s\n' "$1"; }
 update() { say "{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"mock-session\",\"update\":$1}}"; }
+if [ "$MOCK_ACP_MODE" = orphan ]; then
+  if command -v perl >/dev/null 2>&1; then
+    perl -MPOSIX -e 'POSIX::setsid(); exec "sleep", "20"' >/dev/null &
+  else
+    setsid sleep 20 >/dev/null &
+  fi
+  echo $! > "$log.orphan"
+fi
 while IFS= read -r line; do
   printf '%s\n' "$line" >> "$log"
   case "$line" in
     *'"method":"initialize"'*)
+      if [ "$MOCK_ACP_MODE" = orphan ]; then continue; fi
       say '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true},"authMethods":[{"id":"login","name":"Log in with Mock"}],"agentInfo":{"name":"mock-agent","version":"0.1.0"}}}' ;;
     *'"method":"session/new"'*)
       if [ "$MOCK_ACP_MODE" = auth ]; then
@@ -51,9 +63,15 @@ while IFS= read -r line; do
       update '{"sessionUpdate":"tool_call","toolCallId":"call-1","title":"Run npm test","kind":"execute","status":"pending","rawInput":{"command":"npm test"}}'
       say '{"jsonrpc":"2.0","id":7,"method":"session/request_permission","params":{"sessionId":"mock-session","toolCall":{"toolCallId":"call-1","title":"Run npm test","kind":"execute"},"options":[{"optionId":"allow","name":"Allow","kind":"allow_once"},{"optionId":"reject","name":"Reject","kind":"reject_once"}]}}' ;;
     *'"id":7'*)
+      if [ "$MOCK_ACP_MODE" = stall ]; then continue; fi
       case "$line" in
         *'"optionId":"allow"'*)
-          update '{"sessionUpdate":"tool_call_update","toolCallId":"call-1","status":"completed","content":[{"type":"content","content":{"type":"text","text":"12 passed"}}]}'
+          if [ "$MOCK_ACP_MODE" = split ]; then
+            update '{"sessionUpdate":"tool_call_update","toolCallId":"call-1","status":"in_progress","content":[{"type":"content","content":{"type":"text","text":"12 passed"}}]}'
+            update '{"sessionUpdate":"tool_call_update","toolCallId":"call-1","status":"completed"}'
+          else
+            update '{"sessionUpdate":"tool_call_update","toolCallId":"call-1","status":"completed","content":[{"type":"content","content":{"type":"text","text":"12 passed"}}]}'
+          fi
           update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":" All green."}}' ;;
         *)
           update '{"sessionUpdate":"tool_call_update","toolCallId":"call-1","status":"failed","content":[{"type":"content","content":{"type":"text","text":"rejected by the user"}}]}'
@@ -402,4 +420,124 @@ async fn probing_a_missing_or_silent_command_says_what_is_wrong() {
         .unwrap_err();
     assert_eq!(error.kind, AcpProbeErrorKind::Timeout);
     assert!(started.elapsed() < Duration::from_secs(10));
+}
+
+#[tokio::test]
+async fn a_tool_result_streamed_before_the_final_status_is_kept() {
+    let fixture = Fixture::new();
+    let events = Collector::default();
+    let responder = Responder::new(ApprovalDecision::Allow);
+    let result = fixture
+        .runtime("split")
+        .run(fixture.request("run the tests"), &events, Some(&responder))
+        .await
+        .unwrap();
+    assert_eq!(result.text, "Running tests. All green.");
+    let completed = events
+        .events()
+        .into_iter()
+        .filter_map(|event| match event {
+            TurnEvent::ToolCall {
+                status: ToolCallStatus::Succeeded,
+                output,
+                ..
+            } => Some(output),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(completed, [Some("12 passed".to_string())]);
+}
+
+#[tokio::test]
+async fn a_relative_working_directory_is_refused_before_the_agent_starts() {
+    let fixture = Fixture::new();
+    // `tests` exists relative to the test's directory, so the refusal is the
+    // adapter's, not a missing directory.
+    let mut request = TurnRequest::new(Provider::Acp, "tests", "hi");
+    request
+        .harness_options
+        .insert(AGENT_OPTION.into(), "mock".into());
+    let error = fixture
+        .runtime("ok")
+        .run(request, &Collector::default(), None)
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("absolute working directory"),
+        "{error}"
+    );
+    assert_eq!(fixture.methods().len(), 0, "the agent must not be started");
+
+    let error = Acp::probe_agent(
+        &fixture.agent("ok"),
+        Path::new("workspace"),
+        true,
+        Duration::from_secs(10),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.kind, AcpProbeErrorKind::Invalid);
+    assert_eq!(fixture.methods().len(), 0, "the agent must not be started");
+}
+
+#[tokio::test]
+async fn cancelling_after_the_decision_does_not_answer_the_request_twice() {
+    let fixture = Fixture::new();
+    let events = Collector::default();
+    let responder = Responder::new(ApprovalDecision::Allow);
+    let request = fixture.request("run the tests");
+    let cancellation = request.cancellation.clone();
+    let runtime = fixture.runtime("stall");
+    let turn = runtime.run(request, &events, Some(&responder));
+    let cancel = async {
+        // The agent never reacts to the decision, so the permission stays
+        // open in the adapter until the decision's reply is on the wire.
+        for _ in 0..400 {
+            if fixture.methods().iter().any(|method| method == "reply:7") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        cancellation.cancel();
+    };
+    let (result, ()) = tokio::join!(turn, cancel);
+    assert!(
+        matches!(result, Err(RuntimeError::Cancelled { .. })),
+        "{result:?}"
+    );
+    let methods = fixture.methods();
+    assert!(methods.iter().any(|method| method == "session/cancel"));
+    assert_eq!(
+        methods
+            .iter()
+            .filter(|method| method.as_str() == "reply:7")
+            .count(),
+        1,
+        "request 7 was answered more than once: {methods:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_probe_does_not_wait_for_a_descendant_that_kept_stderr_open() {
+    let fixture = Fixture::new();
+    let started = Instant::now();
+    let error = Acp::probe_agent(
+        &fixture.agent("orphan"),
+        &fixture.workspace,
+        false,
+        Duration::from_secs(1),
+    )
+    .await
+    .unwrap_err();
+    let elapsed = started.elapsed();
+    // The agent left its process group, so stopping the group does not close
+    // the stderr pipe the descendant still holds.
+    if let Ok(pid) = std::fs::read_to_string(format!("{}.orphan", fixture.log.display())) {
+        let _ = std::process::Command::new("kill").arg(pid.trim()).status();
+    }
+    assert_eq!(error.kind, AcpProbeErrorKind::Timeout);
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "the probe waited {elapsed:?} for stderr to close"
+    );
 }

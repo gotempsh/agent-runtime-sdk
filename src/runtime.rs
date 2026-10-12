@@ -5204,7 +5204,9 @@ impl AgentRuntime {
                 let decision = decision.unwrap_or_else(|_| crate::ApprovalDecision::Deny {
                     reason: Some("Approval timed out".to_string()),
                 });
-                adapter.approval_response(&approval, &original, decision)?
+                let response = adapter.approval_response(&approval, &original, decision)?;
+                adapter.interaction_answered(&original, state);
+                response
             }
             InteractionRequest::Question {
                 request: question,
@@ -5227,7 +5229,10 @@ impl AgentRuntime {
                 else {
                     return Ok(true);
                 };
-                adapter.question_response(&question, &original, answer.ok().flatten())?
+                let response =
+                    adapter.question_response(&question, &original, answer.ok().flatten())?;
+                adapter.interaction_answered(&original, state);
+                response
             }
         };
         if let Some(response) = response {
@@ -5567,7 +5572,9 @@ impl AgentRuntime {
                                 }
                             }),
                         };
-                        adapter.approval_response(&approval, &original, decision)?
+                        let response = adapter.approval_response(&approval, &original, decision)?;
+                        adapter.interaction_answered(&original, &mut state);
+                        response
                     }
                     InteractionRequest::Question {
                         request: question,
@@ -5591,7 +5598,9 @@ impl AgentRuntime {
                                 interactions.answer(question.clone()),
                             ) => answer.ok().flatten(),
                         };
-                        adapter.question_response(&question, &original, answer)?
+                        let response = adapter.question_response(&question, &original, answer)?;
+                        adapter.interaction_answered(&original, &mut state);
+                        response
                     }
                 };
                 if let Some(response) = response {

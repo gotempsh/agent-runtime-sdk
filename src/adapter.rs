@@ -678,6 +678,21 @@ pub trait AgentAdapter: Send + Sync {
         original: &Value,
         answer: Option<QuestionAnswer>,
     ) -> Result<Option<Vec<u8>>>;
+
+    /// Record that the reply to the approval or question `original` was
+    /// encoded and is being written to the provider.
+    ///
+    /// Called by the turn loop right after
+    /// [`AgentAdapter::approval_response`] or
+    /// [`AgentAdapter::question_response`], with the same `original`. An
+    /// adapter that tracks requests still waiting for an answer — to refuse
+    /// them when it encodes an [`AgentAdapter::interrupt_request`] — drops
+    /// this one here, so a cancellation that arrives before the provider
+    /// reacts to the answer does not answer the same request twice. The
+    /// default does nothing.
+    fn interaction_answered(&self, original: &Value, state: &mut AdapterState) {
+        let _ = (original, state);
+    }
 }
 
 /// Resolve an executable override or search common user-local `PATH` roots.

@@ -25,6 +25,10 @@ request.permission_mode = PermissionMode::Default;
 let result = runtime.run(request, &events, Some(&approvals)).await?;
 ```
 
+The working directory must be absolute: ACP sends it to the agent as `cwd`,
+and the agent starts inside it, so a relative path would resolve a second time.
+A relative one fails the turn before the agent starts.
+
 `AcpAgents` is shared: inserting, replacing or removing an agent on any clone
 takes effect for the next turn of every runtime holding it.
 
@@ -75,7 +79,8 @@ match probe.authentication {
 ```
 
 `probe_agent` starts the agent locally, runs `initialize` and, with
-`check_session`, `session/new` in the given directory, then stops it. It
+`check_session`, `session/new` in the given (absolute) directory, then stops
+it. It
 reports the protocol version, agent name and version, sign-in methods and
 session capabilities. Agents may record that empty session in their history,
 so run it on an explicit user action.

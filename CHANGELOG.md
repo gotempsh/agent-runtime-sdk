@@ -27,11 +27,16 @@ Versioning and Keep a Changelog conventions.
   `session/prompt`; `session/request_permission` reaches the interaction
   handler unless `AcceptEdits`/`FullAccess` decide it, cancellation sends
   `session/cancel`, and `-32000` fails as an authentication error before the
-  prompt. `Acp::probe_agent` runs the handshake (and optionally opens a
-  session) to report capabilities and sign-in state. See
+  prompt. ACP requires an absolute working directory; a relative one is
+  refused before the agent starts. `Acp::probe_agent` runs the handshake (and
+  optionally opens a session) to report capabilities and sign-in state. See
   `docs/how-to/run-acp-agents.md`.
 - `TurnEvent::PlanUpdated` with `PlanEntry`/`PlanEntryStatus`: a complete
   replacement of an agent's execution plan, emitted for ACP `plan` updates.
+- `AgentAdapter::interaction_answered`: called by the turn loop right after
+  an approval or question reply is encoded, so an adapter that tracks
+  unanswered requests stops refusing one the application already answered
+  when the turn is cancelled. The default does nothing.
 - `AgentAdapter::terminal_exit_grace`: a stdio provider that keeps running
   after its terminal frame and end-of-input is stopped after this grace
   period instead of holding the finished turn until its deadline. The default
