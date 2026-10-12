@@ -44,6 +44,9 @@ enum Script {
     AsyncQuestion,
     /// Stream one delta and then wait for `turn/interrupt`.
     Interrupt,
+    /// Stream one delta and then stop reading stdin entirely, with room for
+    /// only one byte in the pipe: a provider busy inside a tool call.
+    StalledInterrupt,
     /// Exit after accepting a turn, before a terminal notification.
     Crash,
     /// Start an automatic compaction, then exit before it completes.
@@ -200,7 +203,11 @@ impl ExecutionTransport for AppServer {
             .iter()
             .map(|argument| argument.to_string_lossy().into_owned())
             .collect();
-        let (sdk_stdin, server_input) = duplex(64 * 1024);
+        let (sdk_stdin, server_input) = duplex(if self.script == Script::StalledInterrupt {
+            1
+        } else {
+            64 * 1024
+        });
         let (sdk_stdout, server_output) = duplex(64 * 1024);
         let (sdk_stderr, server_stderr) = duplex(1024);
         drop(server_stderr);
@@ -459,6 +466,10 @@ async fn serve(
                 for frame in opening_frames(script) {
                     send(&mut output, frame).await;
                 }
+                if script == Script::StalledInterrupt {
+                    // Never read another byte of stdin.
+                    std::future::pending::<()>().await;
+                }
                 user_turns += 1;
                 if script.titles() && user_turns > 1 {
                     for frame in completion_frames(script) {
@@ -573,6 +584,7 @@ fn opening_frames(script: Script) -> Vec<Value> {
             })]
         }
         Script::Interrupt
+        | Script::StalledInterrupt
         | Script::Crash
         | Script::CompactionCrash
         | Script::Title
@@ -1617,6 +1629,67 @@ async fn cancellation_sends_a_native_turn_interrupt() {
         interrupt.pointer("/params/turnId"),
         Some(&json!("turn-1")),
         "the interrupt must name the running turn"
+    );
+}
+
+#[tokio::test]
+async fn cancellation_does_not_wait_for_a_provider_that_stopped_reading_stdin() {
+    let transport = AppServer::new(Script::StalledInterrupt);
+    let cancellation = CancellationToken::new();
+    let mut request = request();
+    request.cancellation = cancellation.clone();
+    let runtime = runtime(transport.clone());
+    let waiting = transport.clone();
+    tokio::spawn(async move {
+        waiting.wait_for("turn/start").await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        cancellation.cancel();
+    });
+
+    let error = tokio::time::timeout(
+        Duration::from_secs(8),
+        runtime.run(request, &Collector::default(), None),
+    )
+    .await
+    .expect("a provider whose stdin is full must not block cancellation")
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        RuntimeError::Cancelled {
+            provider: Provider::Codex
+        }
+    ));
+    assert_eq!(
+        transport.termination_count(),
+        1,
+        "the provider is terminated once the interrupt could not be delivered"
+    );
+}
+
+#[tokio::test]
+async fn interrupting_a_retained_turn_does_not_wait_for_a_stalled_provider() {
+    let transport = AppServer::new(Script::StalledInterrupt);
+    let runtime = retained_runtime(transport.clone(), Duration::from_secs(30));
+    let (_client, handle) = retained_handle(runtime).await;
+    let turn = handle
+        .start_turn(TurnInput::new(
+            InvocationId::new("stalled-one").unwrap(),
+            "first",
+        ))
+        .await
+        .unwrap();
+    transport.wait_for("turn/start").await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    tokio::time::timeout(Duration::from_secs(8), async {
+        turn.interrupt().await;
+        let _ = turn.wait().await;
+    })
+    .await
+    .expect("a retained provider whose stdin is full must not block interruption");
+    assert!(
+        transport.termination_count() >= 1,
+        "the stalled process is retired"
     );
 }
 
