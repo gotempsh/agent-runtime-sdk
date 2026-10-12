@@ -317,6 +317,7 @@ pub trait AgentAdapter: Send + Sync {
             Provider::Codex => "codex",
             Provider::OpenCode => "opencode",
             Provider::Pi => "pi",
+            Provider::Acp => "acp",
         })
     }
 
@@ -634,6 +635,19 @@ pub trait AgentAdapter: Send + Sync {
     ) -> Result<AdapterOutput> {
         let _ = (frame, state);
         Ok(AdapterOutput::default())
+    }
+
+    /// How long a stdio provider may take to exit on its own after its
+    /// terminal frame and the closing of its stdin.
+    ///
+    /// `None` — the default — reads the provider to end-of-output and waits
+    /// for it to exit, because closing stdin is what makes it exit. `Some`
+    /// stops reading at the terminal frame and terminates a provider that is
+    /// still running when the grace period ends; the protocol already decided
+    /// the turn, so that stop is not a failure. Protocol servers such as ACP
+    /// agents need this: nothing obliges them to exit at end-of-input.
+    fn terminal_exit_grace(&self) -> Option<std::time::Duration> {
+        None
     }
 
     /// Encode a provider-native cooperative interrupt for the running turn.

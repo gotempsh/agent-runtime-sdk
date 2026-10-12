@@ -16,6 +16,26 @@ Versioning and Keep a Changelog conventions.
 
 ### Added
 
+- `Provider::Acp` and `providers::acp::Acp` (default feature `acp`): one
+  adapter for any agent that speaks the Agent Client Protocol over stdio —
+  Gemini CLI (`gemini --acp`), GitHub Copilot (`copilot --acp`), Cursor
+  (`cursor-agent acp`) and the rest of the ACP registry. Agents live in a
+  shared, updatable `AcpAgents` registry and a turn selects one with the
+  `agent` harness option, advertised as a `HarnessControlKind::Agent`
+  control. Turns run `initialize`, `session/new` (or `session/resume`, else
+  `session/load` without its replay), optional mode and model selection, then
+  `session/prompt`; `session/request_permission` reaches the interaction
+  handler unless `AcceptEdits`/`FullAccess` decide it, cancellation sends
+  `session/cancel`, and `-32000` fails as an authentication error before the
+  prompt. `Acp::probe_agent` runs the handshake (and optionally opens a
+  session) to report capabilities and sign-in state. See
+  `docs/how-to/run-acp-agents.md`.
+- `TurnEvent::PlanUpdated` with `PlanEntry`/`PlanEntryStatus`: a complete
+  replacement of an agent's execution plan, emitted for ACP `plan` updates.
+- `AgentAdapter::terminal_exit_grace`: a stdio provider that keeps running
+  after its terminal frame and end-of-input is stopped after this grace
+  period instead of holding the finished turn until its deadline. The default
+  (`None`) keeps reading to end-of-output as before.
 - `AgentTask::model`: the model a Claude Code subagent runs on, as its own
   messages report it (for example `claude-haiku-5-5`), including a subagent
   that inherits the parent's model. It is `None` until the subagent's first

@@ -108,6 +108,7 @@ status transition.
 | Event | Meaning | Durable projection |
 | --- | --- | --- |
 | `TasksChanged` | Complete bounded task snapshot for the current run | Replace the materialized task collection |
+| `PlanUpdated` | Complete execution plan an agent published (ACP `plan`) | Replace the materialized plan |
 | `TaskActivity` | One ordered native task transition | Append to the run timeline |
 
 Claude currently emits these events for native Task/Agent work. `AgentTask`

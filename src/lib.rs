@@ -111,10 +111,10 @@ pub use types::{
     AgentWorkflowAgentState, AgentWorkflowPhase, ApprovalDecision, ApprovalRequest,
     AutoCompactionPolicy, CompactionTrigger, ContextCompaction, ContextWindowUsage, DenyAll,
     EventSink, InteractionHandler, LaunchContext, LaunchContextCapabilities, McpServerConfig,
-    NoopEventSink, PermissionMode, PermissionSupport, Provider, ProviderProcessStatus,
-    ProviderReadiness, QuestionAnswer, QuestionOption, QuestionPrompt, QuestionRequest, RunStatus,
-    SecretString, ToolCallStatus, ToolImage, ToolProcessPolicy, TurnCapabilities, TurnEvent,
-    TurnProvenance, TurnRequest, TurnResult, Usage,
+    NoopEventSink, PermissionMode, PermissionSupport, PlanEntry, PlanEntryStatus, Provider,
+    ProviderProcessStatus, ProviderReadiness, QuestionAnswer, QuestionOption, QuestionPrompt,
+    QuestionRequest, RunStatus, SecretString, ToolCallStatus, ToolImage, ToolProcessPolicy,
+    TurnCapabilities, TurnEvent, TurnProvenance, TurnRequest, TurnResult, Usage,
 };
 
 pub use startup::{StartupObserver, StartupStage, StartupTiming};

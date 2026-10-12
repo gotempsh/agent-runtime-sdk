@@ -1,5 +1,7 @@
 //! Built-in coding-agent CLI adapters.
 
+#[cfg(feature = "acp")]
+pub mod acp;
 #[cfg(feature = "claude")]
 mod claude;
 #[cfg(feature = "codex")]
@@ -15,6 +17,8 @@ mod opencode_serve;
 #[cfg(feature = "pi")]
 mod pi;
 
+#[cfg(feature = "acp")]
+pub use acp::{Acp, AcpAgent, AcpAgents};
 #[cfg(feature = "claude")]
 pub use claude::Claude;
 #[cfg(feature = "codex")]

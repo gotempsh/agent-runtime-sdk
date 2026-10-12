@@ -2523,6 +2523,15 @@ impl AgentRuntime {
         adapter: Arc<dyn AgentAdapter>,
         working_directory: &std::path::Path,
     ) -> crate::TransportResult<Vec<HarnessMcpServer>> {
+        if provider == Provider::Acp {
+            return Err(TransportError::new(
+                TransportErrorKind::Unsupported,
+                self.transport.name(),
+                "discover_mcp",
+                "ACP agents have no common MCP listing command",
+                false,
+            ));
+        }
         if provider == Provider::Pi {
             // `pi mcp list` connects to every configured server and exits
             // nonzero when any of them is unreachable, so it cannot serve as a
@@ -5460,6 +5469,7 @@ impl AgentRuntime {
         // interaction timeouts, line bounding — is shared by both kinds of
         // provider instead of growing a second turn loop.
         let mut attached = false;
+        let exit_grace = adapter.terminal_exit_grace();
         let reader: crate::TransportReader = match adapter.attach(request, &state).await {
             Ok(Some(streams)) => {
                 attached = true;
@@ -5597,7 +5607,7 @@ impl AgentRuntime {
             if output.terminal {
                 protocol_completed = true;
                 stdin.take();
-                if attached {
+                if attached || exit_grace.is_some() {
                     // A stdio provider is read to end-of-output because
                     // closing its stdin is what makes it exit, and trailing
                     // lines can still arrive. An adapter-supplied carrier has
@@ -5641,6 +5651,23 @@ impl AgentRuntime {
                     success: protocol_completed,
                     code: None,
                 },
+            }
+        } else if let Some(grace) = exit_grace.filter(|_| protocol_completed) {
+            // The protocol decided the turn; an agent that keeps running
+            // after end-of-input is stopped instead of holding the turn open
+            // until its deadline.
+            if let Ok(status) = tokio::time::timeout(grace, process.wait()).await {
+                status.map_err(|source| RuntimeError::Transport { provider, source })?;
+            } else {
+                process
+                    .terminate()
+                    .await
+                    .map_err(|source| RuntimeError::Transport { provider, source })?;
+                let _ = tokio::time::timeout(ATTACHED_SHUTDOWN_GRACE, process.wait()).await;
+            }
+            TransportExitStatus {
+                success: true,
+                code: None,
             }
         } else {
             process
@@ -5772,6 +5799,7 @@ const fn provider_order(provider: Provider) -> u8 {
         Provider::Codex => 1,
         Provider::OpenCode => 2,
         Provider::Pi => 3,
+        Provider::Acp => 4,
     }
 }
 
@@ -5781,6 +5809,7 @@ fn provider_argument(provider: Provider) -> &'static str {
         Provider::Codex => "codex",
         Provider::OpenCode => "open_code",
         Provider::Pi => "pi",
+        Provider::Acp => "acp",
     }
 }
 
@@ -6106,6 +6135,13 @@ fn mcp_management_access(provider: Provider) -> (HarnessExtensionAccess, Harness
             );
             (denied.clone(), denied)
         }
+        Provider::Acp => {
+            let denied = HarnessExtensionAccess::denied(
+                HarnessExtensionDenialKind::ProviderUnsupported,
+                "ACP agents receive MCP servers per session; configure persistent servers in each agent's own settings.",
+            );
+            (denied.clone(), denied)
+        }
     }
 }
 
@@ -6267,6 +6303,15 @@ fn build_mcp_management_command(
                 transport,
                 "manage_mcp_server",
                 "pi MCP management is not supported by this SDK yet",
+                false,
+            ));
+        }
+        (Provider::Acp, _) => {
+            return Err(TransportError::new(
+                TransportErrorKind::Unsupported,
+                transport,
+                "manage_mcp_server",
+                "ACP agents have no common MCP management command",
                 false,
             ));
         }
