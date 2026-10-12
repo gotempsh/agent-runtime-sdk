@@ -583,22 +583,20 @@ fn response(
 fn is_placeholder_title(title: &str) -> bool {
     let title = title.trim();
     title.is_empty()
-        || ["New session - ", "Child session - "]
-            .iter()
-            .any(|prefix| {
-                // OpenCode's own check: `\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z`.
-                title.strip_prefix(prefix).is_some_and(|time| {
-                    time.len() == 24
-                        && time.bytes().enumerate().all(|(index, byte)| match index {
-                            4 | 7 => byte == b'-',
-                            10 => byte == b'T',
-                            13 | 16 => byte == b':',
-                            19 => byte == b'.',
-                            23 => byte == b'Z',
-                            _ => byte.is_ascii_digit(),
-                        })
-                })
+        || ["New session - ", "Child session - "].iter().any(|prefix| {
+            // OpenCode's own check: `\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z`.
+            title.strip_prefix(prefix).is_some_and(|time| {
+                time.len() == 24
+                    && time.bytes().enumerate().all(|(index, byte)| match index {
+                        4 | 7 => byte == b'-',
+                        10 => byte == b'T',
+                        13 | 16 => byte == b':',
+                        19 => byte == b'.',
+                        23 => byte == b'Z',
+                        _ => byte.is_ascii_digit(),
+                    })
             })
+        })
 }
 
 /// Map one OpenCode SSE event onto the normalized stream.
@@ -617,12 +615,16 @@ fn event(
     // every event that can mutate or finish a turn must identify the current
     // session, so delayed or unrelated traffic cannot leak across turns.
     // `session.updated` carries the whole session as `info` instead.
-    let reported = properties.get("sessionID").and_then(Value::as_str).or_else(|| {
-        (kind == "session.updated")
-            .then(|| properties.pointer("/info/id").and_then(Value::as_str))
-            .flatten()
-    });
-    if kind == "session.updated" && reported.is_none_or(|id| turn.session_id.as_deref() != Some(id)) {
+    let reported = properties
+        .get("sessionID")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            (kind == "session.updated")
+                .then(|| properties.pointer("/info/id").and_then(Value::as_str))
+                .flatten()
+        });
+    if kind == "session.updated" && reported.is_none_or(|id| turn.session_id.as_deref() != Some(id))
+    {
         return;
     }
     if turn.retained {
@@ -1265,8 +1267,12 @@ mod tests {
 
     #[test]
     fn placeholder_titles_are_not_titles() {
-        assert!(is_placeholder_title("New session - 2026-10-11T14:19:52.792Z"));
-        assert!(is_placeholder_title("Child session - 2026-10-11T14:19:52.792Z"));
+        assert!(is_placeholder_title(
+            "New session - 2026-10-11T14:19:52.792Z"
+        ));
+        assert!(is_placeholder_title(
+            "Child session - 2026-10-11T14:19:52.792Z"
+        ));
         assert!(is_placeholder_title("  "));
         assert!(!is_placeholder_title("Create hello.txt file"));
         assert!(!is_placeholder_title("New session - plan the migration"));
@@ -1278,18 +1284,38 @@ mod tests {
         let events = feed(
             &mut state,
             &[
-                sse("session.updated", json!({"info": {"id": "session-1",
-                    "title": "New session - 2026-10-11T14:19:52.792Z"}})),
-                sse("session.updated", json!({"info": {"id": "session-other",
-                    "title": "Someone else's work"}})),
-                sse("session.updated", json!({"info": {"id": "session-1",
-                    "title": "Create hello.txt file"}})),
-                sse("session.updated", json!({"info": {"id": "session-1",
-                    "title": "Create hello.txt file"}})),
+                sse(
+                    "session.updated",
+                    json!({"info": {"id": "session-1",
+                    "title": "New session - 2026-10-11T14:19:52.792Z"}}),
+                ),
+                sse(
+                    "session.updated",
+                    json!({"info": {"id": "session-other",
+                    "title": "Someone else's work"}}),
+                ),
+                sse(
+                    "session.updated",
+                    json!({"info": {"id": "session-1",
+                    "title": "Create hello.txt file"}}),
+                ),
+                sse(
+                    "session.updated",
+                    json!({"info": {"id": "session-1",
+                    "title": "Create hello.txt file"}}),
+                ),
             ],
         );
-        assert_eq!(events, vec![TurnEvent::SessionTitle { title: "Create hello.txt file".into() }]);
-        assert_eq!(state.result.session_title.as_deref(), Some("Create hello.txt file"));
+        assert_eq!(
+            events,
+            vec![TurnEvent::SessionTitle {
+                title: "Create hello.txt file".into()
+            }]
+        );
+        assert_eq!(
+            state.result.session_title.as_deref(),
+            Some("Create hello.txt file")
+        );
     }
 
     #[test]
@@ -1307,7 +1333,10 @@ mod tests {
         }
         assert_eq!(
             events,
-            vec![TurnEvent::SessionStarted { session_id: "session-1".into(), title: None }]
+            vec![TurnEvent::SessionStarted {
+                session_id: "session-1".into(),
+                title: None
+            }]
         );
         assert!(state.result.session_title.is_none());
     }
@@ -1332,7 +1361,9 @@ mod tests {
                     session_id: "session-1".into(),
                     title: Some("Create hello.txt file".into()),
                 },
-                TurnEvent::SessionTitle { title: "Create hello.txt file".into() },
+                TurnEvent::SessionTitle {
+                    title: "Create hello.txt file".into()
+                },
             ]
         );
     }

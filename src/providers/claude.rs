@@ -1109,7 +1109,12 @@ impl AgentAdapter for Claude {
             .flatten()
             .map(str::trim)
             .filter(|description| !description.is_empty())
-            .map(|description| description.chars().take(SESSION_TITLE_DESCRIPTION_CHARS).collect());
+            .map(|description| {
+                description
+                    .chars()
+                    .take(SESSION_TITLE_DESCRIPTION_CHARS)
+                    .collect()
+            });
         native
             .own_commands
             .insert(new_message_uuid(), "pending".to_string());
@@ -1888,7 +1893,10 @@ impl AgentAdapter for Claude {
                 }
             }
             "control_response" => {
-                match value.pointer("/response/request_id").and_then(Value::as_str) {
+                match value
+                    .pointer("/response/request_id")
+                    .and_then(Value::as_str)
+                {
                     Some(INTERRUPT_REQUEST_ID) => native.interrupting = true,
                     // A failed request leaves the session untitled; the
                     // caller asks again on a later turn.
@@ -4294,20 +4302,29 @@ setTimeout(() => {
         let adapter = Claude::default();
         let mut state = titled_turn(Some("  fix the login loop on Safari  "), false);
         let first = adapter
-            .parse_line(r#"{"type":"system","subtype":"init","session_id":"s-1"}"#, &mut state)
+            .parse_line(
+                r#"{"type":"system","subtype":"init","session_id":"s-1"}"#,
+                &mut state,
+            )
             .unwrap();
         assert_eq!(first.writes.len(), 1);
         let frame: Value = serde_json::from_slice(&first.writes[0]).unwrap();
         assert_eq!(frame["type"], "control_request");
         assert_eq!(frame["request_id"], SESSION_TITLE_REQUEST_ID);
         assert_eq!(frame["request"]["subtype"], "generate_session_title");
-        assert_eq!(frame["request"]["description"], "fix the login loop on Safari");
+        assert_eq!(
+            frame["request"]["description"],
+            "fix the login loop on Safari"
+        );
         assert_eq!(frame["request"]["persist"], true);
 
         let later = adapter
             .parse_line(r#"{"type":"rate_limit_event"}"#, &mut state)
             .unwrap();
-        assert!(later.writes.is_empty(), "the title is requested once per turn");
+        assert!(
+            later.writes.is_empty(),
+            "the title is requested once per turn"
+        );
     }
 
     #[test]
@@ -4316,11 +4333,18 @@ setTimeout(() => {
         let long = "é".repeat(SESSION_TITLE_DESCRIPTION_CHARS + 50);
         let mut state = titled_turn(Some(&long), false);
         let output = adapter
-            .parse_line(r#"{"type":"system","subtype":"init","session_id":"s-1"}"#, &mut state)
+            .parse_line(
+                r#"{"type":"system","subtype":"init","session_id":"s-1"}"#,
+                &mut state,
+            )
             .unwrap();
         let frame: Value = serde_json::from_slice(&output.writes[0]).unwrap();
         assert_eq!(
-            frame["request"]["description"].as_str().unwrap().chars().count(),
+            frame["request"]["description"]
+                .as_str()
+                .unwrap()
+                .chars()
+                .count(),
             SESSION_TITLE_DESCRIPTION_CHARS
         );
     }
@@ -4334,7 +4358,10 @@ setTimeout(() => {
             titled_turn(Some("fix it"), true),
         ] {
             let output = adapter
-                .parse_line(r#"{"type":"system","subtype":"init","session_id":"s-1"}"#, &mut state)
+                .parse_line(
+                    r#"{"type":"system","subtype":"init","session_id":"s-1"}"#,
+                    &mut state,
+                )
                 .unwrap();
             assert!(output.writes.is_empty());
         }
@@ -4352,9 +4379,14 @@ setTimeout(() => {
             .unwrap();
         assert_eq!(
             output.events,
-            vec![TurnEvent::SessionTitle { title: "Login redirect loop on Safari".into() }]
+            vec![TurnEvent::SessionTitle {
+                title: "Login redirect loop on Safari".into()
+            }]
         );
-        assert_eq!(state.result.session_title.as_deref(), Some("Login redirect loop on Safari"));
+        assert_eq!(
+            state.result.session_title.as_deref(),
+            Some("Login redirect loop on Safari")
+        );
 
         // The same title announced again is not reported twice.
         let repeated = adapter
@@ -4370,7 +4402,12 @@ setTimeout(() => {
                 &mut state,
             )
             .unwrap();
-        assert_eq!(renamed.events, vec![TurnEvent::SessionTitle { title: "Safari OAuth loop".into() }]);
+        assert_eq!(
+            renamed.events,
+            vec![TurnEvent::SessionTitle {
+                title: "Safari OAuth loop".into()
+            }]
+        );
     }
 
     #[test]
