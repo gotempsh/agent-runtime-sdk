@@ -214,7 +214,7 @@ where
 ///
 /// - By default the reader stops. This is for probes, which have already
 ///   stopped the process they started.
-/// - [`Self::detached`] leaves it draining in the background. A process
+/// - [`Self::detach`] leaves it draining in the background. A process
 ///   started with `ToolProcessPolicy::PreserveOnCompletion` may leave tools
 ///   running that inherited this pipe, and closing the read end would hand
 ///   them a broken pipe (`SIGPIPE`) on their next write. The reader holds
@@ -258,12 +258,14 @@ impl StderrCapture {
     }
 
     /// Keep reading in the background when the wait ends or this is dropped.
-    pub(crate) fn detached(mut self) -> Self {
+    ///
+    /// Call this only once the owner has decided to leave descendants
+    /// running; until then an early return stops the reader with the process.
+    pub(crate) fn detach(&mut self) {
         self.detached = true;
-        self
     }
 
-    /// Stop reading now, even when [`Self::detached`].
+    /// Stop reading now, even when [`Self::detach`]ed.
     pub(crate) fn abort(&self) {
         if let Some(task) = &self.task {
             task.abort();
@@ -288,7 +290,7 @@ impl StderrCapture {
                 )))
             }
             // The reader is still running; dropping `self` below leaves it
-            // or stops it according to `detached`.
+            // or stops it according to `detach`.
             Err(_) => {}
         }
         let tail = self
@@ -521,7 +523,8 @@ mod tests {
     #[tokio::test]
     async fn a_detached_stderr_capture_keeps_draining_for_a_late_writer() {
         let (reader, mut writer) = tokio::io::duplex(8);
-        let capture = StderrCapture::spawn(reader, 64).detached();
+        let mut capture = StderrCapture::spawn(reader, 64);
+        capture.detach();
         writer.write_all(b"early").await.unwrap();
         let tail = capture.finish(Duration::from_millis(200)).await.unwrap();
         assert_eq!(tail, "early");
@@ -536,7 +539,8 @@ mod tests {
     #[tokio::test]
     async fn cancelling_a_detached_wait_keeps_draining_for_a_late_writer() {
         let (reader, mut writer) = tokio::io::duplex(8);
-        let capture = StderrCapture::spawn(reader, 64).detached();
+        let mut capture = StderrCapture::spawn(reader, 64);
+        capture.detach();
         let cancelled = tokio::time::timeout(
             Duration::from_millis(50),
             capture.finish(Duration::from_secs(30)),

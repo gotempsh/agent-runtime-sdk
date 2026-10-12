@@ -28,16 +28,19 @@ const AGENT: &str = r#"#!/bin/sh
 # Scripted ACP agent. MOCK_ACP_MODE: ok, auth, hang, linger, stall (never
 # reacts to a permission reply), split (streams a tool result, then completes
 # with a bare status), orphan (never answers, and leaves a child of its own
-# process group that keeps stderr open) or finish_orphan (leaves the same
-# child, then runs the turn to completion and exits).
+# process group that keeps stderr open), finish_orphan (leaves a child that
+# writes to stderr after 8 seconds, then runs the turn to completion and
+# exits) or late_orphan (the same child after 2 seconds, and never answers).
 if [ "$1" = --version ]; then echo "mock-agent 0.1.0"; exit 0; fi
 log="$MOCK_ACP_LOG"
 say() { printf '%s\n' "$1"; }
 update() { say "{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"mock-session\",\"update\":$1}}"; }
-if [ "$MOCK_ACP_MODE" = finish_orphan ]; then
+if [ "$MOCK_ACP_MODE" = finish_orphan ] || [ "$MOCK_ACP_MODE" = late_orphan ]; then
   # Outlives the turn, then writes to the inherited stderr and records that
   # the write succeeded: a closed pipe would kill it with SIGPIPE first.
-  child='sleep 8; echo late diagnostic >&2; echo wrote > "$1"'
+  delay=8
+  if [ "$MOCK_ACP_MODE" = late_orphan ]; then delay=2; fi
+  child="sleep $delay; echo late diagnostic >&2; echo wrote > \"\$1\""
   if command -v perl >/dev/null 2>&1; then
     perl -MPOSIX -e 'POSIX::setsid(); exec @ARGV' sh -c "$child" sh "$log.late" >/dev/null &
   else
@@ -56,7 +59,7 @@ while IFS= read -r line; do
   printf '%s\n' "$line" >> "$log"
   case "$line" in
     *'"method":"initialize"'*)
-      if [ "$MOCK_ACP_MODE" = orphan ]; then continue; fi
+      if [ "$MOCK_ACP_MODE" = orphan ] || [ "$MOCK_ACP_MODE" = late_orphan ]; then continue; fi
       say '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true},"authMethods":[{"id":"login","name":"Log in with Mock"}],"agentInfo":{"name":"mock-agent","version":"0.1.0"}}}' ;;
     *'"method":"session/new"'*)
       if [ "$MOCK_ACP_MODE" = auth ]; then
@@ -655,4 +658,30 @@ async fn discovery_lists_registered_acp_agents_that_are_installed() {
     let readiness = runtime.readiness(Provider::Acp).await.unwrap();
     assert!(!readiness.installed);
     assert!(readiness.detail.contains("agent is registered"));
+}
+
+#[tokio::test]
+async fn a_failed_turn_stops_reading_stderr() {
+    let fixture = Fixture::new();
+    let mut request = fixture.request("run the tests");
+    request.permission_mode = PermissionMode::FullAccess;
+    // The agent never answers, so the turn fails at its deadline, before the
+    // descendant that escaped the process group writes to stderr.
+    request.timeout = Duration::from_secs(1);
+    let result = fixture
+        .runtime("late_orphan")
+        .run(request, &Collector::default(), None)
+        .await;
+    assert!(
+        matches!(result, Err(RuntimeError::Timeout { .. })),
+        "{result:?}"
+    );
+    // A failed turn has nothing to preserve, so the reader goes with it and
+    // the descendant's later write finds a closed pipe.
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    let wrote = std::fs::read_to_string(format!("{}.late", fixture.log.display())).is_ok();
+    if let Ok(pid) = std::fs::read_to_string(format!("{}.orphan", fixture.log.display())) {
+        let _ = std::process::Command::new("kill").arg(pid.trim()).status();
+    }
+    assert!(!wrote, "a failed turn left its stderr reader running");
 }
