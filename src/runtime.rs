@@ -1007,7 +1007,19 @@ async fn supervise_idle_retained_process(
         match observed {
             None => {}
             Some(Ok(Some(line))) => match adapter.classify_idle_frame(&line) {
-                IdleFrame::Background => {}
+                IdleFrame::Background => {
+                    // Work an earlier turn left pending can still answer; the
+                    // adapter may need to clean up what it opened.
+                    let replies = adapter.idle_frame_writes(&line);
+                    if !replies.is_empty() {
+                        let mut io = retained.io.lock().await;
+                        if current(&retained) {
+                            if let Some(io) = io.as_mut() {
+                                write_optional_frames(Some(&mut io.stdin), &replies).await;
+                            }
+                        }
+                    }
+                }
                 IdleFrame::KeepaliveResult { active: true } => {
                     probe_deadline = None;
                     expires_at = tokio::time::Instant::now() + idle_timeout;
@@ -1125,9 +1137,14 @@ async fn apply_interrupted_frame(
             Err(_) => return false,
         }
     }
-    write_provider_frames(provider, Some(&mut io.stdin), &writes, "interrupt write")
+    if write_provider_frames(provider, Some(&mut io.stdin), &writes, "interrupt write")
         .await
-        .is_ok()
+        .is_err()
+    {
+        return false;
+    }
+    write_optional_frames(Some(&mut io.stdin), &output.optional_writes).await;
+    true
 }
 
 /// Encode a refusal for an approval or question no one can answer.
@@ -1285,9 +1302,14 @@ async fn park_frame(
         }
         parked.buffer(output.events, declined);
     }
-    write_provider_frames(provider, Some(&mut io.stdin), &writes, "parked write")
+    if write_provider_frames(provider, Some(&mut io.stdin), &writes, "parked write")
         .await
-        .is_ok()
+        .is_err()
+    {
+        return false;
+    }
+    write_optional_frames(Some(&mut io.stdin), &output.optional_writes).await;
+    true
 }
 
 /// Whether `event` announces an approval or question awaiting an answer.
@@ -1334,6 +1356,59 @@ async fn write_provider_frames(
             stream,
             source,
         })
+}
+
+/// Upper bound for finishing an optional frame whose first bytes were already
+/// accepted, so the stream is left at a frame boundary.
+const OPTIONAL_WRITE_COMPLETION: Duration = Duration::from_secs(2);
+
+/// Write [`AdapterOutput::optional_writes`] without ever waiting for them.
+///
+/// Each frame is offered to the writer exactly once. If it accepts nothing
+/// right away (a full pipe, a provider that stopped reading) the frame and the
+/// rest of the batch are dropped; a closed or failing writer is ignored. A
+/// frame the writer began to accept is completed first, because abandoning it
+/// half-written would glue the next frame onto it. These writes therefore
+/// cannot delay a turn, and nothing here can turn a completed turn into an
+/// error.
+async fn write_optional_frames(stdin: Option<&mut crate::TransportWriter>, frames: &[Vec<u8>]) {
+    let Some(writer) = stdin else { return };
+    for frame in frames {
+        let mut bytes = Vec::with_capacity(frame.len() + 1);
+        bytes.extend_from_slice(frame);
+        bytes.push(b'\n');
+        if !write_optional_frame(writer, &bytes).await {
+            return;
+        }
+    }
+}
+
+/// Returns whether the writer is still usable for the next optional frame.
+async fn write_optional_frame(writer: &mut crate::TransportWriter, bytes: &[u8]) -> bool {
+    use std::pin::Pin;
+    use std::task::Poll;
+    use tokio::io::{AsyncWrite, AsyncWriteExt};
+
+    let first =
+        std::future::poll_fn(|cx| Poll::Ready(Pin::new(&mut *writer).poll_write(cx, bytes))).await;
+    let written = match first {
+        Poll::Ready(Ok(written)) if written > 0 => written,
+        // No room right now, or a writer that can no longer take bytes.
+        Poll::Pending | Poll::Ready(_) => return false,
+    };
+    if written < bytes.len() {
+        let rest = writer.write_all(&bytes[written..]);
+        if !matches!(
+            tokio::time::timeout(OPTIONAL_WRITE_COMPLETION, rest).await,
+            Ok(Ok(()))
+        ) {
+            return false;
+        }
+    }
+    // Buffering writers hold the bytes until a flush. One that cannot flush
+    // yet keeps them for the next required write to push out.
+    let _ = std::future::poll_fn(|cx| Poll::Ready(Pin::new(&mut *writer).poll_flush(cx))).await;
+    true
 }
 
 /// Close a retained turn that reached its terminal frame or quiet completion.
@@ -4424,6 +4499,7 @@ impl AgentRuntime {
                             "OpenCode preflight",
                         )
                         .await?;
+                        write_optional_frames(Some(&mut writer), &output.optional_writes).await;
                     }
                 })
                 .await;
@@ -5126,6 +5202,7 @@ impl AgentRuntime {
                 "provider write",
             )
             .await?;
+            write_optional_frames(Some(&mut io.stdin), &output.optional_writes).await;
             if let Some(interaction) = output.interaction {
                 if self
                     .answer_retained_interaction(
@@ -5529,6 +5606,7 @@ impl AgentRuntime {
             }
             write_provider_frames(provider, stdin.as_mut(), &output.writes, "provider write")
                 .await?;
+            write_optional_frames(stdin.as_mut(), &output.optional_writes).await;
             if let Some(interaction) = output.interaction {
                 let response = match interaction {
                     InteractionRequest::Approval {
@@ -6363,6 +6441,69 @@ impl EventSink for CompactionGuard<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn optional_frames_are_written_in_order_when_the_writer_has_room() {
+        use tokio::io::AsyncReadExt;
+        let (writer, mut reader) = tokio::io::duplex(1024);
+        let mut writer: crate::TransportWriter = Box::new(writer);
+        write_optional_frames(Some(&mut writer), &[b"one".to_vec(), b"two".to_vec()]).await;
+        drop(writer);
+        let mut written = String::new();
+        reader.read_to_string(&mut written).await.unwrap();
+        assert_eq!(written, "one\ntwo\n");
+    }
+
+    #[tokio::test]
+    async fn an_optional_frame_a_blocked_writer_cannot_take_is_dropped_without_waiting() {
+        use tokio::io::AsyncReadExt;
+        // Eight bytes of room, filled by a required frame nobody reads.
+        let (writer, mut reader) = tokio::io::duplex(8);
+        let mut writer: crate::TransportWriter = Box::new(writer);
+        write_provider_frames(
+            Provider::Codex,
+            Some(&mut writer),
+            &[b"1234567".to_vec()],
+            "test write",
+        )
+        .await
+        .unwrap();
+
+        // Would block forever if awaited; it must return at once.
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            write_optional_frames(Some(&mut writer), &[b"cleanup".to_vec()]),
+        )
+        .await
+        .expect("an optional write must not wait for a blocked writer");
+
+        drop(writer);
+        let mut written = String::new();
+        reader.read_to_string(&mut written).await.unwrap();
+        assert_eq!(
+            written, "1234567\n",
+            "the dropped frame left no partial bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_optional_frame_cannot_fail_on_a_closed_writer() {
+        let (writer, reader) = tokio::io::duplex(1024);
+        drop(reader);
+        let mut writer: crate::TransportWriter = Box::new(writer);
+        write_optional_frames(Some(&mut writer), &[b"cleanup".to_vec()]).await;
+        // A required write to the same writer does fail, which is the
+        // difference an optional frame exists for.
+        let required = write_provider_frames(
+            Provider::Codex,
+            Some(&mut writer),
+            &[b"cleanup".to_vec()],
+            "test write",
+        )
+        .await;
+        assert!(matches!(required, Err(RuntimeError::ProcessIo { .. })));
+        write_optional_frames(None, &[b"cleanup".to_vec()]).await;
+    }
 
     #[test]
     fn only_native_compaction_silences_the_empty_reply_warning() {
@@ -7449,6 +7590,7 @@ mod tests {
                         original: value,
                     }),
                     writes: Vec::new(),
+                    optional_writes: Vec::new(),
                     terminal: false,
                     turn_submitted: false,
                 })

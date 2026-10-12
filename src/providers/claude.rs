@@ -1438,7 +1438,9 @@ impl AgentAdapter for Claude {
         // title into the session, and an already-titled session answers with
         // its existing title without generating another.
         if let Some(description) = native.session_title_description.take() {
-            output.writes.push(session_title_frame(&description)?);
+            output
+                .optional_writes
+                .push(session_title_frame(&description)?);
         }
         match value
             .get("type")
@@ -4307,8 +4309,11 @@ setTimeout(() => {
                 &mut state,
             )
             .unwrap();
-        assert_eq!(first.writes.len(), 1);
-        let frame: Value = serde_json::from_slice(&first.writes[0]).unwrap();
+        // An optional write: a blocked or closed stdin can neither delay nor
+        // fail the turn over a title.
+        assert_eq!(first.writes.len(), 0);
+        assert_eq!(first.optional_writes.len(), 1);
+        let frame: Value = serde_json::from_slice(&first.optional_writes[0]).unwrap();
         assert_eq!(frame["type"], "control_request");
         assert_eq!(frame["request_id"], SESSION_TITLE_REQUEST_ID);
         assert_eq!(frame["request"]["subtype"], "generate_session_title");
@@ -4321,8 +4326,9 @@ setTimeout(() => {
         let later = adapter
             .parse_line(r#"{"type":"rate_limit_event"}"#, &mut state)
             .unwrap();
-        assert!(
-            later.writes.is_empty(),
+        assert_eq!(
+            later.optional_writes.len(),
+            0,
             "the title is requested once per turn"
         );
     }
@@ -4338,7 +4344,7 @@ setTimeout(() => {
                 &mut state,
             )
             .unwrap();
-        let frame: Value = serde_json::from_slice(&output.writes[0]).unwrap();
+        let frame: Value = serde_json::from_slice(&output.optional_writes[0]).unwrap();
         assert_eq!(
             frame["request"]["description"]
                 .as_str()
@@ -4363,7 +4369,7 @@ setTimeout(() => {
                     &mut state,
                 )
                 .unwrap();
-            assert_eq!(output.writes.len(), 0);
+            assert_eq!(output.writes.len() + output.optional_writes.len(), 0);
         }
     }
 

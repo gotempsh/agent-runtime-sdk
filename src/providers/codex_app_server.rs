@@ -531,6 +531,19 @@ fn title_frame(
         else {
             return false;
         };
+        // A hidden thread no live flow is waiting for opened after its turn
+        // ended (or for a flow an earlier turn owned). Nothing else will ever
+        // detach it, and a retained connection would keep it loaded.
+        let awaited = turn
+            .title
+            .as_ref()
+            .is_some_and(|flow| flow.awaits_thread(id));
+        if !awaited {
+            if let Some(thread) = orphaned_title_thread(value) {
+                push_frame(output, &orphan_unsubscribe(thread));
+                return true;
+            }
+        }
         // An answer for a flow this turn does not own is dropped too.
         if let Some(flow) = turn.title.as_mut() {
             flow.on_response(id, value, output);
@@ -563,7 +576,54 @@ fn title_frame(
     true
 }
 
+/// The hidden thread a successful title-flow `thread/start` answer opened.
+///
+/// The request id alone identifies the step, so this holds without any state
+/// the finished turn took with it: the answer may arrive after the turn that
+/// sent the request, on a retained connection, with nothing left to say which
+/// flow it belonged to.
+fn orphaned_title_thread(value: &Value) -> Option<&str> {
+    let id = value.get("id")?.as_str()?;
+    let step = id.strip_prefix(TITLE_ID_PREFIX)?.rsplit('-').next()?;
+    if step != "thread" || value.get("error").is_some() {
+        return None;
+    }
+    value
+        .pointer("/result/thread/id")
+        .and_then(Value::as_str)
+        .filter(|thread| !thread.is_empty())
+}
+
+/// `thread/unsubscribe` for a hidden thread no flow owns any more. The id
+/// keeps the title prefix so its answer is dropped like every other.
+fn orphan_unsubscribe(thread: &str) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": format!("{TITLE_ID_PREFIX}orphan-{thread}-unsubscribe"),
+        "method": "thread/unsubscribe",
+        "params": {"threadId": thread},
+    })
+}
+
+/// Frames to write in answer to a frame read while no turn runs: the
+/// `thread/unsubscribe` for a hidden title thread whose `thread/start` was
+/// answered only after its turn ended.
+pub(super) fn idle_frame_writes(line: &str) -> Vec<Vec<u8>> {
+    let Ok(value) = serde_json::from_str::<Value>(line) else {
+        return Vec::new();
+    };
+    orphaned_title_thread(&value)
+        .and_then(|thread| encode(&orphan_unsubscribe(thread)).ok())
+        .into_iter()
+        .collect()
+}
+
 impl TitleFlow {
+    /// Whether `id` answers the `thread/start` this flow is waiting on.
+    fn awaits_thread(&self, id: &str) -> bool {
+        self.step == TitleStep::StartingThread && id == self.id("thread")
+    }
+
     /// Request id for one step of the current attempt.
     fn id(&self, step: &str) -> String {
         let attempt = if self.retried { 2 } else { 1 };
@@ -869,11 +929,12 @@ impl TitleFlow {
     }
 }
 
-/// Queue a title-flow frame. Encoding plain JSON cannot fail in practice, and
-/// a title is never worth failing the turn over.
+/// Queue a title-flow frame as an optional write: the runtime never waits for
+/// it and ignores its failure. Encoding plain JSON cannot fail in practice,
+/// and a title is never worth failing the turn over.
 fn push_frame(output: &mut AdapterOutput, frame: &Value) {
     if let Ok(bytes) = encode(frame) {
-        output.writes.push(bytes);
+        output.optional_writes.push(bytes);
     }
 }
 
@@ -1898,7 +1959,7 @@ mod tests {
         let mut state = AdapterState::default();
         let output = parse_line(&question_frame(true).to_string(), &mut state).unwrap();
 
-        assert!(output.writes.is_empty(), "{:?}", output.writes);
+        assert_eq!(writes(&output).len(), 0, "{:?}", writes(&output));
         assert!(matches!(
             output.interaction,
             Some(InteractionRequest::Question { ref request, .. }) if request.id == "server-9"
@@ -2432,7 +2493,17 @@ mod tests {
     }
 
     fn writes(output: &AdapterOutput) -> Vec<Value> {
-        output.writes.iter().cloned().map(decode).collect()
+        output
+            .writes
+            .iter()
+            .chain(&output.optional_writes)
+            .cloned()
+            .map(decode)
+            .collect()
+    }
+
+    fn no_writes(output: &AdapterOutput) -> bool {
+        output.writes.len() + output.optional_writes.len() == 0
     }
 
     fn feed(state: &mut AdapterState, frame: Value) -> AdapterOutput {
@@ -2548,6 +2619,10 @@ mod tests {
         // The user's turn is written first; titling never delays it.
         let opened_writes = writes(&opened);
         assert_eq!(opened_writes.len(), 2, "{opened_writes:?}");
+        // The title request is an optional write: the runtime never waits on
+        // it, so it cannot delay or fail the turn.
+        assert_eq!(opened.writes.len(), 1);
+        assert_eq!(opened.optional_writes.len(), 1);
         assert_eq!(opened_writes[0]["method"], "turn/start");
         assert_eq!(opened_writes[0]["params"]["threadId"], "thread-1");
         let config_read = &opened_writes[1];
@@ -2616,12 +2691,12 @@ mod tests {
             &turn_start,
             json!({"turn": {"id": "title-turn"}}),
         );
-        assert!(accepted.writes.is_empty() && accepted.events.is_empty());
+        assert!(no_writes(&accepted) && accepted.events.is_empty());
         let message = feed(
             &mut state,
             hidden_answer(r#"{"title":"Fix login redirect."}"#),
         );
-        assert!(message.writes.is_empty() && message.events.is_empty());
+        assert!(no_writes(&message) && message.events.is_empty());
 
         let done = feed(&mut state, hidden_completed("completed"));
         assert!(!done.terminal);
@@ -2653,7 +2728,7 @@ mod tests {
         assert!(echo.events.is_empty(), "{:?}", echo.events);
         for reply in [name, unsubscribe] {
             let late = answer(&mut state, &reply, json!({}));
-            assert!(late.events.is_empty() && late.writes.is_empty());
+            assert!(late.events.is_empty() && no_writes(&late));
         }
     }
 
@@ -2705,7 +2780,7 @@ mod tests {
             ] {
                 let output = feed(&mut state, frame);
                 assert!(!output.terminal);
-                assert!(output.writes.is_empty(), "{:?}", output.writes);
+                assert_eq!(writes(&output).len(), 0, "{:?}", writes(&output));
                 events.extend(output.events);
             }
             let approval = feed(
@@ -2771,16 +2846,16 @@ mod tests {
     #[test]
     fn no_title_is_requested_without_a_description_or_for_a_named_or_continued_thread() {
         let (_, opened) = open(&title_request(None), json!({"id": "thread-1"}));
-        assert_eq!(opened.writes.len(), 1);
+        assert_eq!(writes(&opened).len(), 1);
 
         let (_, opened) = open(&title_request(Some("   ")), json!({"id": "thread-1"}));
-        assert_eq!(opened.writes.len(), 1);
+        assert_eq!(writes(&opened).len(), 1);
 
         let (state, opened) = open(
             &title_request(Some(DESCRIPTION)),
             json!({"id": "thread-1", "name": "Named in the Codex app"}),
         );
-        assert_eq!(opened.writes.len(), 1);
+        assert_eq!(writes(&opened).len(), 1);
         assert_eq!(writes(&opened)[0]["method"], "turn/start");
         assert_eq!(
             state.result.session_title.as_deref(),
@@ -2791,14 +2866,14 @@ mod tests {
         request.session_id = Some("thread-1".into());
         request.continuation = true;
         let (_, opened) = open(&request, json!({"id": "thread-1"}));
-        assert_eq!(opened.writes.len(), 1);
+        assert_eq!(writes(&opened).len(), 1);
 
         let mut request = title_request(Some(DESCRIPTION));
         request.prompt = "/compact".into();
         request.session_id = Some("thread-1".into());
         let (_, opened) = open(&request, json!({"id": "thread-1"}));
         assert_eq!(writes(&opened)[0]["method"], "thread/compact/start");
-        assert_eq!(opened.writes.len(), 1);
+        assert_eq!(writes(&opened).len(), 1);
     }
 
     #[test]
@@ -2857,7 +2932,7 @@ mod tests {
         let (mut state, opened) =
             open(&title_request(Some(DESCRIPTION)), json!({"id": "thread-1"}));
         let unread = reject(&mut state, &writes(&opened)[1]);
-        assert!(unread.writes.is_empty() && unread.events.is_empty());
+        assert!(no_writes(&unread) && unread.events.is_empty());
 
         let (mut state, opened) =
             open(&title_request(Some(DESCRIPTION)), json!({"id": "thread-1"}));
@@ -2912,7 +2987,7 @@ mod tests {
             hidden_completed("completed"),
         ] {
             let output = feed(&mut state, late);
-            assert!(output.events.is_empty() && output.writes.is_empty());
+            assert!(output.events.is_empty() && no_writes(&output));
         }
         assert_eq!(state.result.session_title, None);
 
@@ -2932,6 +3007,117 @@ mod tests {
         ));
     }
 
+    /// Open the user's thread, answer `config/read`, and leave the hidden
+    /// `thread/start` unanswered. Returns that request.
+    fn pending_hidden_thread(state: &mut AdapterState, opened: &AdapterOutput) -> Value {
+        let started = answer(state, &writes(opened)[1], json!({"config": {}}));
+        let [thread_start] = writes(&started).try_into().unwrap();
+        assert_eq!(thread_start["method"], "thread/start");
+        thread_start
+    }
+
+    fn user_turn_completed(state: &mut AdapterState) -> AdapterOutput {
+        parse_line(
+            r#"{"jsonrpc":"2.0","id":4,"result":{"turn":{"id":"turn-1"}}}"#,
+            state,
+        )
+        .unwrap();
+        feed(
+            state,
+            json!({"jsonrpc": "2.0", "method": "turn/completed", "params": {
+                "threadId": "thread-1", "turn": {"id": "turn-1", "status": "completed"}}}),
+        )
+    }
+
+    #[test]
+    fn a_hidden_thread_that_opens_after_its_turn_ended_is_unsubscribed() {
+        let opened_reply = |request: &Value| {
+            json!({"jsonrpc": "2.0", "id": request["id"], "result": {
+                "thread": {"id": "title-thread"}, "sandbox": {"type": "readOnly"}}})
+        };
+        for retained in [false, true] {
+            let (mut state, opened) =
+                open(&title_request(Some(DESCRIPTION)), json!({"id": "thread-1"}));
+            if retained {
+                mark_retained(&mut state);
+            }
+            let thread_start = pending_hidden_thread(&mut state, &opened);
+            // The turn ends before the app server answers `thread/start`, so
+            // there is no hidden thread to detach yet.
+            let end = user_turn_completed(&mut state);
+            assert!(end.terminal);
+            assert_eq!(writes(&end).len(), 0, "retained: {retained}");
+
+            // The answer arrives on a later frame, and must not be dropped.
+            let late = feed(&mut state, opened_reply(&thread_start));
+            assert!(late.events.is_empty() && !late.terminal);
+            assert_eq!(late.writes.len(), 0);
+            let [unsubscribe] = writes(&late).try_into().unwrap();
+            assert_eq!(unsubscribe["method"], "thread/unsubscribe");
+            assert_eq!(unsubscribe["params"], json!({"threadId": "title-thread"}));
+            assert!(unsubscribe["id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with(TITLE_ID_PREFIX)));
+            assert_eq!(state.result.session_title, None);
+        }
+    }
+
+    #[test]
+    fn a_hidden_thread_of_an_earlier_turn_is_unsubscribed_by_the_next_one() {
+        let (mut old_state, opened) =
+            open(&title_request(Some(DESCRIPTION)), json!({"id": "thread-1"}));
+        let thread_start = pending_hidden_thread(&mut old_state, &opened);
+        user_turn_completed(&mut old_state);
+
+        // A later turn on the same connection owns its own flow, and with it a
+        // different request-id nonce.
+        let (mut state, reopened) =
+            open(&title_request(Some(DESCRIPTION)), json!({"id": "thread-1"}));
+        mark_retained(&mut state);
+        let orphan = feed(
+            &mut state,
+            json!({"jsonrpc": "2.0", "id": thread_start["id"], "result": {
+                "thread": {"id": "title-thread-old"}, "sandbox": {"type": "readOnly"}}}),
+        );
+        assert_eq!(orphan.events.len(), 0);
+        let [unsubscribe] = writes(&orphan).try_into().unwrap();
+        assert_eq!(
+            unsubscribe["params"],
+            json!({"threadId": "title-thread-old"})
+        );
+        // The live flow was not advanced by the foreign answer.
+        assert_eq!(load(&state).title.unwrap().step, TitleStep::ReadingConfig);
+        assert_eq!(writes(&reopened)[1]["method"], "config/read");
+    }
+
+    #[test]
+    fn a_late_hidden_thread_is_unsubscribed_between_turns() {
+        let (mut state, opened) =
+            open(&title_request(Some(DESCRIPTION)), json!({"id": "thread-1"}));
+        let thread_start = pending_hidden_thread(&mut state, &opened);
+        user_turn_completed(&mut state);
+
+        let line = json!({"jsonrpc": "2.0", "id": thread_start["id"], "result": {
+            "thread": {"id": "title-thread"}, "sandbox": {"type": "readOnly"}}})
+        .to_string();
+        assert_eq!(classify_idle_frame(&line), IdleFrame::Background);
+        let [frame] = idle_frame_writes(&line).try_into().unwrap();
+        let unsubscribe = decode(frame);
+        assert_eq!(unsubscribe["method"], "thread/unsubscribe");
+        assert_eq!(unsubscribe["params"], json!({"threadId": "title-thread"}));
+
+        // Nothing else a retained process reads between turns is answered.
+        for quiet in [
+            json!({"jsonrpc": "2.0", "id": thread_start["id"], "error": {"code": 1, "message": "no"}}),
+            json!({"jsonrpc": "2.0", "id": format!("{TITLE_ID_PREFIX}1-1-config"), "result": {}}),
+            json!({"jsonrpc": "2.0", "id": ID_KEEPALIVE, "result": {"data": []}}),
+            json!({"jsonrpc": "2.0", "method": "thread/started", "params": {}}),
+        ] {
+            assert_eq!(idle_frame_writes(&quiet.to_string()).len(), 0, "{quiet}");
+        }
+        assert_eq!(idle_frame_writes("not json").len(), 0);
+    }
+
     #[test]
     fn a_frame_answering_another_flow_is_dropped_without_advancing_this_one() {
         let (mut state, opened) =
@@ -2941,7 +3127,7 @@ mod tests {
             json!({"jsonrpc": "2.0", "id": format!("{TITLE_ID_PREFIX}0-1-config"),
                 "result": {"config": {}}}),
         );
-        assert!(foreign.writes.is_empty() && foreign.events.is_empty());
+        assert!(no_writes(&foreign) && foreign.events.is_empty());
         assert_eq!(load(&state).title.unwrap().step, TitleStep::ReadingConfig);
         assert_ne!(
             writes(&opened)[1]["id"],

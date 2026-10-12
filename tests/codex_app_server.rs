@@ -56,6 +56,22 @@ enum Script {
     /// way `codex app-server` does; the user's turn completes only once the
     /// hidden thread is unsubscribed.
     Title,
+    /// Like [`Script::Title`], but the app server completes the user's turn
+    /// and hangs up while the hidden title turn is still running.
+    TitleThenClose,
+    /// Like [`Script::Title`], but the user's turn completes while the hidden
+    /// `thread/start` is still unanswered; the reply follows the turn's end.
+    LateTitleThread,
+}
+
+impl Script {
+    /// Whether the user's thread opens unnamed, so a title is generated.
+    fn titles(self) -> bool {
+        matches!(
+            self,
+            Script::Title | Script::TitleThenClose | Script::LateTitleThread
+        )
+    }
 }
 
 #[derive(Clone)]
@@ -285,6 +301,23 @@ async fn serve(
                 )
                 .await;
             }
+            Some("thread/start")
+                if params.get("ephemeral") == Some(&json!(true))
+                    && script == Script::LateTitleThread =>
+            {
+                for frame in completion_frames(script) {
+                    send(&mut output, frame).await;
+                }
+                for frame in [
+                    json!({"jsonrpc":"2.0","method":"thread/started",
+                        "params":{"thread":{"id":"title-thread","ephemeral":true}}}),
+                    json!({"jsonrpc":"2.0","id":id,"result":{
+                        "thread":{"id":"title-thread"},"sandbox":{"type":"readOnly"},
+                        "model":params["model"]}}),
+                ] {
+                    send(&mut output, frame).await;
+                }
+            }
             Some("thread/start") if params.get("ephemeral") == Some(&json!(true)) => {
                 for frame in [
                     json!({"jsonrpc":"2.0","method":"thread/started",
@@ -295,6 +328,19 @@ async fn serve(
                 ] {
                     send(&mut output, frame).await;
                 }
+            }
+            Some("turn/start") if hidden && script == Script::TitleThenClose => {
+                send(
+                    &mut output,
+                    json!({"jsonrpc":"2.0","id":id,"result":{"turn":{"id":"title-turn"}}}),
+                )
+                .await;
+                for frame in completion_frames(script) {
+                    send(&mut output, frame).await;
+                }
+                // Hang up with the title still running: nothing is reading
+                // the SDK's stdin any more, and nothing is left to answer.
+                return;
             }
             Some("turn/start") if hidden => {
                 for frame in [
@@ -331,11 +377,13 @@ async fn serve(
                     json!({"jsonrpc":"2.0","id":id,"result":{"status":"unsubscribed"}}),
                 )
                 .await;
-                for frame in completion_frames(script) {
-                    send(&mut output, frame).await;
+                if script == Script::Title {
+                    for frame in completion_frames(script) {
+                        send(&mut output, frame).await;
+                    }
                 }
             }
-            Some("thread/start") if script == Script::Title => {
+            Some("thread/start") if script.titles() => {
                 send(
                     &mut output,
                     json!({"jsonrpc":"2.0","id":id,"result":{"thread":{"id":"thread-fixture"}}}),
@@ -412,7 +460,7 @@ async fn serve(
                     send(&mut output, frame).await;
                 }
                 user_turns += 1;
-                if script == Script::Title && user_turns > 1 {
+                if script.titles() && user_turns > 1 {
                     for frame in completion_frames(script) {
                         send(&mut output, frame).await;
                     }
@@ -524,7 +572,12 @@ fn opening_frames(script: Script) -> Vec<Value> {
                         "options":[{"label":"Dark","description":"Dim"}]}]}
             })]
         }
-        Script::Interrupt | Script::Crash | Script::CompactionCrash | Script::Title => Vec::new(),
+        Script::Interrupt
+        | Script::Crash
+        | Script::CompactionCrash
+        | Script::Title
+        | Script::TitleThenClose
+        | Script::LateTitleThread => Vec::new(),
     }
 }
 
@@ -1713,4 +1766,71 @@ async fn a_retained_process_titles_a_session_and_stays_reusable() {
         .unwrap();
     assert_eq!(second.session_id.as_deref(), Some("thread-fixture"));
     assert_eq!(transport.spawn_count(), 1);
+}
+
+#[tokio::test]
+async fn a_title_cleanup_write_cannot_fail_a_completed_turn() {
+    // The app server completes the turn and hangs up while the hidden title
+    // turn runs, so `thread/unsubscribe` has nowhere to go.
+    let transport = AppServer::new(Script::TitleThenClose);
+    let events = Collector::default();
+    let runtime = runtime(transport.clone());
+    let mut request = request();
+    request.request_session_title = Some("Review the workspace for stale config".into());
+
+    let result = runtime
+        .run(request, &events, None)
+        .await
+        .expect("a failed title cleanup must not replace the turn's success");
+
+    assert_eq!(result.text, "Working");
+    assert_eq!(result.session_title, None);
+}
+
+#[tokio::test]
+async fn a_title_cleanup_write_cannot_fail_a_completed_retained_turn() {
+    let transport = AppServer::new(Script::TitleThenClose);
+    let runtime = retained_runtime(transport.clone(), Duration::from_secs(30));
+    let (_client, handle) = retained_handle(runtime).await;
+    let mut input = TurnInput::new(InvocationId::new("titled").unwrap(), "first");
+    input.request_session_title = Some("Review the workspace".into());
+
+    let result = handle
+        .start_turn(input)
+        .await
+        .unwrap()
+        .wait()
+        .await
+        .expect("a failed title cleanup must not replace the turn's success");
+
+    assert_eq!(result.text, "Working");
+}
+
+#[tokio::test]
+async fn a_hidden_thread_opened_after_its_turn_ended_is_unsubscribed_between_turns() {
+    // The user's turn ends while the hidden `thread/start` is unanswered. On a
+    // retained connection the reply then arrives with no turn running, and the
+    // thread it opened must still be detached.
+    let transport = AppServer::new(Script::LateTitleThread);
+    let runtime = retained_runtime(transport.clone(), Duration::from_secs(30));
+    let (_client, handle) = retained_handle(runtime).await;
+    let mut input = TurnInput::new(InvocationId::new("titled").unwrap(), "first");
+    input.request_session_title = Some("Review the workspace".into());
+
+    let result = handle
+        .start_turn(input)
+        .await
+        .unwrap()
+        .wait()
+        .await
+        .unwrap();
+    assert_eq!(result.text, "Working");
+
+    let unsubscribe = transport
+        .wait_for("thread/unsubscribe")
+        .await
+        .expect("the late hidden thread is detached");
+    assert_eq!(unsubscribe["params"], json!({"threadId": "title-thread"}));
+    // The late reply did not retire the process.
+    assert_eq!(transport.termination_count(), 0);
 }
