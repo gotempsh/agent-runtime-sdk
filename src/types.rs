@@ -381,6 +381,16 @@ pub struct TurnRequest {
     /// anything else fails with [`crate::RuntimeError::NothingToContinue`]
     /// before writing to the provider.
     pub continuation: bool,
+    /// Ask the harness to title a session that has no title yet, the way its
+    /// own interactive client does, from this user-written description of the
+    /// task (normally the session's first prompt, without injected context).
+    ///
+    /// The title arrives as [`TurnEvent::SessionTitle`] and in
+    /// [`TurnResult::session_title`]. Generation runs alongside the turn and
+    /// never delays it, so a turn that ends first simply reports no title;
+    /// keep setting this until one arrives. Adapters whose harness titles
+    /// sessions by itself, or cannot, ignore it. The runtime never logs it.
+    pub request_session_title: Option<String>,
 }
 
 impl fmt::Debug for TurnRequest {
@@ -413,6 +423,10 @@ impl fmt::Debug for TurnRequest {
             &self.required_sandbox_capabilities,
         );
         debug.field("continuation", &self.continuation);
+        debug.field(
+            "request_session_title_bytes",
+            &self.request_session_title.as_ref().map(String::len),
+        );
         debug.finish_non_exhaustive()
     }
 }
@@ -446,6 +460,7 @@ impl TurnRequest {
             sandbox: None,
             required_sandbox_capabilities: crate::SandboxCapabilities::NONE,
             continuation: false,
+            request_session_title: None,
         }
     }
 }
@@ -1057,6 +1072,12 @@ pub enum TurnEvent {
         /// Provider-native display title when the harness reports one.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         title: Option<String>,
+    },
+    /// The harness titled the session (see
+    /// [`TurnRequest::request_session_title`]) or its title changed.
+    SessionTitle {
+        /// Provider-native display title, trimmed and non-empty.
+        title: String,
     },
     /// Incremental assistant prose.
     TextDelta {

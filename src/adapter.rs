@@ -241,6 +241,16 @@ pub struct AdapterOutput {
     /// issuing the next call once the previous response arrived. An adapter
     /// that uses this field must set [`CommandSpec::interactive_stdin`].
     pub writes: Vec<Vec<u8>>,
+    /// Provider-native frames the runtime may write after [`Self::writes`] but
+    /// never waits for: housekeeping such as a session-title request or the
+    /// cleanup of a hidden thread.
+    ///
+    /// Each frame is written only if the provider's stdin accepts it at once.
+    /// One that would block is dropped, and a failed write is ignored, so these
+    /// frames can neither delay a turn nor fail it, even one that has just
+    /// completed. An adapter must only put frames here whose loss costs the
+    /// caller a nicety, not the turn.
+    pub optional_writes: Vec<Vec<u8>>,
     /// True after a provider terminal frame. The runtime then closes stdin.
     pub terminal: bool,
     /// The provider acknowledged the submitted prompt for this turn.
@@ -581,6 +591,17 @@ pub trait AgentAdapter: Send + Sync {
     fn classify_idle_frame(&self, line: &str) -> IdleFrame {
         let _ = line;
         IdleFrame::Unexpected
+    }
+
+    /// Frames to write in answer to a frame [`Self::classify_idle_frame`] read
+    /// between turns, such as cleanup for work an earlier turn left pending.
+    ///
+    /// They are written like [`AdapterOutput::optional_writes`]: only if stdin
+    /// accepts them at once, and a failure is ignored. The default writes
+    /// nothing.
+    fn idle_frame_writes(&self, line: &str) -> Vec<Vec<u8>> {
+        let _ = line;
+        Vec::new()
     }
 
     /// Supply a protocol carrier to use instead of the child's stdout and stdin.

@@ -207,6 +207,8 @@ pub struct TurnInput {
     pub attachments: Vec<TurnAttachment>,
     /// How provider approvals and questions must be handled.
     pub interaction_policy: InteractionPolicy,
+    /// See [`TurnRequest::request_session_title`].
+    pub request_session_title: Option<String>,
 }
 
 impl TurnInput {
@@ -230,6 +232,7 @@ impl TurnInput {
             environment: BTreeMap::new(),
             attachments: Vec::new(),
             interaction_policy: InteractionPolicy::Deny,
+            request_session_title: None,
         }
     }
 }
@@ -1669,6 +1672,7 @@ impl RuntimeEntry {
             sandbox: self.spec.sandbox.clone(),
             required_sandbox_capabilities: self.spec.required_sandbox_capabilities,
             continuation: input.invocation_kind == RuntimeInvocationKind::Continuation,
+            request_session_title: input.request_session_title.clone(),
         }
     }
 

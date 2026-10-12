@@ -39,6 +39,23 @@ const ID_TURN: u64 = 4;
 const ID_INTERRUPT: u64 = 5;
 /// Written only by [`keepalive_probe`] between turns.
 const ID_KEEPALIVE: &str = "sdk-idle-keepalive";
+/// Prefix of every request id the session-title flow writes. The rest of the
+/// id names the flow and the step, so a late answer for an abandoned flow can
+/// neither advance a newer one nor be mistaken for a keepalive answer.
+const TITLE_ID_PREFIX: &str = "sdk-title-";
+
+/// Model Codex's own TUI titles threads with (`codex-rs/tui/src/app/thread_title.rs`).
+const TITLE_MODEL: &str = "gpt-5.6-luna";
+/// Longest title the TUI asks for and keeps.
+const TITLE_MAX_CHARS: usize = 36;
+/// Byte bound of the whole title prompt, instructions included.
+const TITLE_PROMPT_MAX_BYTES: usize = 960;
+/// Longest structured answer the hidden title turn may return.
+const TITLE_RESPONSE_MAX_BYTES: usize = 8 * 1024;
+/// `ThreadSource::Feature("thread_title")`, which serializes as its name.
+const TITLE_THREAD_SOURCE: &str = "thread_title";
+/// `codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_READ_ONLY`.
+const READ_ONLY_PERMISSION_PROFILE: &str = ":read-only";
 
 /// Reply sent for a question the turn did not wait on. An empty answer set
 /// reads to the model as "the user chose nothing"; this says what actually
@@ -86,6 +103,64 @@ struct TurnState {
     /// This invocation compacts the thread (`thread/compact/start`) instead of
     /// starting a turn.
     manual_compaction: bool,
+    /// Hidden thread that titles a new session, when one was requested.
+    title: Option<TitleFlow>,
+}
+
+/// Where the session-title flow is. Every step waits on exactly one answer.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+enum TitleStep {
+    /// Waiting for the user's thread to open.
+    #[default]
+    Waiting,
+    /// `config/read`, to learn which MCP servers to disable.
+    ReadingConfig,
+    /// `thread/start` of the hidden thread.
+    StartingThread,
+    /// `turn/start` on the hidden thread.
+    StartingTurn,
+    /// The hidden turn is generating the title.
+    Running,
+    /// Finished, failed, or abandoned. Nothing more is written.
+    Done,
+}
+
+/// Codex's TUI titles a new thread from a hidden, ephemeral, read-only thread
+/// with every tool disabled, then names the visible thread with the result
+/// (`codex-rs/tui/src/app/thread_title.rs`, `temporary_structured_request.rs`).
+/// This replays it on the turn's own app-server connection. It runs alongside
+/// the user's turn and never delays or fails it: every error ends the flow
+/// silently, and a turn that ends first abandons it.
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+struct TitleFlow {
+    /// Distinguishes this flow's request ids from every other flow's.
+    nonce: String,
+    /// The bounded prompt, built exactly like the TUI's `thread_title_prompt`.
+    prompt: String,
+    cwd: String,
+    /// MCP servers the hidden thread must not start.
+    mcp_servers: Vec<String>,
+    /// Model of the user's thread, the fallback when the title model fails.
+    main_model: Option<String>,
+    /// Model provider of the user's thread.
+    model_provider: Option<String>,
+    /// Model of the current attempt; `None` is the server's default model.
+    model: Option<String>,
+    /// The single fallback attempt was already used.
+    retried: bool,
+    step: TitleStep,
+    /// Hidden thread of the current attempt.
+    thread_id: Option<String>,
+    /// Every hidden thread this flow opened, so frames of an abandoned
+    /// attempt stay out of the user's turn too.
+    hidden_threads: Vec<String>,
+    /// Hidden turn of the current attempt.
+    turn_id: Option<String>,
+    /// Latest final agent message of the hidden turn.
+    response: Option<String>,
+    /// The user's thread was named some other way meanwhile; that name wins.
+    superseded: bool,
 }
 
 pub(super) fn mark_retained(state: &mut AdapterState) {
@@ -215,6 +290,20 @@ pub(super) fn prepare_turn(request: &TurnRequest, state: &mut AdapterState) -> R
         }
     }
 
+    let manual_compaction = super::is_manual_compaction_prompt(&request.prompt);
+    let title = request
+        .request_session_title
+        .as_deref()
+        .filter(|_| !request.continuation && !manual_compaction)
+        .map(str::trim)
+        .filter(|description| !description.is_empty())
+        .map(|description| TitleFlow {
+            nonce: title_nonce(),
+            prompt: title_prompt(description),
+            cwd: request.working_directory.to_string_lossy().into_owned(),
+            mcp_servers: request.launch_context.mcp_servers.keys().cloned().collect(),
+            ..TitleFlow::default()
+        });
     store(
         state,
         &TurnState {
@@ -222,7 +311,8 @@ pub(super) fn prepare_turn(request: &TurnRequest, state: &mut AdapterState) -> R
             turn_params,
             resume: request.session_id.is_some(),
             model: request.model.clone(),
-            manual_compaction: super::is_manual_compaction_prompt(&request.prompt),
+            manual_compaction,
+            title,
             ..TurnState::default()
         },
     );
@@ -286,6 +376,16 @@ pub(super) fn classify_idle_frame(line: &str) -> IdleFrame {
                     .is_some_and(|terminals| !terminals.is_empty()),
             }
         }
+        // A session-title flow the finished turn abandoned can still be
+        // answered. It never owes the process anything.
+        Some(id)
+            if !has_method
+                && id
+                    .as_str()
+                    .is_some_and(|id| id.starts_with(TITLE_ID_PREFIX)) =>
+        {
+            IdleFrame::Background
+        }
         _ => IdleFrame::Unexpected,
     }
 }
@@ -301,6 +401,19 @@ pub(super) fn parse_line(line: &str, state: &mut AdapterState) -> Result<Adapter
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
+    // The hidden title thread shares this connection. Nothing it sends may
+    // reach the user's turn: not its text, usage, errors, nor its end.
+    if title_frame(&value, &method, &mut turn, state, &mut output) {
+        store(state, &turn);
+        return Ok(output);
+    }
+    // A rename names its thread but no turn, so a retained connection would
+    // otherwise drop it as uncorrelated.
+    if method == "thread/name/updated" && value.get("id").is_none() {
+        notification(&value, &method, &mut turn, state, &mut output);
+        store(state, &turn);
+        return Ok(output);
+    }
     // `thread/compact/start` answers with an empty result; the compaction's
     // turn id first appears on `turn/started`, so a manual compaction adopts
     // it there instead of discarding its own turn as uncorrelated.
@@ -355,6 +468,13 @@ pub(super) fn parse_line(line: &str, state: &mut AdapterState) -> Result<Adapter
     } else {
         notification(&value, &method, &mut turn, state, &mut output);
     }
+    if output.terminal {
+        // The title is lost for this turn; the next one asks again. Detach a
+        // hidden thread a retained connection would otherwise keep loaded.
+        if let Some(flow) = turn.title.as_mut() {
+            flow.abandon(&mut output);
+        }
+    }
     store(state, &turn);
     Ok(output)
 }
@@ -391,6 +511,516 @@ fn reported_turn_id(value: &Value) -> Option<&str> {
         .pointer("/params/turnId")
         .or_else(|| value.pointer("/params/turn/id"))
         .and_then(Value::as_str)
+}
+
+/// Route a frame that belongs to the session-title flow, returning whether it
+/// did. A routed frame never reaches the user's turn.
+fn title_frame(
+    value: &Value,
+    method: &str,
+    turn: &mut TurnState,
+    state: &mut AdapterState,
+    output: &mut AdapterOutput,
+) -> bool {
+    let real_thread = turn.thread_id.clone();
+    if method.is_empty() {
+        let Some(id) = value
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| id.starts_with(TITLE_ID_PREFIX))
+        else {
+            return false;
+        };
+        // A hidden thread no live flow is waiting for opened after its turn
+        // ended (or for a flow an earlier turn owned). Nothing else will ever
+        // detach it, and a retained connection would keep it loaded.
+        let awaited = turn
+            .title
+            .as_ref()
+            .is_some_and(|flow| flow.awaits_thread(id));
+        if !awaited {
+            if let Some(thread) = orphaned_title_thread(value) {
+                push_frame(output, &orphan_unsubscribe(thread));
+                return true;
+            }
+        }
+        // An answer for a flow this turn does not own is dropped too.
+        if let Some(flow) = turn.title.as_mut() {
+            flow.on_response(id, value, output);
+        }
+        return true;
+    }
+    let Some(flow) = turn.title.as_mut() else {
+        return false;
+    };
+    let reported = value
+        .pointer("/params/threadId")
+        .or_else(|| value.pointer("/params/thread/id"))
+        .and_then(Value::as_str);
+    if !reported.is_some_and(|reported| flow.hidden_threads.iter().any(|own| own == reported)) {
+        return false;
+    }
+    if let Some(id) = value.get("id") {
+        // The hidden thread has no tools and no user to ask; whatever it
+        // requests is refused so it cannot stall.
+        push_frame(
+            output,
+            &json!({"jsonrpc": "2.0", "id": id, "error": {
+                "code": -32000,
+                "message": "The session-title thread cannot request approvals or input.",
+            }}),
+        );
+    } else {
+        flow.on_notification(method, value, real_thread.as_deref(), state, output);
+    }
+    true
+}
+
+/// The hidden thread a successful title-flow `thread/start` answer opened.
+///
+/// The request id alone identifies the step, so this holds without any state
+/// the finished turn took with it: the answer may arrive after the turn that
+/// sent the request, on a retained connection, with nothing left to say which
+/// flow it belonged to.
+fn orphaned_title_thread(value: &Value) -> Option<&str> {
+    let id = value.get("id")?.as_str()?;
+    let step = id.strip_prefix(TITLE_ID_PREFIX)?.rsplit('-').next()?;
+    if step != "thread" || value.get("error").is_some() {
+        return None;
+    }
+    value
+        .pointer("/result/thread/id")
+        .and_then(Value::as_str)
+        .filter(|thread| !thread.is_empty())
+}
+
+/// `thread/unsubscribe` for a hidden thread no flow owns any more. The id
+/// keeps the title prefix so its answer is dropped like every other.
+fn orphan_unsubscribe(thread: &str) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": format!("{TITLE_ID_PREFIX}orphan-{thread}-unsubscribe"),
+        "method": "thread/unsubscribe",
+        "params": {"threadId": thread},
+    })
+}
+
+/// Frames to write in answer to a frame read while no turn runs: the
+/// `thread/unsubscribe` for a hidden title thread whose `thread/start` was
+/// answered only after its turn ended.
+pub(super) fn idle_frame_writes(line: &str) -> Vec<Vec<u8>> {
+    let Ok(value) = serde_json::from_str::<Value>(line) else {
+        return Vec::new();
+    };
+    orphaned_title_thread(&value)
+        .and_then(|thread| encode(&orphan_unsubscribe(thread)).ok())
+        .into_iter()
+        .collect()
+}
+
+impl TitleFlow {
+    /// Whether `id` answers the `thread/start` this flow is waiting on.
+    fn awaits_thread(&self, id: &str) -> bool {
+        self.step == TitleStep::StartingThread && id == self.id("thread")
+    }
+
+    /// Request id for one step of the current attempt.
+    fn id(&self, step: &str) -> String {
+        let attempt = if self.retried { 2 } else { 1 };
+        format!("{TITLE_ID_PREFIX}{}-{attempt}-{step}", self.nonce)
+    }
+
+    fn send(&self, output: &mut AdapterOutput, step: &str, method: &str, params: Value) {
+        push_frame(
+            output,
+            &json!({"jsonrpc": "2.0", "id": self.id(step), "method": method, "params": params}),
+        );
+    }
+
+    /// Read the effective configuration for the MCP servers to disable, like
+    /// the TUI does before every hidden thread.
+    fn read_config(&mut self, output: &mut AdapterOutput) {
+        self.step = TitleStep::ReadingConfig;
+        self.send(
+            output,
+            "config",
+            "config/read",
+            json!({"includeLayers": false, "cwd": self.cwd}),
+        );
+    }
+
+    /// `thread/start` an ephemeral, read-only thread with every tool, MCP
+    /// server and extension disabled (`start_temporary_thread`).
+    fn start_thread(&mut self, output: &mut AdapterOutput) {
+        self.step = TitleStep::StartingThread;
+        self.thread_id = None;
+        self.turn_id = None;
+        self.response = None;
+        let mut config = Map::new();
+        for feature in [
+            "apps",
+            "code_mode",
+            "code_mode_only",
+            "context_management",
+            "current_time_reminder",
+            "deferred_executor",
+            "enable_fanout",
+            "goals",
+            "hooks",
+            "image_generation",
+            "memories",
+            "multi_agent",
+            "multi_agent_v2",
+            "plugins",
+            "request_permissions_tool",
+            "shell_snapshot",
+            "shell_tool",
+            "standalone_web_search",
+            "token_budget",
+            "tool_suggest",
+            "unified_exec",
+            "view_image",
+        ] {
+            config.insert(format!("features.{feature}"), json!(false));
+        }
+        for key in [
+            "cloud.skills.enabled",
+            "skills.include_instructions",
+            "tools.experimental_request_user_input.enabled",
+            "tools.update_plan.enabled",
+        ] {
+            config.insert(key.to_string(), json!(false));
+        }
+        config.insert("web_search".to_string(), json!("disabled"));
+        config.insert(
+            "default_permissions".to_string(),
+            json!(READ_ONLY_PERMISSION_PROFILE),
+        );
+        // One dotted key per server merges `enabled = false` into the
+        // server's own definition. A nested `mcp_servers` object replaces it
+        // instead, which Codex refuses ("invalid transport") for a server
+        // that only a `--config` override on the app-server defines, such as
+        // the ones an application launches it with.
+        if self
+            .mcp_servers
+            .iter()
+            .all(|name| is_plain_server_name(name))
+        {
+            for name in &self.mcp_servers {
+                config.insert(format!("mcp_servers.{name}.enabled"), json!(false));
+            }
+        } else {
+            config.insert(
+                "mcp_servers".to_string(),
+                Value::Object(
+                    self.mcp_servers
+                        .iter()
+                        .map(|name| (name.clone(), json!({"enabled": false})))
+                        .collect(),
+                ),
+            );
+        }
+        let mut params = json!({
+            "cwd": self.cwd,
+            "sandbox": "read-only",
+            // Nothing on this connection can answer the hidden thread.
+            "approvalPolicy": "never",
+            "ephemeral": true,
+            "threadSource": TITLE_THREAD_SOURCE,
+            "environments": [],
+            "dynamicTools": [],
+            "runtimeWorkspaceRoots": [],
+            "selectedCapabilityRoots": [],
+            "config": config,
+        });
+        if let Some(model) = &self.model {
+            params["model"] = json!(model);
+        }
+        if let Some(provider) = &self.model_provider {
+            params["modelProvider"] = json!(provider);
+        }
+        self.send(output, "thread", "thread/start", params);
+    }
+
+    /// `turn/start` the structured title request (`start_structured_turn`).
+    fn start_turn(&mut self, output: &mut AdapterOutput) {
+        self.step = TitleStep::StartingTurn;
+        let mut params = json!({
+            "threadId": self.thread_id,
+            "input": [{"type": "text", "text": self.prompt}],
+            "outputSchema": title_output_schema(),
+        });
+        if self.model.as_deref() == Some(TITLE_MODEL) {
+            params["effort"] = json!("low");
+        }
+        self.send(output, "turn", "turn/start", params);
+    }
+
+    /// Try once more on the user's own model when the title model failed,
+    /// otherwise give up silently.
+    fn retry_or_finish(&mut self, output: &mut AdapterOutput) {
+        self.detach(output);
+        if !self.retried
+            && self.model.as_deref() == Some(TITLE_MODEL)
+            && self.main_model.as_deref() != Some(TITLE_MODEL)
+        {
+            self.retried = true;
+            self.model = self.main_model.clone();
+            self.start_thread(output);
+        } else {
+            self.step = TitleStep::Done;
+        }
+    }
+
+    /// Best-effort `thread/unsubscribe` of the current hidden thread.
+    fn detach(&mut self, output: &mut AdapterOutput) {
+        if let Some(thread) = self.thread_id.take() {
+            self.send(
+                output,
+                "unsubscribe",
+                "thread/unsubscribe",
+                json!({"threadId": thread}),
+            );
+        }
+    }
+
+    /// Stop because the user's turn ended first.
+    fn abandon(&mut self, output: &mut AdapterOutput) {
+        if self.step != TitleStep::Done {
+            self.detach(output);
+            self.step = TitleStep::Done;
+        }
+    }
+
+    fn on_response(&mut self, id: &str, value: &Value, output: &mut AdapterOutput) {
+        let failed = value.get("error").is_some();
+        let result = value.get("result").unwrap_or(&Value::Null);
+        if self.step == TitleStep::ReadingConfig && id == self.id("config") {
+            if failed {
+                // Fail closed, like the TUI: unknown MCP servers stay enabled
+                // otherwise.
+                self.step = TitleStep::Done;
+                return;
+            }
+            if let Some(servers) = result
+                .pointer("/config/mcp_servers")
+                .and_then(Value::as_object)
+            {
+                self.mcp_servers.extend(servers.keys().cloned());
+            }
+            self.mcp_servers.sort();
+            self.mcp_servers.dedup();
+            // The title model is an OpenAI model; another provider's thread
+            // titles with its own model straight away.
+            self.model = if matches!(self.model_provider.as_deref(), None | Some("openai")) {
+                Some(TITLE_MODEL.to_string())
+            } else {
+                self.main_model.clone()
+            };
+            self.start_thread(output);
+        } else if self.step == TitleStep::StartingThread && id == self.id("thread") {
+            if failed {
+                self.retry_or_finish(output);
+                return;
+            }
+            let Some(hidden) = result
+                .pointer("/thread/id")
+                .and_then(Value::as_str)
+                .filter(|hidden| !hidden.is_empty())
+            else {
+                self.step = TitleStep::Done;
+                return;
+            };
+            self.hidden_threads.push(hidden.to_string());
+            self.thread_id = Some(hidden.to_string());
+            // Fail closed, like the TUI, unless the thread really is read-only.
+            if result.pointer("/sandbox/type").and_then(Value::as_str) != Some("readOnly") {
+                self.detach(output);
+                self.step = TitleStep::Done;
+                return;
+            }
+            self.start_turn(output);
+        } else if self.step == TitleStep::StartingTurn && id == self.id("turn") {
+            if failed {
+                self.retry_or_finish(output);
+                return;
+            }
+            self.turn_id = result
+                .pointer("/turn/id")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            self.step = TitleStep::Running;
+        }
+        // `thread/name/set` and `thread/unsubscribe` answers, and answers for
+        // a step this flow already left, need nothing.
+    }
+
+    fn on_notification(
+        &mut self,
+        method: &str,
+        value: &Value,
+        real_thread: Option<&str>,
+        state: &mut AdapterState,
+        output: &mut AdapterOutput,
+    ) {
+        if !matches!(self.step, TitleStep::StartingTurn | TitleStep::Running) {
+            return;
+        }
+        let params = value.get("params").unwrap_or(&Value::Null);
+        if params.get("threadId").and_then(Value::as_str) != self.thread_id.as_deref() {
+            // A frame of an attempt this flow already abandoned.
+            return;
+        }
+        match method {
+            "item/completed" => {
+                let Some(item) = params.get("item") else {
+                    return;
+                };
+                if item.get("type").and_then(Value::as_str) != Some("agentMessage")
+                    || item.get("phase").and_then(Value::as_str) == Some("commentary")
+                {
+                    return;
+                }
+                if let Some(text) = item.get("text").and_then(Value::as_str) {
+                    self.response =
+                        (text.len() <= TITLE_RESPONSE_MAX_BYTES).then(|| text.to_string());
+                }
+            }
+            "turn/completed" | "turn/failed" => {
+                let completed = params.get("turn").unwrap_or(params);
+                if let (Some(reported), Some(own)) = (
+                    completed.get("id").and_then(Value::as_str),
+                    self.turn_id.as_deref(),
+                ) {
+                    if reported != own {
+                        return;
+                    }
+                }
+                let status = completed
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("completed");
+                if method == "turn/failed" || status != "completed" {
+                    // The title model can be unavailable to this account
+                    // even though the thread and turn were accepted.
+                    self.retry_or_finish(output);
+                    return;
+                }
+                if let Some(title) = self.response.as_deref().and_then(parse_title) {
+                    if !self.superseded {
+                        if let Some(real_thread) = real_thread {
+                            // Name the thread in Codex itself, so the Codex
+                            // app and `thread/list` show the same title.
+                            self.send(
+                                output,
+                                "name",
+                                "thread/name/set",
+                                json!({"threadId": real_thread, "name": title}),
+                            );
+                        }
+                        super::report_session_title(&title, state, output);
+                    }
+                }
+                self.detach(output);
+                self.step = TitleStep::Done;
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Queue a title-flow frame as an optional write: the runtime never waits for
+/// it and ignores its failure. Encoding plain JSON cannot fail in practice,
+/// and a title is never worth failing the turn over.
+fn push_frame(output: &mut AdapterOutput, frame: &Value) {
+    if let Ok(bytes) = encode(frame) {
+        output.optional_writes.push(bytes);
+    }
+}
+
+/// Whether `name` can sit unquoted inside a dotted config key.
+fn is_plain_server_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// A process-unique flow id. Ids only need to be unique per connection.
+fn title_nonce() -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        .to_string()
+}
+
+/// The TUI's `thread_title_output_schema`.
+fn title_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "title": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": TITLE_MAX_CHARS,
+            },
+        },
+        "required": ["title"],
+        "additionalProperties": false,
+    })
+}
+
+/// The TUI's `thread_title_prompt`: its instructions and the user's
+/// description, bounded to [`TITLE_PROMPT_MAX_BYTES`] without splitting a
+/// character.
+fn title_prompt(description: &str) -> String {
+    let prefix = format!(
+        "Generate a concise, single-line task title of at most {TITLE_MAX_CHARS} characters \
+         and under five words where possible. Start with an imperative verb. Capitalize only \
+         the first word unless the user's language, proper nouns, acronyms, or code terms \
+         require otherwise. Preserve ticket references exactly. Write in the user's language. \
+         Do not use quotes, markdown, or trailing punctuation. Do not answer the request.\
+         \n\nUser prompt:\n"
+    );
+    let remaining = TITLE_PROMPT_MAX_BYTES.saturating_sub(prefix.len());
+    let description = description
+        .trim()
+        .char_indices()
+        .take_while(|(index, character)| index + character.len_utf8() <= remaining)
+        .map(|(_, character)| character)
+        .collect::<String>();
+    format!("{prefix}{description}")
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GeneratedTitle {
+    title: String,
+}
+
+/// The TUI's `parse_thread_title`.
+fn parse_title(response: &str) -> Option<String> {
+    if !response.trim_start().starts_with('{') {
+        return None;
+    }
+    let title = serde_json::from_str::<GeneratedTitle>(response).ok()?.title;
+    let normalized = title
+        .trim()
+        .trim_matches(|character| {
+            matches!(
+                character,
+                '"' | '\'' | '`' | '\u{201C}' | '\u{201D}' | '\u{2018}' | '\u{2019}'
+            )
+        })
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim_end_matches(['.', '?', '!'])
+        .trim_end()
+        .to_string();
+    if normalized.is_empty() {
+        return None;
+    }
+    Some(normalized.chars().take(TITLE_MAX_CHARS).collect())
 }
 
 /// Advance the handshake with the response to one of our own requests.
@@ -446,13 +1076,13 @@ fn parse_response(
                 .filter(|id| !id.is_empty())
                 .ok_or_else(|| protocol("Codex opened a thread without an identifier"))?
                 .to_string();
-            if let Some(title) = result
+            let named = result
                 .pointer("/thread/name")
                 .or_else(|| result.pointer("/thread/title"))
                 .and_then(Value::as_str)
                 .map(str::trim)
-                .filter(|title| !title.is_empty())
-            {
+                .filter(|title| !title.is_empty());
+            if let Some(title) = named {
                 state.result.session_title = Some(title.to_string());
             }
             // `turn/completed` does not repeat the model, so record whatever
@@ -489,6 +1119,35 @@ fn parse_response(
             output
                 .writes
                 .push(encode(&request(ID_TURN, "turn/start", params))?);
+            // Written after the user's turn so titling never delays it.
+            let requested_model = turn.model.clone();
+            if let Some(flow) = turn
+                .title
+                .as_mut()
+                .filter(|flow| flow.step == TitleStep::Waiting)
+            {
+                if named.is_some() {
+                    flow.step = TitleStep::Done;
+                } else {
+                    flow.main_model = state
+                        .result
+                        .model
+                        .clone()
+                        .or_else(|| {
+                            result
+                                .get("model")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned)
+                        })
+                        .or(requested_model);
+                    flow.model_provider = result
+                        .get("modelProvider")
+                        .or_else(|| result.pointer("/thread/modelProvider"))
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
+                    flow.read_config(output);
+                }
+            }
         }
         ID_TURN => {
             turn.turn_id = result
@@ -631,16 +1290,42 @@ fn notification(
             }
         }
         "thread/name/updated" => {
+            // `ThreadNameUpdatedNotification` is `{threadId, threadName}`.
+            let own = match (
+                params.get("threadId").and_then(Value::as_str),
+                turn.thread_id.as_deref(),
+            ) {
+                (Some(reported), Some(current)) => reported == current,
+                _ => !turn.retained,
+            };
+            if !own {
+                return;
+            }
             if let Some(name) = params
-                .get("name")
+                .get("threadName")
+                .or_else(|| params.get("name"))
                 .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|name| !name.is_empty())
+                .filter(|name| !name.trim().is_empty())
             {
-                state.result.session_title = Some(name.to_string());
+                if let Some(flow) = turn
+                    .title
+                    .as_mut()
+                    .filter(|flow| flow.step != TitleStep::Done)
+                {
+                    flow.superseded = true;
+                }
+                super::report_session_title(name, state, output);
             }
         }
         "warning" => {
+            // A warning that names another thread (the hidden title thread
+            // before its id is known) is not about this turn.
+            let reported = params.get("threadId").and_then(Value::as_str);
+            if let (Some(reported), Some(current)) = (reported, turn.thread_id.as_deref()) {
+                if reported != current {
+                    return;
+                }
+            }
             if let Some(message) = params
                 .get("message")
                 .and_then(Value::as_str)
@@ -703,6 +1388,12 @@ fn notification(
             }
         }
         "error" => {
+            let reported = params.get("threadId").and_then(Value::as_str);
+            if let (Some(reported), Some(current)) = (reported, turn.thread_id.as_deref()) {
+                if reported != current {
+                    return;
+                }
+            }
             turn.error_message = params
                 .pointer("/error/message")
                 .or_else(|| params.get("message"))
@@ -1268,7 +1959,7 @@ mod tests {
         let mut state = AdapterState::default();
         let output = parse_line(&question_frame(true).to_string(), &mut state).unwrap();
 
-        assert!(output.writes.is_empty(), "{:?}", output.writes);
+        assert_eq!(writes(&output).len(), 0, "{:?}", writes(&output));
         assert!(matches!(
             output.interaction,
             Some(InteractionRequest::Question { ref request, .. }) if request.id == "server-9"
@@ -1788,5 +2479,743 @@ mod tests {
 
         assert!(output.interaction.is_none());
         assert_eq!(decode(output.writes[0].clone())["id"], json!("server-5"));
+    }
+
+    // Session titles: a hidden thread, the way Codex's TUI titles threads.
+
+    const DESCRIPTION: &str = "Fix the login redirect bug in auth.rs (JIRA-142)";
+
+    fn title_request(description: Option<&str>) -> TurnRequest {
+        let mut request = TurnRequest::new(Provider::Codex, "/work/repo", "full prompt");
+        request.model = Some("requested-model".into());
+        request.request_session_title = description.map(str::to_owned);
+        request
+    }
+
+    fn writes(output: &AdapterOutput) -> Vec<Value> {
+        output
+            .writes
+            .iter()
+            .chain(&output.optional_writes)
+            .cloned()
+            .map(decode)
+            .collect()
+    }
+
+    fn no_writes(output: &AdapterOutput) -> bool {
+        output.writes.len() + output.optional_writes.len() == 0
+    }
+
+    fn feed(state: &mut AdapterState, frame: Value) -> AdapterOutput {
+        parse_line(&frame.to_string(), state).unwrap()
+    }
+
+    /// Answer a request the adapter wrote.
+    fn answer(state: &mut AdapterState, request: &Value, result: Value) -> AdapterOutput {
+        feed(
+            state,
+            json!({"jsonrpc": "2.0", "id": request["id"], "result": result}),
+        )
+    }
+
+    fn reject(state: &mut AdapterState, request: &Value) -> AdapterOutput {
+        feed(
+            state,
+            json!({"jsonrpc": "2.0", "id": request["id"],
+                "error": {"code": -32600, "message": "model not found"}}),
+        )
+    }
+
+    /// Prepare `request`, finish the handshake and open the user's thread.
+    fn open(request: &TurnRequest, thread: Value) -> (AdapterState, AdapterOutput) {
+        let mut state = AdapterState::default();
+        prepare_turn(request, &mut state).unwrap();
+        parse_line(r#"{"jsonrpc":"2.0","id":1,"result":{}}"#, &mut state).unwrap();
+        let opened = feed(
+            &mut state,
+            json!({"jsonrpc": "2.0", "id": 2, "result": {
+                "thread": thread, "model": "gpt-5-codex", "modelProvider": "openai"
+            }}),
+        );
+        (state, opened)
+    }
+
+    /// Open the user's thread and drive the title flow up to its hidden turn.
+    /// Returns the hidden `turn/start` frame.
+    fn hidden_turn_started(state: &mut AdapterState, opened: &AdapterOutput) -> Value {
+        let config_read = writes(opened)[1].clone();
+        let started = answer(state, &config_read, json!({"config": {}}));
+        let thread_start = writes(&started)[0].clone();
+        let turn = answer(
+            state,
+            &thread_start,
+            json!({"thread": {"id": "title-thread"}, "sandbox": {"type": "readOnly"}}),
+        );
+        writes(&turn)[0].clone()
+    }
+
+    fn hidden(method: &str, params: Value) -> Value {
+        let mut params = params;
+        params["threadId"] = json!("title-thread");
+        json!({"jsonrpc": "2.0", "method": method, "params": params})
+    }
+
+    fn hidden_answer(text: &str) -> Value {
+        hidden(
+            "item/completed",
+            json!({"turnId": "title-turn", "item": {
+                "id": "title-item", "type": "agentMessage", "text": text, "phase": "final_answer"
+            }}),
+        )
+    }
+
+    fn hidden_completed(status: &str) -> Value {
+        hidden(
+            "turn/completed",
+            json!({"turn": {"id": "title-turn", "status": status, "model": TITLE_MODEL,
+                "usage": {"inputTokens": 9, "outputTokens": 3}}}),
+        )
+    }
+
+    #[test]
+    fn a_server_name_that_cannot_be_a_dotted_key_is_disabled_as_a_table() {
+        let mut request = title_request(Some(DESCRIPTION));
+        for name in ["plain-server", "needs.quotes"] {
+            request.launch_context.mcp_servers.insert(
+                name.into(),
+                crate::McpServerConfig::Stdio {
+                    command: "server".into(),
+                    args: Vec::new(),
+                    environment_from: std::collections::BTreeMap::new(),
+                },
+            );
+        }
+        let (state, _) = open(&request, json!({"id": "thread-1"}));
+        let mut flow = load(&state).title.expect("a title flow");
+        let mut output = AdapterOutput::default();
+        flow.start_thread(&mut output);
+        let frame = &writes(&output)[0];
+        let config = &frame["params"]["config"];
+        assert_eq!(
+            config["mcp_servers"],
+            json!({"needs.quotes": {"enabled": false}, "plain-server": {"enabled": false}})
+        );
+        assert!(config.get("mcp_servers.plain-server.enabled").is_none());
+    }
+
+    #[test]
+    fn a_requested_title_runs_on_a_hidden_read_only_thread_and_names_the_users_thread() {
+        let mut request = title_request(Some(DESCRIPTION));
+        request.launch_context.mcp_servers.insert(
+            "temps_fleet".into(),
+            crate::McpServerConfig::Stdio {
+                command: "temps-fleet".into(),
+                args: Vec::new(),
+                environment_from: std::collections::BTreeMap::new(),
+            },
+        );
+        let (mut state, opened) = open(&request, json!({"id": "thread-1"}));
+
+        // The user's turn is written first; titling never delays it.
+        let opened_writes = writes(&opened);
+        assert_eq!(opened_writes.len(), 2, "{opened_writes:?}");
+        // The title request is an optional write: the runtime never waits on
+        // it, so it cannot delay or fail the turn.
+        assert_eq!(opened.writes.len(), 1);
+        assert_eq!(opened.optional_writes.len(), 1);
+        assert_eq!(opened_writes[0]["method"], "turn/start");
+        assert_eq!(opened_writes[0]["params"]["threadId"], "thread-1");
+        let config_read = &opened_writes[1];
+        assert_eq!(config_read["method"], "config/read");
+        assert_eq!(config_read["params"]["cwd"], "/work/repo");
+        let id = config_read["id"].as_str().unwrap();
+        assert!(id.starts_with(TITLE_ID_PREFIX) && id != ID_KEEPALIVE);
+
+        let started = answer(
+            &mut state,
+            config_read,
+            json!({"config": {"model": "gpt-5-codex", "mcp_servers": {"github": {"url": "x"}}}}),
+        );
+        assert_eq!(started.events.len(), 0);
+        let [thread_start] = writes(&started).try_into().unwrap();
+        assert_eq!(thread_start["method"], "thread/start");
+        let params = &thread_start["params"];
+        assert_eq!(params["model"], TITLE_MODEL);
+        assert_eq!(params["modelProvider"], "openai");
+        assert_eq!(params["ephemeral"], true);
+        assert_eq!(params["sandbox"], "read-only");
+        assert_eq!(params["cwd"], "/work/repo");
+        assert_eq!(params["threadSource"], "thread_title");
+        for empty in [
+            "environments",
+            "dynamicTools",
+            "runtimeWorkspaceRoots",
+            "selectedCapabilityRoots",
+        ] {
+            assert_eq!(params[empty], json!([]), "{empty}");
+        }
+        let config = &params["config"];
+        for feature in ["shell_tool", "unified_exec", "multi_agent", "apps", "hooks"] {
+            assert_eq!(config[format!("features.{feature}")], false, "{feature}");
+        }
+        assert_eq!(config["tools.update_plan.enabled"], false);
+        assert_eq!(config["web_search"], "disabled");
+        assert_eq!(config["default_permissions"], ":read-only");
+        // Merged into each server's own definition, so a server only a
+        // `--config` override defines is not replaced by a transport-less one.
+        assert_eq!(config["mcp_servers.github.enabled"], false);
+        assert_eq!(config["mcp_servers.temps_fleet.enabled"], false);
+        assert!(config.get("mcp_servers").is_none());
+        assert!(thread_start["id"]
+            .as_str()
+            .unwrap()
+            .starts_with(TITLE_ID_PREFIX));
+
+        let turn = answer(
+            &mut state,
+            &thread_start,
+            json!({"thread": {"id": "title-thread"}, "sandbox": {"type": "readOnly"}}),
+        );
+        let [turn_start] = writes(&turn).try_into().unwrap();
+        assert_eq!(turn_start["method"], "turn/start");
+        assert_eq!(turn_start["params"]["threadId"], "title-thread");
+        assert_eq!(
+            turn_start["params"]["input"],
+            json!([{"type": "text", "text": title_prompt(DESCRIPTION)}])
+        );
+        assert_eq!(turn_start["params"]["outputSchema"], title_output_schema());
+        assert_eq!(turn_start["params"]["effort"], "low");
+
+        let accepted = answer(
+            &mut state,
+            &turn_start,
+            json!({"turn": {"id": "title-turn"}}),
+        );
+        assert!(no_writes(&accepted) && accepted.events.is_empty());
+        let message = feed(
+            &mut state,
+            hidden_answer(r#"{"title":"Fix login redirect."}"#),
+        );
+        assert!(no_writes(&message) && message.events.is_empty());
+
+        let done = feed(&mut state, hidden_completed("completed"));
+        assert!(!done.terminal);
+        assert_eq!(
+            done.events,
+            [TurnEvent::SessionTitle {
+                title: "Fix login redirect".into()
+            }]
+        );
+        let [name, unsubscribe] = writes(&done).try_into().unwrap();
+        assert_eq!(name["method"], "thread/name/set");
+        assert_eq!(
+            name["params"],
+            json!({"threadId": "thread-1", "name": "Fix login redirect"})
+        );
+        assert_eq!(unsubscribe["method"], "thread/unsubscribe");
+        assert_eq!(unsubscribe["params"], json!({"threadId": "title-thread"}));
+        assert_eq!(
+            state.result.session_title.as_deref(),
+            Some("Fix login redirect")
+        );
+
+        // Codex echoes the rename; it is the same title, so no second event.
+        let echo = feed(
+            &mut state,
+            json!({"jsonrpc": "2.0", "method": "thread/name/updated",
+                "params": {"threadId": "thread-1", "threadName": "Fix login redirect"}}),
+        );
+        assert!(echo.events.is_empty(), "{:?}", echo.events);
+        for reply in [name, unsubscribe] {
+            let late = answer(&mut state, &reply, json!({}));
+            assert!(late.events.is_empty() && no_writes(&late));
+        }
+    }
+
+    #[test]
+    fn hidden_thread_frames_never_reach_or_end_the_users_turn() {
+        for retained in [false, true] {
+            let (mut state, opened) =
+                open(&title_request(Some(DESCRIPTION)), json!({"id": "thread-1"}));
+            if retained {
+                mark_retained(&mut state);
+            }
+            hidden_turn_started(&mut state, &opened);
+            // The user's `turn/start` has not been answered yet, so its turn
+            // id is unknown: nothing but the thread id tells the turns apart.
+            let mut events = Vec::new();
+            for frame in [
+                hidden(
+                    "turn/started",
+                    json!({"turn": {"id": "title-turn", "status": "inProgress"}}),
+                ),
+                hidden(
+                    "item/started",
+                    json!({"turnId": "title-turn", "item": {
+                        "id": "cmd", "type": "commandExecution", "command": "ls"
+                    }}),
+                ),
+                hidden(
+                    "item/agentMessage/delta",
+                    json!({"turnId": "title-turn", "itemId": "title-item", "delta": "{\"ti"}),
+                ),
+                hidden(
+                    "item/reasoning/summaryTextDelta",
+                    json!({"turnId": "title-turn", "itemId": "r", "delta": "thinking"}),
+                ),
+                hidden(
+                    "thread/tokenUsage/updated",
+                    json!({"turnId": "title-turn", "tokenUsage": {
+                        "last": {"inputTokens": 9, "outputTokens": 3, "totalTokens": 12},
+                        "modelContextWindow": 128_000
+                    }}),
+                ),
+                hidden(
+                    "error",
+                    json!({"turnId": "title-turn", "willRetry": false,
+                        "error": {"message": "hidden failure"}}),
+                ),
+                hidden("warning", json!({"message": "hidden warning"})),
+                hidden_answer(r#"{"title":"Fix login redirect"}"#),
+            ] {
+                let output = feed(&mut state, frame);
+                assert!(!output.terminal);
+                assert_eq!(writes(&output).len(), 0, "{:?}", writes(&output));
+                events.extend(output.events);
+            }
+            let approval = feed(
+                &mut state,
+                json!({"jsonrpc": "2.0", "id": "server-7",
+                    "method": "item/commandExecution/requestApproval",
+                    "params": {"threadId": "title-thread", "turnId": "title-turn",
+                        "itemId": "cmd", "command": "rm -rf /"}}),
+            );
+            assert!(approval.interaction.is_none() && approval.events.is_empty());
+            let [refusal] = writes(&approval).try_into().unwrap();
+            assert_eq!(refusal["id"], "server-7");
+            assert!(refusal.get("error").is_some());
+
+            let done = feed(&mut state, hidden_completed("completed"));
+            assert!(!done.terminal, "the hidden turn ended the user's turn");
+            events.extend(done.events);
+            assert_eq!(
+                events,
+                [TurnEvent::SessionTitle {
+                    title: "Fix login redirect".into()
+                }],
+                "retained: {retained}"
+            );
+            assert_eq!(state.result.text.len(), 0);
+            assert!(state.result.reasoning.is_none());
+            assert_eq!(state.result.usage, Usage::default());
+            assert_eq!(state.result.model.as_deref(), None);
+            assert!(state.terminal_failure.is_none());
+            assert_eq!(load(&state).error_message, None);
+
+            // The user's own turn still runs and ends as before.
+            parse_line(
+                r#"{"jsonrpc":"2.0","id":4,"result":{"turn":{"id":"turn-1"}}}"#,
+                &mut state,
+            )
+            .unwrap();
+            let text = feed(
+                &mut state,
+                json!({"jsonrpc": "2.0", "method": "item/agentMessage/delta", "params": {
+                    "threadId": "thread-1", "turnId": "turn-1", "itemId": "i", "delta": "Done"}}),
+            );
+            assert_eq!(
+                text.events,
+                [TurnEvent::TextDelta {
+                    text: "Done".into()
+                }]
+            );
+            let end = feed(
+                &mut state,
+                json!({"jsonrpc": "2.0", "method": "turn/completed", "params": {
+                    "threadId": "thread-1", "turn": {"id": "turn-1", "status": "completed"}}}),
+            );
+            assert!(end.terminal);
+            assert_eq!(state.result.status, RunStatus::Succeeded);
+            assert_eq!(
+                state.result.session_title.as_deref(),
+                Some("Fix login redirect")
+            );
+        }
+    }
+
+    #[test]
+    fn no_title_is_requested_without_a_description_or_for_a_named_or_continued_thread() {
+        let (_, opened) = open(&title_request(None), json!({"id": "thread-1"}));
+        assert_eq!(writes(&opened).len(), 1);
+
+        let (_, opened) = open(&title_request(Some("   ")), json!({"id": "thread-1"}));
+        assert_eq!(writes(&opened).len(), 1);
+
+        let (state, opened) = open(
+            &title_request(Some(DESCRIPTION)),
+            json!({"id": "thread-1", "name": "Named in the Codex app"}),
+        );
+        assert_eq!(writes(&opened).len(), 1);
+        assert_eq!(writes(&opened)[0]["method"], "turn/start");
+        assert_eq!(
+            state.result.session_title.as_deref(),
+            Some("Named in the Codex app")
+        );
+
+        let mut request = title_request(Some(DESCRIPTION));
+        request.session_id = Some("thread-1".into());
+        request.continuation = true;
+        let (_, opened) = open(&request, json!({"id": "thread-1"}));
+        assert_eq!(writes(&opened).len(), 1);
+
+        let mut request = title_request(Some(DESCRIPTION));
+        request.prompt = "/compact".into();
+        request.session_id = Some("thread-1".into());
+        let (_, opened) = open(&request, json!({"id": "thread-1"}));
+        assert_eq!(writes(&opened)[0]["method"], "thread/compact/start");
+        assert_eq!(writes(&opened).len(), 1);
+    }
+
+    #[test]
+    fn a_failing_title_model_falls_back_once_to_the_threads_model_then_gives_up_silently() {
+        let (mut state, opened) =
+            open(&title_request(Some(DESCRIPTION)), json!({"id": "thread-1"}));
+        let started = answer(&mut state, &writes(&opened)[1], json!({"config": {}}));
+        let first = writes(&started)[0].clone();
+        assert_eq!(first["params"]["model"], TITLE_MODEL);
+
+        let retried = reject(&mut state, &first);
+        assert!(retried.events.is_empty() && !retried.terminal);
+        let [second] = writes(&retried).try_into().unwrap();
+        assert_eq!(second["method"], "thread/start");
+        assert_eq!(second["params"]["model"], "gpt-5-codex");
+        assert_ne!(second["id"], first["id"]);
+
+        // The fallback's turn carries no title-model effort.
+        let turn = answer(
+            &mut state,
+            &second,
+            json!({"thread": {"id": "title-thread"}, "sandbox": {"type": "readOnly"}}),
+        );
+        let turn_start = writes(&turn)[0].clone();
+        assert!(turn_start["params"].get("effort").is_none());
+
+        let failed = reject(&mut state, &turn_start);
+        assert!(failed.events.is_empty() && !failed.terminal);
+        assert!(state.terminal_failure.is_none());
+        // Only the hidden thread is detached; nothing is retried again.
+        let [unsubscribe] = writes(&failed).try_into().unwrap();
+        assert_eq!(unsubscribe["method"], "thread/unsubscribe");
+        assert_eq!(load(&state).title.unwrap().step, TitleStep::Done);
+    }
+
+    #[test]
+    fn a_hidden_turn_the_title_model_cannot_run_retries_on_the_threads_model() {
+        let (mut state, opened) =
+            open(&title_request(Some(DESCRIPTION)), json!({"id": "thread-1"}));
+        let turn_start = hidden_turn_started(&mut state, &opened);
+        answer(
+            &mut state,
+            &turn_start,
+            json!({"turn": {"id": "title-turn"}}),
+        );
+        let failed = feed(&mut state, hidden_completed("failed"));
+        assert!(failed.events.is_empty() && !failed.terminal);
+        let [unsubscribe, restart] = writes(&failed).try_into().unwrap();
+        assert_eq!(unsubscribe["method"], "thread/unsubscribe");
+        assert_eq!(restart["method"], "thread/start");
+        assert_eq!(restart["params"]["model"], "gpt-5-codex");
+    }
+
+    #[test]
+    fn a_thread_that_is_not_read_only_or_unreadable_config_ends_the_title_flow() {
+        let (mut state, opened) =
+            open(&title_request(Some(DESCRIPTION)), json!({"id": "thread-1"}));
+        let unread = reject(&mut state, &writes(&opened)[1]);
+        assert!(no_writes(&unread) && unread.events.is_empty());
+
+        let (mut state, opened) =
+            open(&title_request(Some(DESCRIPTION)), json!({"id": "thread-1"}));
+        let started = answer(&mut state, &writes(&opened)[1], json!({"config": {}}));
+        let writable = answer(
+            &mut state,
+            &writes(&started)[0],
+            json!({"thread": {"id": "title-thread"}, "sandbox": {"type": "dangerFullAccess"}}),
+        );
+        let [unsubscribe] = writes(&writable).try_into().unwrap();
+        assert_eq!(unsubscribe["method"], "thread/unsubscribe");
+    }
+
+    #[test]
+    fn another_providers_thread_titles_with_its_own_model() {
+        let mut state = AdapterState::default();
+        prepare_turn(&title_request(Some(DESCRIPTION)), &mut state).unwrap();
+        parse_line(r#"{"jsonrpc":"2.0","id":1,"result":{}}"#, &mut state).unwrap();
+        let opened = feed(
+            &mut state,
+            json!({"jsonrpc": "2.0", "id": 2, "result": {
+                "thread": {"id": "thread-1"}, "model": "llama3", "modelProvider": "ollama"
+            }}),
+        );
+        let started = answer(&mut state, &writes(&opened)[1], json!({"config": {}}));
+        assert_eq!(writes(&started)[0]["params"]["model"], "llama3");
+    }
+
+    #[test]
+    fn a_turn_that_ends_first_abandons_the_title_and_late_frames_stay_inert() {
+        let (mut state, opened) =
+            open(&title_request(Some(DESCRIPTION)), json!({"id": "thread-1"}));
+        let turn_start = hidden_turn_started(&mut state, &opened);
+        parse_line(
+            r#"{"jsonrpc":"2.0","id":4,"result":{"turn":{"id":"turn-1"}}}"#,
+            &mut state,
+        )
+        .unwrap();
+        let end = feed(
+            &mut state,
+            json!({"jsonrpc": "2.0", "method": "turn/completed", "params": {
+                "threadId": "thread-1", "turn": {"id": "turn-1", "status": "completed"}}}),
+        );
+        assert!(end.terminal);
+        assert!(end.events.is_empty(), "{:?}", end.events);
+        let [unsubscribe] = writes(&end).try_into().unwrap();
+        assert_eq!(unsubscribe["params"]["threadId"], "title-thread");
+
+        for late in [
+            json!({"jsonrpc": "2.0", "id": turn_start["id"], "result": {"turn": {"id": "title-turn"}}}),
+            hidden_answer(r#"{"title":"Too late"}"#),
+            hidden_completed("completed"),
+        ] {
+            let output = feed(&mut state, late);
+            assert!(output.events.is_empty() && no_writes(&output));
+        }
+        assert_eq!(state.result.session_title, None);
+
+        // Between turns a retained process drops them as background output,
+        // and never reads them as a keepalive answer.
+        assert_eq!(
+            classify_idle_frame(&json!({"id": turn_start["id"], "result": {}}).to_string()),
+            IdleFrame::Background
+        );
+        assert_eq!(
+            classify_idle_frame(&hidden_completed("completed").to_string()),
+            IdleFrame::Background
+        );
+        assert!(matches!(
+            classify_idle_frame(&json!({"id": ID_KEEPALIVE, "result": {"data": []}}).to_string()),
+            IdleFrame::KeepaliveResult { active: false }
+        ));
+    }
+
+    /// Open the user's thread, answer `config/read`, and leave the hidden
+    /// `thread/start` unanswered. Returns that request.
+    fn pending_hidden_thread(state: &mut AdapterState, opened: &AdapterOutput) -> Value {
+        let started = answer(state, &writes(opened)[1], json!({"config": {}}));
+        let [thread_start] = writes(&started).try_into().unwrap();
+        assert_eq!(thread_start["method"], "thread/start");
+        thread_start
+    }
+
+    fn user_turn_completed(state: &mut AdapterState) -> AdapterOutput {
+        parse_line(
+            r#"{"jsonrpc":"2.0","id":4,"result":{"turn":{"id":"turn-1"}}}"#,
+            state,
+        )
+        .unwrap();
+        feed(
+            state,
+            json!({"jsonrpc": "2.0", "method": "turn/completed", "params": {
+                "threadId": "thread-1", "turn": {"id": "turn-1", "status": "completed"}}}),
+        )
+    }
+
+    #[test]
+    fn a_hidden_thread_that_opens_after_its_turn_ended_is_unsubscribed() {
+        let opened_reply = |request: &Value| {
+            json!({"jsonrpc": "2.0", "id": request["id"], "result": {
+                "thread": {"id": "title-thread"}, "sandbox": {"type": "readOnly"}}})
+        };
+        for retained in [false, true] {
+            let (mut state, opened) =
+                open(&title_request(Some(DESCRIPTION)), json!({"id": "thread-1"}));
+            if retained {
+                mark_retained(&mut state);
+            }
+            let thread_start = pending_hidden_thread(&mut state, &opened);
+            // The turn ends before the app server answers `thread/start`, so
+            // there is no hidden thread to detach yet.
+            let end = user_turn_completed(&mut state);
+            assert!(end.terminal);
+            assert_eq!(writes(&end).len(), 0, "retained: {retained}");
+
+            // The answer arrives on a later frame, and must not be dropped.
+            let late = feed(&mut state, opened_reply(&thread_start));
+            assert!(late.events.is_empty() && !late.terminal);
+            assert_eq!(late.writes.len(), 0);
+            let [unsubscribe] = writes(&late).try_into().unwrap();
+            assert_eq!(unsubscribe["method"], "thread/unsubscribe");
+            assert_eq!(unsubscribe["params"], json!({"threadId": "title-thread"}));
+            assert!(unsubscribe["id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with(TITLE_ID_PREFIX)));
+            assert_eq!(state.result.session_title, None);
+        }
+    }
+
+    #[test]
+    fn a_hidden_thread_of_an_earlier_turn_is_unsubscribed_by_the_next_one() {
+        let (mut old_state, opened) =
+            open(&title_request(Some(DESCRIPTION)), json!({"id": "thread-1"}));
+        let thread_start = pending_hidden_thread(&mut old_state, &opened);
+        user_turn_completed(&mut old_state);
+
+        // A later turn on the same connection owns its own flow, and with it a
+        // different request-id nonce.
+        let (mut state, reopened) =
+            open(&title_request(Some(DESCRIPTION)), json!({"id": "thread-1"}));
+        mark_retained(&mut state);
+        let orphan = feed(
+            &mut state,
+            json!({"jsonrpc": "2.0", "id": thread_start["id"], "result": {
+                "thread": {"id": "title-thread-old"}, "sandbox": {"type": "readOnly"}}}),
+        );
+        assert_eq!(orphan.events.len(), 0);
+        let [unsubscribe] = writes(&orphan).try_into().unwrap();
+        assert_eq!(
+            unsubscribe["params"],
+            json!({"threadId": "title-thread-old"})
+        );
+        // The live flow was not advanced by the foreign answer.
+        assert_eq!(load(&state).title.unwrap().step, TitleStep::ReadingConfig);
+        assert_eq!(writes(&reopened)[1]["method"], "config/read");
+    }
+
+    #[test]
+    fn a_late_hidden_thread_is_unsubscribed_between_turns() {
+        let (mut state, opened) =
+            open(&title_request(Some(DESCRIPTION)), json!({"id": "thread-1"}));
+        let thread_start = pending_hidden_thread(&mut state, &opened);
+        user_turn_completed(&mut state);
+
+        let line = json!({"jsonrpc": "2.0", "id": thread_start["id"], "result": {
+            "thread": {"id": "title-thread"}, "sandbox": {"type": "readOnly"}}})
+        .to_string();
+        assert_eq!(classify_idle_frame(&line), IdleFrame::Background);
+        let [frame] = idle_frame_writes(&line).try_into().unwrap();
+        let unsubscribe = decode(frame);
+        assert_eq!(unsubscribe["method"], "thread/unsubscribe");
+        assert_eq!(unsubscribe["params"], json!({"threadId": "title-thread"}));
+
+        // Nothing else a retained process reads between turns is answered.
+        for quiet in [
+            json!({"jsonrpc": "2.0", "id": thread_start["id"], "error": {"code": 1, "message": "no"}}),
+            json!({"jsonrpc": "2.0", "id": format!("{TITLE_ID_PREFIX}1-1-config"), "result": {}}),
+            json!({"jsonrpc": "2.0", "id": ID_KEEPALIVE, "result": {"data": []}}),
+            json!({"jsonrpc": "2.0", "method": "thread/started", "params": {}}),
+        ] {
+            assert_eq!(idle_frame_writes(&quiet.to_string()).len(), 0, "{quiet}");
+        }
+        assert_eq!(idle_frame_writes("not json").len(), 0);
+    }
+
+    #[test]
+    fn a_frame_answering_another_flow_is_dropped_without_advancing_this_one() {
+        let (mut state, opened) =
+            open(&title_request(Some(DESCRIPTION)), json!({"id": "thread-1"}));
+        let foreign = feed(
+            &mut state,
+            json!({"jsonrpc": "2.0", "id": format!("{TITLE_ID_PREFIX}0-1-config"),
+                "result": {"config": {}}}),
+        );
+        assert!(no_writes(&foreign) && foreign.events.is_empty());
+        assert_eq!(load(&state).title.unwrap().step, TitleStep::ReadingConfig);
+        assert_ne!(
+            writes(&opened)[1]["id"],
+            json!(format!("{TITLE_ID_PREFIX}0-1-config"))
+        );
+    }
+
+    #[test]
+    fn a_rename_reports_the_session_title_once_and_supersedes_generation() {
+        for retained in [false, true] {
+            let (mut state, opened) =
+                open(&title_request(Some(DESCRIPTION)), json!({"id": "thread-1"}));
+            if retained {
+                mark_retained(&mut state);
+            }
+            let turn_start = hidden_turn_started(&mut state, &opened);
+            answer(
+                &mut state,
+                &turn_start,
+                json!({"turn": {"id": "title-turn"}}),
+            );
+            let renamed = json!({"jsonrpc": "2.0", "method": "thread/name/updated",
+                "params": {"threadId": "thread-1", "threadName": "  Renamed by hand "}});
+            let first = feed(&mut state, renamed.clone());
+            assert_eq!(
+                first.events,
+                [TurnEvent::SessionTitle {
+                    title: "Renamed by hand".into()
+                }],
+                "retained: {retained}"
+            );
+            assert_eq!(feed(&mut state, renamed).events.len(), 0);
+            let other = feed(
+                &mut state,
+                json!({"jsonrpc": "2.0", "method": "thread/name/updated",
+                    "params": {"threadId": "thread-other", "threadName": "Not ours"}}),
+            );
+            assert_eq!(other.events.len(), 0);
+
+            // The hand-written name wins over the generated one.
+            feed(
+                &mut state,
+                hidden_answer(r#"{"title":"Fix login redirect"}"#),
+            );
+            let done = feed(&mut state, hidden_completed("completed"));
+            assert!(done.events.is_empty(), "{:?}", done.events);
+            let [unsubscribe] = writes(&done).try_into().unwrap();
+            assert_eq!(unsubscribe["method"], "thread/unsubscribe");
+            assert_eq!(
+                state.result.session_title.as_deref(),
+                Some("Renamed by hand")
+            );
+        }
+    }
+
+    #[test]
+    fn the_title_prompt_matches_the_tui_and_stays_within_its_byte_bound() {
+        let prompt = title_prompt("  Fix it  ");
+        assert_eq!(
+            prompt,
+            "Generate a concise, single-line task title of at most 36 characters and under \
+             five words where possible. Start with an imperative verb. Capitalize only the \
+             first word unless the user's language, proper nouns, acronyms, or code terms \
+             require otherwise. Preserve ticket references exactly. Write in the user's \
+             language. Do not use quotes, markdown, or trailing punctuation. Do not answer \
+             the request.\n\nUser prompt:\nFix it"
+        );
+        let long = title_prompt(&"é".repeat(2_000));
+        assert!(long.len() <= TITLE_PROMPT_MAX_BYTES);
+        assert!(long.len() > TITLE_PROMPT_MAX_BYTES - 2);
+        assert!(long.ends_with('é'));
+    }
+
+    #[test]
+    fn generated_titles_are_normalized_like_the_tui() {
+        assert_eq!(
+            parse_title(r#"{"title":"  “Fix   the\nlogin bug?!”  "}"#).as_deref(),
+            Some("Fix the login bug")
+        );
+        assert_eq!(
+            parse_title(&format!(r#"{{"title":"{}"}}"#, "a".repeat(50)))
+                .unwrap()
+                .chars()
+                .count(),
+            TITLE_MAX_CHARS
+        );
+        assert_eq!(parse_title(r#"Title: {"title":"x"}"#), None);
+        assert_eq!(parse_title(r#"{"title":"x","extra":1}"#), None);
+        assert_eq!(parse_title(r#"{"title":" ... "}"#), None);
     }
 }

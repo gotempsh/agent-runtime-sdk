@@ -16,6 +16,22 @@ Versioning and Keep a Changelog conventions.
 
 ### Added
 
+- `TurnRequest::request_session_title`, `TurnEvent::SessionTitle` and
+  `TurnResult::session_title`: ask the harness to title a session that has
+  none yet, from the user's own description of the task, the way its own
+  client does. Claude Code answers `generate_session_title`, the Codex
+  app-server replays its TUI's hidden title thread, and `opencode serve`
+  titles through its session API. Generation runs alongside the turn and
+  never delays or fails it; a turn that ends first reports no title, so keep
+  setting the field until one arrives. The request is carried over the
+  protocol (`ProtocolTurnInput::request_session_title`) and is never logged.
+- `AdapterOutput::optional_writes` and `AgentAdapter::idle_frame_writes`:
+  provider frames the runtime writes without ever waiting for them. A frame
+  the provider's stdin does not accept at once is dropped and a failed write
+  is ignored, so housekeeping such as the session-title request and the
+  cleanup of its hidden Codex thread can neither delay a turn nor replace a
+  completed turn's success with a write error. Code that constructs
+  `AdapterOutput` with struct syntax must now set `optional_writes`.
 - `Provider::Acp` and `providers::acp::Acp` (default feature `acp`): one
   adapter for any agent that speaks the Agent Client Protocol over stdio —
   Gemini CLI (`gemini --acp`), GitHub Copilot (`copilot --acp`), Cursor

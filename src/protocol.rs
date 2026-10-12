@@ -204,6 +204,10 @@ pub struct ProtocolTurnInput {
     pub attachments: Vec<TurnAttachment>,
     /// Required approval/question handling.
     pub interaction_policy: InteractionPolicy,
+    /// See [`crate::TurnRequest::request_session_title`]. Protocol logging
+    /// must redact the full frame.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_session_title: Option<String>,
 }
 
 impl fmt::Debug for ProtocolTurnInput {
@@ -234,6 +238,10 @@ impl fmt::Debug for ProtocolTurnInput {
             )
             .field("attachment_count", &self.attachments.len())
             .field("interaction_policy", &self.interaction_policy)
+            .field(
+                "request_session_title_bytes",
+                &self.request_session_title.as_ref().map(String::len),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -770,6 +778,7 @@ mod tests {
                     }],
                     attachments: vec![TurnAttachment::new("uploads/report.pdf")],
                     interaction_policy: InteractionPolicy::RequireHandler,
+                    request_session_title: None,
                 },
             },
         }
