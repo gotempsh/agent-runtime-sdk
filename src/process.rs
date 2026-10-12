@@ -204,14 +204,25 @@ where
 /// Reads a child's stderr into a bounded tail while the process runs.
 ///
 /// A descendant that outlives its parent can keep the pipe open, so the
-/// stream may not reach end-of-file when the process does. Both finishers
-/// therefore wait only a bounded time for it and keep what arrived: a finished
-/// process never waits on a stray descendant, and a failure diagnostic still
-/// carries the stderr the process wrote. Dropping the capture stops the
-/// reader, so an early return cannot leave it running.
+/// stream may not reach end-of-file when the process does. [`Self::finish`]
+/// therefore waits only a bounded time for it and keeps what arrived: a
+/// finished process never waits on a stray descendant, and a failure
+/// diagnostic still carries the stderr the process wrote.
+///
+/// What happens to the reader once the wait is over, or the capture is
+/// dropped, depends on who owns the process:
+///
+/// - By default the reader stops. This is for probes, which have already
+///   stopped the process they started.
+/// - [`Self::detached`] leaves it draining in the background. A process
+///   started with `ToolProcessPolicy::PreserveOnCompletion` may leave tools
+///   running that inherited this pipe, and closing the read end would hand
+///   them a broken pipe (`SIGPIPE`) on their next write. The reader holds
+///   only the bounded tail and ends when the last writer closes the pipe.
 pub(crate) struct StderrCapture {
     task: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
     tail: Arc<Mutex<VecDeque<u8>>>,
+    detached: bool,
 }
 
 impl StderrCapture {
@@ -242,40 +253,27 @@ impl StderrCapture {
         Self {
             task: Some(task),
             tail,
+            detached: false,
         }
     }
 
-    /// Stop reading now.
+    /// Keep reading in the background when the wait ends or this is dropped.
+    pub(crate) fn detached(mut self) -> Self {
+        self.detached = true;
+        self
+    }
+
+    /// Stop reading now, even when [`Self::detached`].
     pub(crate) fn abort(&self) {
         if let Some(task) = &self.task {
             task.abort();
         }
     }
 
-    /// Wait up to `grace` for end-of-file, then stop reading and return the
-    /// tail captured so far.
-    ///
-    /// Use this once the owner has stopped the process and everything it
-    /// started: closing the read end then cannot hurt a process that is meant
-    /// to survive.
-    pub(crate) async fn finish(self, grace: Duration) -> std::io::Result<String> {
-        self.finish_with(grace, false).await
-    }
-
-    /// Wait up to `grace` for end-of-file, then return the tail captured so
-    /// far while the reader keeps draining in the background.
-    ///
-    /// Use this when descendants may be meant to outlive the process: a
-    /// reader that went away would hand them a broken pipe (`SIGPIPE`) on
-    /// their next write. The background reader holds only the bounded tail
-    /// and ends when the last writer closes the pipe.
-    pub(crate) async fn finish_detached(self, grace: Duration) -> std::io::Result<String> {
-        self.finish_with(grace, true).await
-    }
-
-    async fn finish_with(mut self, grace: Duration, detach: bool) -> std::io::Result<String> {
+    /// Wait up to `grace` for end-of-file and return the tail captured so far.
+    pub(crate) async fn finish(mut self, grace: Duration) -> std::io::Result<String> {
         // The handle stays in `self` while waiting, so cancelling this future
-        // drops `self` and stops the reader instead of leaving it running.
+        // drops `self`, which applies the same policy as an elapsed grace.
         let Some(task) = self.task.as_mut() else {
             return Ok(String::new());
         };
@@ -289,9 +287,8 @@ impl StderrCapture {
                     "stderr reader task failed: {error}"
                 )))
             }
-            // Dropping a join handle detaches the task, which then keeps
-            // draining; otherwise `self` is dropped below and stops it.
-            Err(_) if detach => drop(self.task.take()),
+            // The reader is still running; dropping `self` below leaves it
+            // or stops it according to `detached`.
             Err(_) => {}
         }
         let tail = self
@@ -305,7 +302,9 @@ impl StderrCapture {
 
 impl Drop for StderrCapture {
     fn drop(&mut self) {
-        self.abort();
+        if !self.detached {
+            self.abort();
+        }
     }
 }
 
@@ -522,12 +521,9 @@ mod tests {
     #[tokio::test]
     async fn a_detached_stderr_capture_keeps_draining_for_a_late_writer() {
         let (reader, mut writer) = tokio::io::duplex(8);
-        let capture = StderrCapture::spawn(reader, 64);
+        let capture = StderrCapture::spawn(reader, 64).detached();
         writer.write_all(b"early").await.unwrap();
-        let tail = capture
-            .finish_detached(Duration::from_millis(200))
-            .await
-            .unwrap();
+        let tail = capture.finish(Duration::from_millis(200)).await.unwrap();
         assert_eq!(tail, "early");
         // The reader is still there: a write far larger than the pipe's
         // buffer completes instead of failing with a broken pipe.
@@ -535,6 +531,22 @@ mod tests {
             .await
             .expect("the late writer was blocked")
             .expect("the reader closed the pipe");
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_detached_wait_keeps_draining_for_a_late_writer() {
+        let (reader, mut writer) = tokio::io::duplex(8);
+        let capture = StderrCapture::spawn(reader, 64).detached();
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(50),
+            capture.finish(Duration::from_secs(30)),
+        )
+        .await;
+        assert!(cancelled.is_err(), "the wait should still be pending");
+        tokio::time::timeout(Duration::from_secs(5), writer.write_all(&[b'x'; 1024]))
+            .await
+            .expect("the late writer was blocked")
+            .expect("cancelling the wait closed the pipe");
     }
 
     #[tokio::test]
