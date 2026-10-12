@@ -274,20 +274,25 @@ impl StderrCapture {
     }
 
     async fn finish_with(mut self, grace: Duration, detach: bool) -> std::io::Result<String> {
-        let Some(mut task) = self.task.take() else {
+        // The handle stays in `self` while waiting, so cancelling this future
+        // drops `self` and stops the reader instead of leaving it running.
+        let Some(task) = self.task.as_mut() else {
             return Ok(String::new());
         };
-        match tokio::time::timeout(grace, &mut task).await {
-            Ok(Ok(Ok(()))) => {}
+        match tokio::time::timeout(grace, task).await {
+            Ok(Ok(Ok(()))) => {
+                self.task = None;
+            }
             Ok(Ok(Err(error))) => return Err(error),
             Ok(Err(error)) => {
                 return Err(std::io::Error::other(format!(
                     "stderr reader task failed: {error}"
                 )))
             }
-            // Dropping a join handle detaches the task.
-            Err(_) if detach => drop(task),
-            Err(_) => task.abort(),
+            // Dropping a join handle detaches the task, which then keeps
+            // draining; otherwise `self` is dropped below and stops it.
+            Err(_) if detach => drop(self.task.take()),
+            Err(_) => {}
         }
         let tail = self
             .tail
@@ -530,6 +535,28 @@ mod tests {
             .await
             .expect("the late writer was blocked")
             .expect("the reader closed the pipe");
+    }
+
+    #[tokio::test]
+    async fn cancelling_the_wait_stops_the_reader() {
+        let (reader, mut writer) = tokio::io::duplex(8);
+        let capture = StderrCapture::spawn(reader, 64);
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(50),
+            capture.finish(Duration::from_secs(30)),
+        )
+        .await;
+        assert!(cancelled.is_err(), "the wait should still be pending");
+        // Once the reader is gone the pipe is broken for the writer.
+        let mut broken = false;
+        for _ in 0..100 {
+            if writer.write_all(&[b'x'; 64]).await.is_err() {
+                broken = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(broken, "the reader kept running after the wait was dropped");
     }
 
     #[tokio::test]
