@@ -188,7 +188,7 @@ Versioning and Keep a Changelog conventions.
   gives up after 1 second, for one-shot and retained turns alike, and the
   provider is terminated as it already was when the interrupt was not
   accepted.
-- A finished turn, probe or metadata query no longer waits for a descendant for a descendant
+- A finished turn, probe or metadata query no longer waits for a descendant
   of the provider that kept its stderr open after the process ended, which
   turned a completed ACP turn into a timeout when the agent's terminal grace
   stopped it. The runtime waits a bounded 2 seconds for stderr to close and

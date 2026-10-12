@@ -15,7 +15,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use temps_agent_runtime::lifecycle::{InvocationId, RuntimeId};
+use temps_agent_runtime::lifecycle::{
+    InterruptOutcome, InvocationId, RuntimeFailureKind, RuntimeId,
+};
 use temps_agent_runtime::providers::{Codex, CodexTurnMode};
 use temps_agent_runtime::retained::TurnAttachment;
 use temps_agent_runtime::retained::{
@@ -1681,12 +1683,14 @@ async fn interrupting_a_retained_turn_does_not_wait_for_a_stalled_provider() {
         .unwrap();
     transport.wait_for("turn/start").await.unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
-    tokio::time::timeout(Duration::from_secs(8), async {
-        turn.interrupt().await;
-        let _ = turn.wait().await;
+    let (outcome, result) = tokio::time::timeout(Duration::from_secs(8), async {
+        let outcome = turn.interrupt().await;
+        (outcome, turn.wait().await)
     })
     .await
     .expect("a retained provider whose stdin is full must not block interruption");
+    assert_eq!(outcome, InterruptOutcome::Interrupted);
+    assert_eq!(result.unwrap_err().kind, RuntimeFailureKind::Cancelled);
     assert!(
         transport.termination_count() >= 1,
         "the stalled process is retired"
