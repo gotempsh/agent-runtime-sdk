@@ -19,20 +19,22 @@ use temps_agent_runtime::providers::acp::{
 };
 use temps_agent_runtime::providers::{Acp, AcpAgent, AcpAgents};
 use temps_agent_runtime::{
-    AgentRuntime, ApprovalDecision, ApprovalRequest, EventSink, InteractionHandler, PermissionMode,
-    PlanEntryStatus, Provider, ProviderProcessErrorKind, QuestionAnswer, QuestionRequest, Result,
-    RuntimeError, ToolCallStatus, TurnEvent, TurnRequest,
+    AgentRuntime, ApprovalDecision, ApprovalRequest, EventSink, HarnessControlKind, HarnessStatus,
+    InteractionHandler, PermissionMode, PlanEntryStatus, Provider, ProviderProcessErrorKind,
+    QuestionAnswer, QuestionRequest, Result, RuntimeError, ToolCallStatus, TurnEvent, TurnRequest,
 };
 
 const AGENT: &str = r#"#!/bin/sh
 # Scripted ACP agent. MOCK_ACP_MODE: ok, auth, hang, linger, stall (never
 # reacts to a permission reply), split (streams a tool result, then completes
-# with a bare status) or orphan (never answers, and leaves a child of its own
-# process group that keeps stderr open).
+# with a bare status), orphan (never answers, and leaves a child of its own
+# process group that keeps stderr open) or finish_orphan (leaves the same
+# child, then runs the turn to completion and exits).
+if [ "$1" = --version ]; then echo "mock-agent 0.1.0"; exit 0; fi
 log="$MOCK_ACP_LOG"
 say() { printf '%s\n' "$1"; }
 update() { say "{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"mock-session\",\"update\":$1}}"; }
-if [ "$MOCK_ACP_MODE" = orphan ]; then
+if [ "$MOCK_ACP_MODE" = orphan ] || [ "$MOCK_ACP_MODE" = finish_orphan ]; then
   if command -v perl >/dev/null 2>&1; then
     perl -MPOSIX -e 'POSIX::setsid(); exec "sleep", "20"' >/dev/null &
   else
@@ -540,4 +542,93 @@ async fn a_probe_does_not_wait_for_a_descendant_that_kept_stderr_open() {
         elapsed < Duration::from_secs(10),
         "the probe waited {elapsed:?} for stderr to close"
     );
+}
+
+#[tokio::test]
+async fn a_finished_turn_does_not_wait_for_a_descendant_that_kept_stderr_open() {
+    let fixture = Fixture::new();
+    let mut request = fixture.request("run the tests");
+    request.permission_mode = PermissionMode::FullAccess;
+    // The descendant holds stderr for 20 seconds; a turn that waited for it
+    // would hit this deadline instead of returning its result.
+    request.timeout = Duration::from_secs(8);
+    let started = Instant::now();
+    let result = fixture
+        .runtime("finish_orphan")
+        .run(request, &Collector::default(), None)
+        .await;
+    let elapsed = started.elapsed();
+    if let Ok(pid) = std::fs::read_to_string(format!("{}.orphan", fixture.log.display())) {
+        let _ = std::process::Command::new("kill").arg(pid.trim()).status();
+    }
+    let result = result.unwrap_or_else(|error| {
+        panic!("the finished turn failed after {elapsed:?}: {error:?}");
+    });
+    assert_eq!(result.text, "Running tests. All green.");
+    assert!(
+        elapsed < Duration::from_secs(8),
+        "the finished turn waited {elapsed:?} for stderr to close"
+    );
+}
+
+#[tokio::test]
+async fn discovery_lists_registered_acp_agents_that_are_installed() {
+    let fixture = Fixture::new();
+    let agents = AcpAgents::new();
+    agents.insert(fixture.agent("ok")).unwrap();
+    agents
+        .insert(AcpAgent::new(
+            "ghost",
+            "Ghost Agent",
+            "temps-acp-not-installed",
+            ["--acp"],
+        ))
+        .unwrap();
+    let mut builder = AgentRuntime::builder();
+    builder.register(Acp::new(agents.clone()));
+    let runtime = builder.build().unwrap();
+
+    let inventory = runtime.discover_harnesses().await;
+    let harness = inventory
+        .harnesses
+        .iter()
+        .find(|harness| harness.provider == Provider::Acp)
+        .expect("a registered ACP adapter appears in the inventory");
+    assert_eq!(harness.status, HarnessStatus::Ready);
+    let readiness = harness.readiness.as_ref().unwrap();
+    assert!(readiness.installed);
+    assert_eq!(readiness.version.as_deref(), Some("mock-agent 0.1.0"));
+    assert!(
+        readiness.detail.contains("Ghost Agent") && readiness.detail.contains("not found"),
+        "{}",
+        readiness.detail
+    );
+    let offered = harness
+        .control_groups
+        .iter()
+        .filter(|group| group.kind == HarnessControlKind::Agent)
+        .flat_map(|group| group.options.iter().map(|option| option.id.as_str()))
+        .collect::<Vec<_>>();
+    assert_eq!(offered, ["mock"]);
+    assert!(
+        runtime.readiness(Provider::Acp).await.unwrap().installed,
+        "readiness must follow the registered agents, not the placeholder `acp` executable"
+    );
+
+    // Registry changes apply to the next probe without rebuilding the runtime.
+    agents.remove("mock");
+    let inventory = runtime.discover_harnesses().await;
+    let harness = inventory
+        .harnesses
+        .iter()
+        .find(|harness| harness.provider == Provider::Acp)
+        .unwrap();
+    assert_eq!(harness.status, HarnessStatus::NotInstalled);
+    assert_eq!(harness.control_groups.len(), 0);
+    assert!(!runtime.readiness(Provider::Acp).await.unwrap().installed);
+
+    agents.remove("ghost");
+    let readiness = runtime.readiness(Provider::Acp).await.unwrap();
+    assert!(!readiness.installed);
+    assert!(readiness.detail.contains("agent is registered"));
 }

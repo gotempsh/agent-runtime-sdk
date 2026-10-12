@@ -46,7 +46,7 @@ use crate::{
     InteractionRequest, LaunchContextCapabilities, McpServerConfig, PermissionMode,
     PermissionSupport, PlanEntry, PlanEntryStatus, Provider, ProviderProcessErrorKind,
     ProviderReadiness, ProviderTerminalFailure, QuestionAnswer, QuestionRequest, Result, RunStatus,
-    RuntimeError, ToolCallStatus, TurnEvent, TurnRequest, Usage,
+    RuntimeError, SelectableExecutable, ToolCallStatus, TurnEvent, TurnRequest, Usage,
 };
 
 /// Harness option naming the registered [`AcpAgent::id`] a turn runs.
@@ -366,9 +366,8 @@ impl Acp {
         let mut stdin = child.stdin.take();
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
-        let stderr_task = stderr.map(|stderr| {
-            tokio::spawn(crate::process::bounded_stderr(stderr, MAX_DIAGNOSTIC_CHARS))
-        });
+        let stderr_task =
+            stderr.map(|stderr| crate::process::StderrCapture::spawn(stderr, MAX_DIAGNOSTIC_CHARS));
         let exchange = async {
             let mut lines = BufReader::new(stdout.ok_or_else(|| {
                 AcpProbeError::new(AcpProbeErrorKind::Spawn, "stdout was not piped")
@@ -428,14 +427,10 @@ impl Acp {
         // Stopping the agent's process group does not close stderr when a
         // descendant left the group and kept the pipe, so the read is bounded
         // and abandoned instead of holding the probe past its timeout.
-        let mut stderr = None;
-        if let Some(mut task) = stderr_task {
-            if let Ok(joined) = tokio::time::timeout(STDERR_DRAIN, &mut task).await {
-                stderr = joined.ok().and_then(std::result::Result::ok);
-            } else {
-                task.abort();
-            }
-        }
+        let stderr = match stderr_task {
+            Some(task) => task.finish(STDERR_DRAIN).await.ok(),
+            None => None,
+        };
         let with_stderr = |mut error: AcpProbeError| {
             if let Some(stderr) = stderr.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
                 error.message = format!("{} ({})", error.message, bounded(stderr, 400));
@@ -895,6 +890,18 @@ impl AgentAdapter for Acp {
 
     fn terminal_exit_grace(&self) -> Option<Duration> {
         Some(EXIT_GRACE)
+    }
+
+    fn selectable_executables(&self) -> Option<Vec<SelectableExecutable>> {
+        // The agent is chosen per turn, so readiness is about the registered
+        // agents' own commands rather than the placeholder `acp` executable.
+        Some(
+            self.agents
+                .list()
+                .into_iter()
+                .map(|agent| SelectableExecutable::new(agent.id, agent.label, agent.command))
+                .collect(),
+        )
     }
 
     fn control_groups(&self) -> Vec<HarnessControlGroup> {

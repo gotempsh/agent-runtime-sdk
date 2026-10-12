@@ -1,6 +1,8 @@
 use std::collections::VecDeque;
 use std::ffi::OsStr;
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
@@ -199,6 +201,80 @@ where
     Ok(String::from_utf8_lossy(&tail.into_iter().collect::<Vec<_>>()).into_owned())
 }
 
+/// Reads a child's stderr into a bounded tail while the process runs.
+///
+/// A descendant that outlives its parent can keep the pipe open, so the
+/// stream may not reach end-of-file when the process does. [`Self::finish`]
+/// therefore waits only a bounded time for it, then stops reading and keeps
+/// what arrived: a finished process never waits on a stray descendant, and a
+/// failure diagnostic still carries the stderr the process wrote. Dropping the
+/// capture stops the reader, so an early return cannot leave it running.
+pub(crate) struct StderrCapture {
+    task: tokio::task::JoinHandle<std::io::Result<()>>,
+    tail: Arc<Mutex<VecDeque<u8>>>,
+}
+
+impl StderrCapture {
+    pub(crate) fn spawn<R>(mut stderr: R, capacity: usize) -> Self
+    where
+        R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    {
+        let tail = Arc::new(Mutex::new(VecDeque::new()));
+        let shared = Arc::clone(&tail);
+        let task = tokio::spawn(async move {
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let read = stderr.read(&mut buffer).await?;
+                if read == 0 {
+                    return Ok(());
+                }
+                let mut tail = shared
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                for byte in &buffer[..read] {
+                    if tail.len() == capacity {
+                        tail.pop_front();
+                    }
+                    tail.push_back(*byte);
+                }
+            }
+        });
+        Self { task, tail }
+    }
+
+    /// Stop reading now.
+    pub(crate) fn abort(&self) {
+        self.task.abort();
+    }
+
+    /// Wait up to `grace` for end-of-file, then stop reading and return the
+    /// tail captured so far.
+    pub(crate) async fn finish(mut self, grace: Duration) -> std::io::Result<String> {
+        match tokio::time::timeout(grace, &mut self.task).await {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(error))) => return Err(error),
+            Ok(Err(error)) => {
+                return Err(std::io::Error::other(format!(
+                    "stderr reader task failed: {error}"
+                )))
+            }
+            Err(_) => self.task.abort(),
+        }
+        let tail = self
+            .tail
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let bytes = tail.iter().copied().collect::<Vec<_>>();
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
+}
+
+impl Drop for StderrCapture {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -394,5 +470,30 @@ mod tests {
             .expect("termination deadline")
             .expect("termination status");
         assert!(!status.success());
+    }
+
+    #[tokio::test]
+    async fn stderr_capture_keeps_what_arrived_when_the_pipe_stays_open() {
+        let (reader, mut writer) = tokio::io::duplex(64);
+        let capture = StderrCapture::spawn(reader, 8);
+        writer.write_all(b"0123456789").await.unwrap();
+        // The writer stays open, as a descendant holding stderr would.
+        let started = std::time::Instant::now();
+        let tail = capture.finish(Duration::from_millis(200)).await.unwrap();
+        assert_eq!(tail, "23456789");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        drop(writer);
+    }
+
+    #[tokio::test]
+    async fn stderr_capture_returns_at_end_of_file_without_waiting_out_the_grace() {
+        let (reader, mut writer) = tokio::io::duplex(64);
+        let capture = StderrCapture::spawn(reader, 32);
+        writer.write_all(b"boom").await.unwrap();
+        drop(writer);
+        let started = std::time::Instant::now();
+        let tail = capture.finish(Duration::from_secs(30)).await.unwrap();
+        assert_eq!(tail, "boom");
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 }

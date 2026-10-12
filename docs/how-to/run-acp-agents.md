@@ -67,6 +67,30 @@ the agent does not support them.
 An agent asks only when it decides to; an agent configured to run tools
 without asking never sends a request.
 
+## Offer the installed agents
+
+Register the adapter and `discover_harnesses` lists `Provider::Acp` like any
+other harness. The runtime resolves each registered agent's own command inside
+the configured transport (local, SSH, container or sandbox), concurrently:
+
+- `HarnessReadiness::status` is `Ready` when at least one agent is installed
+  and `NotInstalled` when none is (or none is registered).
+- `readiness.detail` names every agent, installed or not found, with its
+  version when it reports one.
+- The `agent` control group (`HarnessControlKind::Agent`) lists only the
+  installed agents, so its options are exactly what a turn can run. A group
+  with no installed agent is omitted.
+- `runtime.readiness(Provider::Acp)` reports the same aggregate instead of
+  looking for a program named `acp`.
+
+Authentication stays `Unknown` here: opening a session can leave an empty
+session in an agent's history, so the sign-in check is the explicit
+`Acp::probe_agent` below. Registry changes apply to the next discovery without
+rebuilding the runtime.
+
+Custom adapters that choose among several executables per turn opt in through
+`AgentAdapter::selectable_executables`.
+
 ## Check an agent
 
 ```rust
@@ -90,6 +114,8 @@ so run it on an explicit user action.
 - One process per turn; the process is not retained across turns.
 - An agent that keeps running after the turn ends is stopped after
   `terminal_exit_grace` (3 seconds), which also stops tool processes it left
-  running.
+  running. A descendant that escaped the agent's process group and still
+  holds its stderr no longer delays the finished turn: the runtime waits at
+  most 2 seconds for stderr to close and keeps what had arrived.
 - Questions (elicitation) and client-side file system and terminal methods
   are not offered.

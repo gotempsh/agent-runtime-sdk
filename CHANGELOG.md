@@ -47,6 +47,15 @@ Versioning and Keep a Changelog conventions.
   refused before the agent starts. `Acp::probe_agent` runs the handshake (and
   optionally opens a session) to report capabilities and sign-in state. See
   `docs/how-to/run-acp-agents.md`.
+- ACP agents appear in harness discovery and readiness. `discover_harnesses`
+  now includes `Provider::Acp` when the adapter is registered and
+  `AgentRuntime::readiness(Provider::Acp)` resolves each registered agent's
+  own command inside the configured transport instead of a placeholder `acp`
+  executable: the harness is `Ready` when at least one agent is installed,
+  `readiness.detail` names every agent, and the `Agent` control group lists
+  only installed agents. New `AgentAdapter::selectable_executables` (default
+  `None`, so existing adapters are unchanged) and `SelectableExecutable`
+  expose that per-turn choice to the runtime.
 - `TurnEvent::PlanUpdated` with `PlanEntry`/`PlanEntryStatus`: a complete
   replacement of an agent's execution plan, emitted for ACP `plan` updates.
 - `AgentAdapter::interaction_answered`: called by the turn loop right after
@@ -171,6 +180,11 @@ Versioning and Keep a Changelog conventions.
 
 ### Fixed
 
+- A finished turn, probe or metadata query no longer waits for a descendant
+  of the provider that kept its stderr open after the process ended, which
+  turned a completed ACP turn into a timeout when the agent's terminal grace
+  stopped it. The runtime waits a bounded 2 seconds for stderr to close,
+  then stops reading and keeps the tail that had arrived for diagnostics.
 - Changing a Claude turn's model, effort or permission mode no longer
   replaces the retained process and stops its background subagents and
   shells. The process switches them in place with `set_model`,

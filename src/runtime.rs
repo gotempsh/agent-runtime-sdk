@@ -30,6 +30,10 @@ use crate::{
 const DEFAULT_MAX_PROMPT_BYTES: usize = 256 * 1024;
 const DEFAULT_MAX_EVENT_LINE_BYTES: usize = 2 * 1024 * 1024;
 const STDERR_TAIL_BYTES: usize = 32 * 1024;
+/// How long a finished process's stderr may stay open before the reader is
+/// stopped. A descendant that outlived the process can hold the pipe, and the
+/// result of a finished turn or probe must not wait for it.
+const STDERR_DRAIN_GRACE: Duration = Duration::from_secs(2);
 const MAX_PROVIDER_CODE_CHARS: usize = 256;
 const CATALOG_MAX_BYTES: usize = 1024 * 1024;
 const CATALOG_TIMEOUT: Duration = Duration::from_secs(15);
@@ -2237,6 +2241,30 @@ fn validate_attachments(request: &TurnRequest) -> Result<()> {
     Ok(())
 }
 
+/// Readiness of one adapter, with the selectable executables that resolved.
+struct AdapterInspection {
+    readiness: crate::ProviderReadiness,
+    /// Ids of the installed [`crate::SelectableExecutable`]s, or `None` for an
+    /// adapter that runs one fixed executable.
+    installed_choices: Option<Vec<String>>,
+}
+
+/// Keep only the installed agents in `Agent` control groups, so an
+/// application offers what can actually run, and drop a group left empty.
+fn retain_installed_agents(groups: &mut Vec<HarnessControlGroup>, installed: &[String]) {
+    for group in groups
+        .iter_mut()
+        .filter(|group| group.kind == crate::HarnessControlKind::Agent)
+    {
+        group
+            .options
+            .retain(|option| installed.contains(&option.id));
+    }
+    groups.retain(|group| {
+        group.kind != crate::HarnessControlKind::Agent || !group.options.is_empty()
+    });
+}
+
 /// Bounded process runtime shared by all provider adapters.
 #[derive(Clone)]
 pub struct AgentRuntime {
@@ -2317,18 +2345,133 @@ impl AgentRuntime {
     }
 
     /// Inspect one compiled adapter inside the configured execution transport.
+    ///
+    /// An adapter that runs one of several registered executables, such as
+    /// the ACP adapter, is installed when at least one of them resolves;
+    /// [`crate::ProviderReadiness::detail`] names each.
     pub async fn readiness(&self, provider: Provider) -> Result<crate::ProviderReadiness> {
         let adapter = self
             .adapters
             .get(&provider)
             .ok_or(RuntimeError::AdapterUnavailable { provider })?;
-        self.transport
-            .readiness(TransportReadinessRequest {
-                provider,
-                program: adapter.executable(),
-            })
+        self.inspect_adapter(provider, adapter.as_ref())
             .await
+            .map(|inspection| inspection.readiness)
             .map_err(|source| RuntimeError::Transport { provider, source })
+    }
+
+    /// Resolve an adapter's executable, or each executable it can select
+    /// among, inside the configured transport.
+    async fn inspect_adapter(
+        &self,
+        provider: Provider,
+        adapter: &dyn AgentAdapter,
+    ) -> crate::TransportResult<AdapterInspection> {
+        let Some(choices) = adapter.selectable_executables() else {
+            let readiness = self
+                .transport
+                .readiness(TransportReadinessRequest {
+                    provider,
+                    program: adapter.executable(),
+                })
+                .await?;
+            return Ok(AdapterInspection {
+                readiness,
+                installed_choices: None,
+            });
+        };
+        if choices.is_empty() {
+            return Ok(AdapterInspection {
+                readiness: crate::ProviderReadiness {
+                    provider,
+                    installed: false,
+                    executable: None,
+                    version: None,
+                    detail: format!(
+                        "No {provider} agent is registered; register one to make this provider available."
+                    ),
+                },
+                installed_choices: Some(Vec::new()),
+            });
+        }
+        let mut tasks = tokio::task::JoinSet::new();
+        for (index, choice) in choices.iter().enumerate() {
+            let transport = Arc::clone(&self.transport);
+            let request = TransportReadinessRequest {
+                provider,
+                program: choice.executable.clone(),
+            };
+            tasks.spawn(async move { (index, transport.readiness(request).await) });
+        }
+        let mut outcomes = choices.iter().map(|_| None).collect::<Vec<_>>();
+        while let Some(joined) = tasks.join_next().await {
+            if let Ok((index, outcome)) = joined {
+                outcomes[index] = Some(outcome);
+            }
+        }
+        let mut installed = Vec::new();
+        let mut notes = Vec::with_capacity(choices.len());
+        let mut first_error = None;
+        let mut inspected = 0usize;
+        for (choice, outcome) in choices.iter().zip(outcomes) {
+            match outcome {
+                Some(Ok(readiness)) if readiness.installed => {
+                    inspected += 1;
+                    let version = readiness
+                        .version
+                        .as_deref()
+                        .and_then(|version| version.lines().next())
+                        .map(|version| version.chars().take(60).collect::<String>())
+                        .filter(|version| !version.is_empty());
+                    notes.push(match version {
+                        Some(version) => format!("{}: installed ({version})", choice.label),
+                        None => format!("{}: installed", choice.label),
+                    });
+                    installed.push((choice.id.clone(), readiness));
+                }
+                Some(Ok(_)) => {
+                    inspected += 1;
+                    notes.push(format!(
+                        "{}: `{}` was not found",
+                        choice.label,
+                        choice.executable.display()
+                    ));
+                }
+                Some(Err(error)) => {
+                    notes.push(format!(
+                        "{}: could not be inspected ({})",
+                        choice.label,
+                        error.message.chars().take(160).collect::<String>()
+                    ));
+                    first_error.get_or_insert(error);
+                }
+                None => notes.push(format!("{}: inspection did not finish", choice.label)),
+            }
+        }
+        if inspected == 0 {
+            if let Some(error) = first_error {
+                return Err(error);
+            }
+        }
+        let installed_choices = installed.iter().map(|(id, _)| id.clone()).collect();
+        let single = (installed.len() == 1).then(|| installed[0].1.clone());
+        Ok(AdapterInspection {
+            readiness: crate::ProviderReadiness {
+                provider,
+                installed: !installed.is_empty(),
+                // One resolved path and version identify an executable only
+                // when exactly one of the registered ones is installed.
+                executable: single.as_ref().and_then(|found| found.executable.clone()),
+                version: single.and_then(|found| found.version),
+                detail: format!(
+                    "{} of {} registered {provider} agent(s) installed. {}.",
+                    installed.len(),
+                    choices.len(),
+                    notes.join("; ")
+                ),
+            },
+            installed_choices: Some(installed_choices),
+        })
     }
 
     /// Autocomplete working directories inside this runtime's transport.
@@ -2773,7 +2916,7 @@ impl AgentRuntime {
         };
         let stderr_task = process
             .take_stderr()
-            .map(|stderr| tokio::spawn(crate::process::bounded_stderr(stderr, STDERR_TAIL_BYTES)));
+            .map(|stderr| crate::process::StderrCapture::spawn(stderr, STDERR_TAIL_BYTES));
         let run = async {
             let read_output = async {
                 let mut output = Vec::new();
@@ -2799,17 +2942,13 @@ impl AgentRuntime {
         match result {
             Ok(Ok((output, status))) if status.success => {
                 if let Some(task) = stderr_task {
-                    let _ = task.await;
+                    task.abort();
                 }
                 Ok(output)
             }
             Ok(Ok((_, _))) => {
                 let stderr = match stderr_task {
-                    Some(task) => task
-                        .await
-                        .ok()
-                        .and_then(std::result::Result::ok)
-                        .unwrap_or_default(),
+                    Some(task) => task.finish(STDERR_DRAIN_GRACE).await.unwrap_or_default(),
                     None => String::new(),
                 };
                 Err(extension_transport_error(
@@ -2920,7 +3059,7 @@ impl AgentRuntime {
         };
         let stderr_task = process
             .take_stderr()
-            .map(|stderr| tokio::spawn(crate::process::bounded_stderr(stderr, STDERR_TAIL_BYTES)));
+            .map(|stderr| crate::process::StderrCapture::spawn(stderr, STDERR_TAIL_BYTES));
         let read = async {
             let mut reader = BufReader::new(stdout).lines();
             let mut lines = Vec::new();
@@ -3004,6 +3143,7 @@ impl AgentRuntime {
             Provider::Codex,
             Provider::OpenCode,
             Provider::Pi,
+            Provider::Acp,
         ] {
             if self.adapters.contains_key(&provider) {
                 let runtime = self.clone();
@@ -3046,31 +3186,30 @@ impl AgentRuntime {
         if !capabilities.process_tree_termination {
             limitations.push(HarnessLimitation::ProcessTreeTerminationUnavailable);
         }
-        match self
-            .transport
-            .readiness(TransportReadinessRequest {
-                provider,
-                program: adapter.executable(),
-            })
-            .await
-        {
-            Ok(readiness) => {
-                let (authentication, control_groups, models, account_usage) = if readiness.installed
-                {
-                    let authentication =
-                        self.probe_harness_authentication(Arc::clone(adapter), context.clone());
-                    let metadata = self.probe_harness_metadata(Arc::clone(adapter), context);
-                    let (authentication, metadata) = tokio::join!(authentication, metadata);
-                    let (control_groups, models, account_usage) = metadata;
-                    (authentication, control_groups, models, account_usage)
-                } else {
-                    (
-                        HarnessAuthentication::unknown("executable_not_installed"),
-                        adapter.control_groups(),
-                        HarnessModelCatalog::unsupported("executable_not_installed"),
-                        None,
-                    )
-                };
+        match self.inspect_adapter(provider, adapter.as_ref()).await {
+            Ok(AdapterInspection {
+                readiness,
+                installed_choices,
+            }) => {
+                let (authentication, mut control_groups, models, account_usage) =
+                    if readiness.installed {
+                        let authentication =
+                            self.probe_harness_authentication(Arc::clone(adapter), context.clone());
+                        let metadata = self.probe_harness_metadata(Arc::clone(adapter), context);
+                        let (authentication, metadata) = tokio::join!(authentication, metadata);
+                        let (control_groups, models, account_usage) = metadata;
+                        (authentication, control_groups, models, account_usage)
+                    } else {
+                        (
+                            HarnessAuthentication::unknown("executable_not_installed"),
+                            adapter.control_groups(),
+                            HarnessModelCatalog::unsupported("executable_not_installed"),
+                            None,
+                        )
+                    };
+                if let Some(installed) = &installed_choices {
+                    retain_installed_agents(&mut control_groups, installed);
+                }
                 HarnessReadiness {
                     provider,
                     status: if !readiness.installed {
@@ -3361,7 +3500,7 @@ impl AgentRuntime {
         };
         let stderr_task = process
             .take_stderr()
-            .map(|stderr| tokio::spawn(crate::process::bounded_stderr(stderr, STDERR_TAIL_BYTES)));
+            .map(|stderr| crate::process::StderrCapture::spawn(stderr, STDERR_TAIL_BYTES));
         let mut seen = Vec::with_capacity(expected.len());
         let read_lines = async {
             let mut reader = BufReader::new(stdout).lines();
@@ -3433,11 +3572,7 @@ impl AgentRuntime {
             process.wait().await.ok()
         };
         let stderr = match stderr_task {
-            Some(task) => task
-                .await
-                .ok()
-                .and_then(std::result::Result::ok)
-                .unwrap_or_default(),
+            Some(task) => task.finish(STDERR_DRAIN_GRACE).await.unwrap_or_default(),
             None => String::new(),
         };
         if status.is_some_and(|status| !status.success) {
@@ -5625,7 +5760,7 @@ impl AgentRuntime {
                 stream: "stderr setup",
                 source: std::io::Error::new(std::io::ErrorKind::BrokenPipe, "stderr was not piped"),
             })?;
-        let stderr_task = tokio::spawn(crate::process::bounded_stderr(stderr, STDERR_TAIL_BYTES));
+        let stderr_task = crate::process::StderrCapture::spawn(stderr, STDERR_TAIL_BYTES);
         // A provider whose protocol is not carried by its own stdio replaces
         // both halves here. The child stays spawned, supervised and
         // stderr-drained exactly as before; only the frame carrier differs,
@@ -5854,12 +5989,11 @@ impl AgentRuntime {
             }
             crate::ToolProcessPolicy::TerminateOnCompletion => {}
         }
+        // The process is gone, but a descendant it left behind can still hold
+        // stderr open; the finished turn must not wait for it.
         let stderr = stderr_task
+            .finish(STDERR_DRAIN_GRACE)
             .await
-            .map_err(|error| RuntimeError::Protocol {
-                provider,
-                message: format!("stderr reader task failed: {error}"),
-            })?
             .map_err(|source| RuntimeError::ProcessIo {
                 provider,
                 stream: "stderr read",

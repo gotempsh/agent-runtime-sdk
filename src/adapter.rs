@@ -86,6 +86,36 @@ pub struct AuthenticationProbeSpec {
     pub command: CommandSpec,
 }
 
+/// One executable an adapter may run, chosen per turn rather than fixed.
+///
+/// See [`AgentAdapter::selectable_executables`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SelectableExecutable {
+    /// Value that selects this executable. It is the id of the matching option
+    /// in the adapter's [`crate::HarnessControlKind::Agent`] control group.
+    pub id: String,
+    /// User-facing name, used in readiness diagnostics.
+    pub label: String,
+    /// Executable name or path meaningful inside the selected transport.
+    pub executable: PathBuf,
+}
+
+impl SelectableExecutable {
+    /// Describe one selectable executable.
+    pub fn new(
+        id: impl Into<String>,
+        label: impl Into<String>,
+        executable: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            label: label.into(),
+            executable: executable.into(),
+        }
+    }
+}
+
 impl CommandSpec {
     /// Create a process specification for an executable.
     pub fn new(program: impl Into<PathBuf>) -> Self {
@@ -329,6 +359,20 @@ pub trait AgentAdapter: Send + Sync {
             Provider::Pi => "pi",
             Provider::Acp => "acp",
         })
+    }
+
+    /// Executables this adapter can run when a turn chooses among several,
+    /// such as the agents registered with the ACP adapter.
+    ///
+    /// `None`, the default, means [`Self::executable`] is the one program the
+    /// adapter runs. `Some` replaces it for readiness: the runtime resolves
+    /// every entry inside the configured transport, reports the provider as
+    /// installed when at least one resolves, names each entry in the
+    /// readiness detail, and keeps only the installed entries as options of
+    /// the [`crate::HarnessControlKind::Agent`] control group in discovery.
+    /// An empty `Some` means nothing is registered yet.
+    fn selectable_executables(&self) -> Option<Vec<SelectableExecutable>> {
+        None
     }
 
     /// Static and interactive permission behavior implemented by this adapter.
