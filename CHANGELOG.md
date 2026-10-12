@@ -180,6 +180,14 @@ Versioning and Keep a Changelog conventions.
 
 ### Fixed
 
+- Cancelling a turn no longer waits for a provider that has stopped reading
+  its stdin. A provider busy inside a tool call can leave its pipe full, and
+  the adapter-encoded interrupt (`turn/interrupt` for the Codex app-server)
+  was written without a bound, so cancellation and the process-tree cleanup
+  after it waited until the tool ended on its own. The interrupt write now
+  gives up after 1 second, for one-shot and retained turns alike, and the
+  provider is terminated as it already was when the interrupt was not
+  accepted.
 - A finished turn, probe or metadata query no longer waits for a descendant
   of the provider that kept its stderr open after the process ended, which
   turned a completed ACP turn into a timeout when the agent's terminal grace

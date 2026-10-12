@@ -60,6 +60,10 @@ const SANDBOX_RETRY_PROMPT: &str = "The sandbox profile was updated with the app
 /// How long a cancelled provider may keep running after acknowledging an
 /// adapter-encoded interrupt, before the process tree is terminated anyway.
 const INTERRUPT_GRACE: Duration = Duration::from_secs(5);
+/// How long delivering an adapter-encoded interrupt may take. The frame is a
+/// few bytes, so a provider that does not accept it in this time has stopped
+/// reading its stdin (a full pipe while a tool runs) and will not act on it.
+const INTERRUPT_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 /// How long to wait for a terminated provider to be reaped when the turn ran
 /// over adapter-supplied protocol streams. The process is already being
 /// stopped; this only bounds how long the turn waits to observe it.
@@ -1474,6 +1478,29 @@ async fn write_provider_frames(
         })
 }
 
+/// Deliver an adapter-encoded interrupt, giving up after
+/// [`INTERRUPT_WRITE_TIMEOUT`].
+///
+/// A provider busy inside a tool may stop reading its stdin; an unbounded
+/// write would then hold cancellation (and the process-tree cleanup that
+/// follows it) until the tool ended on its own. Returns whether the frame was
+/// written. After a timeout the writer may hold a partial frame, so callers
+/// stop using it and terminate the provider.
+async fn write_interrupt_frame(
+    provider: Provider,
+    stdin: Option<&mut FrameWriter>,
+    frame: &[u8],
+) -> bool {
+    matches!(
+        tokio::time::timeout(
+            INTERRUPT_WRITE_TIMEOUT,
+            write_provider_frames(provider, stdin, &[frame.to_vec()], "interrupt"),
+        )
+        .await,
+        Ok(Ok(()))
+    )
+}
+
 /// Write [`AdapterOutput::optional_writes`] without ever waiting for them.
 ///
 /// Each frame is offered to the writer exactly once. If it accepts nothing
@@ -1564,14 +1591,7 @@ async fn cancel_running_process(
 ) -> RuntimeError {
     if stdin.is_some() {
         if let Some(frame) = adapter.interrupt_request(state) {
-            let delivered = write_provider_frames(
-                provider,
-                stdin.as_mut(),
-                std::slice::from_ref(&frame),
-                "interrupt",
-            )
-            .await
-            .is_ok();
+            let delivered = write_interrupt_frame(provider, stdin.as_mut(), &frame).await;
             // End-of-input lets a stdio protocol server exit on its own once
             // it has acknowledged the interrupt.
             stdin.take();
@@ -5564,14 +5584,7 @@ impl AgentRuntime {
         let Some(frame) = adapter.interrupt_request(&state) else {
             return Err(RuntimeError::Cancelled { provider });
         };
-        let delivered = write_provider_frames(
-            provider,
-            Some(&mut io.stdin),
-            std::slice::from_ref(&frame),
-            "interrupt",
-        )
-        .await
-        .is_ok();
+        let delivered = write_interrupt_frame(provider, Some(&mut io.stdin), &frame).await;
         if !delivered || adapter.retained_interrupt_settled(&state).is_none() {
             return Err(RuntimeError::Cancelled { provider });
         }
