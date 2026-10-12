@@ -1106,6 +1106,7 @@ fn protocol_turn_input(input: TurnInput) -> ProtocolTurnInput {
         environment: protocol_environment(input.environment),
         attachments: input.attachments,
         interaction_policy: input.interaction_policy,
+        request_session_title: input.request_session_title,
     }
 }
 

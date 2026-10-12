@@ -47,6 +47,9 @@ const MAX_BACKGROUND_SUMMARY: usize = 5;
 const FOLLOW_UP_GRACE: Duration = Duration::from_secs(3);
 /// Request ID of the native interrupt the runtime sends to a retained turn.
 const INTERRUPT_REQUEST_ID: &str = "temps-agent-runtime-interrupt";
+const SESSION_TITLE_REQUEST_ID: &str = "temps-agent-runtime-session-title";
+/// Claude Code's own client titles from at most this much of the prompt.
+const SESSION_TITLE_DESCRIPTION_CHARS: usize = 1000;
 /// Upper bound on user messages one turn may submit, its prompt included.
 const MAX_TURN_MESSAGES: usize = 32;
 
@@ -446,6 +449,10 @@ struct ClaudeNativeState {
     /// emitted.
     #[serde(default)]
     workflow_unsent: BTreeSet<String>,
+    /// Description to title the session from; taken when the title request
+    /// is written after the turn's first frame.
+    #[serde(default)]
+    session_title_description: Option<String>,
 }
 
 impl ClaudeNativeState {
@@ -1097,6 +1104,17 @@ impl AgentAdapter for Claude {
     fn prepare_turn(&self, request: &TurnRequest, state: &mut AdapterState) -> Result<()> {
         let mut native = take_native_state(state);
         native.manual_compaction_turn = is_manual_compaction_prompt(&request.prompt);
+        native.session_title_description = (!request.continuation)
+            .then_some(request.request_session_title.as_deref())
+            .flatten()
+            .map(str::trim)
+            .filter(|description| !description.is_empty())
+            .map(|description| {
+                description
+                    .chars()
+                    .take(SESSION_TITLE_DESCRIPTION_CHARS)
+                    .collect()
+            });
         native
             .own_commands
             .insert(new_message_uuid(), "pending".to_string());
@@ -1414,12 +1432,27 @@ impl AgentAdapter for Claude {
         })?;
         let mut output = AdapterOutput::default();
         let mut native = take_native_state(state);
+        // Claude answers `generate_session_title` only once a session holds
+        // the turn's message, so ask after its first frame. Claude Code's
+        // interactive client makes the same request; `persist` saves the
+        // title into the session, and an already-titled session answers with
+        // its existing title without generating another.
+        if let Some(description) = native.session_title_description.take() {
+            output
+                .optional_writes
+                .push(session_title_frame(&description)?);
+        }
         match value
             .get("type")
             .and_then(Value::as_str)
             .unwrap_or_default()
         {
             "system" => {
+                if value.get("subtype").and_then(Value::as_str) == Some("session_title_changed") {
+                    if let Some(title) = value.get("title").and_then(Value::as_str) {
+                        super::report_session_title(title, state, &mut output);
+                    }
+                }
                 if native.result_seen
                     && value.get("subtype").and_then(Value::as_str) == Some("init")
                 {
@@ -1862,12 +1895,22 @@ impl AgentAdapter for Claude {
                 }
             }
             "control_response" => {
-                if value
+                match value
                     .pointer("/response/request_id")
                     .and_then(Value::as_str)
-                    == Some(INTERRUPT_REQUEST_ID)
                 {
-                    native.interrupting = true;
+                    Some(INTERRUPT_REQUEST_ID) => native.interrupting = true,
+                    // A failed request leaves the session untitled; the
+                    // caller asks again on a later turn.
+                    Some(SESSION_TITLE_REQUEST_ID) => {
+                        if let Some(title) = value
+                            .pointer("/response/response/title")
+                            .and_then(Value::as_str)
+                        {
+                            super::report_session_title(title, state, &mut output);
+                        }
+                    }
+                    _ => {}
                 }
             }
             "rate_limit_event" => {
@@ -1930,6 +1973,22 @@ impl AgentAdapter for Claude {
         };
         encode_control_response(&request.id, response).map(Some)
     }
+}
+
+fn session_title_frame(description: &str) -> Result<Vec<u8>> {
+    serde_json::to_vec(&json!({
+        "type": "control_request",
+        "request_id": SESSION_TITLE_REQUEST_ID,
+        "request": {
+            "subtype": "generate_session_title",
+            "description": description,
+            "persist": true,
+        },
+    }))
+    .map_err(|error| RuntimeError::Protocol {
+        provider: Provider::Claude,
+        message: format!("could not encode the session title request: {error}"),
+    })
 }
 
 fn encode_control_response(request_id: &str, response: Value) -> Result<Vec<u8>> {
@@ -4228,6 +4287,147 @@ setTimeout(() => {
                 title: Some("Inspect the runtime".into()),
             }]
         );
+    }
+
+    fn titled_turn(description: Option<&str>, continuation: bool) -> AdapterState {
+        let adapter = Claude::default();
+        let mut request = TurnRequest::new(Provider::Claude, ".", "<context/>\nfix the login loop");
+        request.request_session_title = description.map(str::to_owned);
+        request.continuation = continuation;
+        let mut state = AdapterState::default();
+        adapter.prepare_turn(&request, &mut state).unwrap();
+        state
+    }
+
+    #[test]
+    fn asks_claude_to_title_the_session_once_after_its_first_frame() {
+        let adapter = Claude::default();
+        let mut state = titled_turn(Some("  fix the login loop on Safari  "), false);
+        let first = adapter
+            .parse_line(
+                r#"{"type":"system","subtype":"init","session_id":"s-1"}"#,
+                &mut state,
+            )
+            .unwrap();
+        // An optional write: a blocked or closed stdin can neither delay nor
+        // fail the turn over a title.
+        assert_eq!(first.writes.len(), 0);
+        assert_eq!(first.optional_writes.len(), 1);
+        let frame: Value = serde_json::from_slice(&first.optional_writes[0]).unwrap();
+        assert_eq!(frame["type"], "control_request");
+        assert_eq!(frame["request_id"], SESSION_TITLE_REQUEST_ID);
+        assert_eq!(frame["request"]["subtype"], "generate_session_title");
+        assert_eq!(
+            frame["request"]["description"],
+            "fix the login loop on Safari"
+        );
+        assert_eq!(frame["request"]["persist"], true);
+
+        let later = adapter
+            .parse_line(r#"{"type":"rate_limit_event"}"#, &mut state)
+            .unwrap();
+        assert_eq!(
+            later.optional_writes.len(),
+            0,
+            "the title is requested once per turn"
+        );
+    }
+
+    #[test]
+    fn bounds_the_title_description_like_claude_code() {
+        let adapter = Claude::default();
+        let long = "é".repeat(SESSION_TITLE_DESCRIPTION_CHARS + 50);
+        let mut state = titled_turn(Some(&long), false);
+        let output = adapter
+            .parse_line(
+                r#"{"type":"system","subtype":"init","session_id":"s-1"}"#,
+                &mut state,
+            )
+            .unwrap();
+        let frame: Value = serde_json::from_slice(&output.optional_writes[0]).unwrap();
+        assert_eq!(
+            frame["request"]["description"]
+                .as_str()
+                .unwrap()
+                .chars()
+                .count(),
+            SESSION_TITLE_DESCRIPTION_CHARS
+        );
+    }
+
+    #[test]
+    fn no_title_is_requested_without_a_description_or_for_a_continuation() {
+        let adapter = Claude::default();
+        for mut state in [
+            titled_turn(None, false),
+            titled_turn(Some("   "), false),
+            titled_turn(Some("fix it"), true),
+        ] {
+            let output = adapter
+                .parse_line(
+                    r#"{"type":"system","subtype":"init","session_id":"s-1"}"#,
+                    &mut state,
+                )
+                .unwrap();
+            assert_eq!(output.writes.len() + output.optional_writes.len(), 0);
+        }
+    }
+
+    #[test]
+    fn the_title_response_reports_the_session_title() {
+        let adapter = Claude::default();
+        let mut state = AdapterState::default();
+        let output = adapter
+            .parse_line(
+                r#"{"type":"control_response","response":{"subtype":"success","request_id":"temps-agent-runtime-session-title","response":{"title":" Login  redirect loop on Safari "}}}"#,
+                &mut state,
+            )
+            .unwrap();
+        assert_eq!(
+            output.events,
+            vec![TurnEvent::SessionTitle {
+                title: "Login redirect loop on Safari".into()
+            }]
+        );
+        assert_eq!(
+            state.result.session_title.as_deref(),
+            Some("Login redirect loop on Safari")
+        );
+
+        // The same title announced again is not reported twice.
+        let repeated = adapter
+            .parse_line(
+                r#"{"type":"system","subtype":"session_title_changed","title":"Login redirect loop on Safari"}"#,
+                &mut state,
+            )
+            .unwrap();
+        assert_eq!(repeated.events.len(), 0);
+        let renamed = adapter
+            .parse_line(
+                r#"{"type":"system","subtype":"session_title_changed","title":"Safari OAuth loop"}"#,
+                &mut state,
+            )
+            .unwrap();
+        assert_eq!(
+            renamed.events,
+            vec![TurnEvent::SessionTitle {
+                title: "Safari OAuth loop".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn a_failed_title_request_is_silent() {
+        let adapter = Claude::default();
+        let mut state = AdapterState::default();
+        let output = adapter
+            .parse_line(
+                r#"{"type":"control_response","response":{"subtype":"error","request_id":"temps-agent-runtime-session-title","error":"no session"}}"#,
+                &mut state,
+            )
+            .unwrap();
+        assert_eq!(output.events.len(), 0);
+        assert!(state.result.session_title.is_none());
     }
 
     #[test]

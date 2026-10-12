@@ -654,9 +654,121 @@ enum RetainedTurnEnd {
 /// backpressure, in which case the requester sees an ordinary busy runtime.
 const HANDOFF_DECISION_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// A provider's stdin that never leaves a frame half written.
+///
+/// An optional frame ([`AdapterOutput::optional_writes`]) is offered once and
+/// dropped if the writer has no room, but a writer can accept only a prefix of
+/// it. The unsent remainder is kept here and goes out before any later write,
+/// required or optional, so the next frame is never glued onto a fragment.
+struct FrameWriter {
+    inner: crate::TransportWriter,
+    /// Unsent remainder of an optional frame the writer accepted in part.
+    tail: Vec<u8>,
+}
+
+impl FrameWriter {
+    fn new(inner: crate::TransportWriter) -> Self {
+        Self {
+            inner,
+            tail: Vec::new(),
+        }
+    }
+
+    /// Send what an earlier partial frame left behind.
+    fn poll_drain(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        use std::pin::Pin;
+        use std::task::Poll;
+        use tokio::io::AsyncWrite;
+        while !self.tail.is_empty() {
+            let written = match Pin::new(&mut self.inner).poll_write(cx, &self.tail) {
+                Poll::Ready(Ok(written)) => written,
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Pending => return Poll::Pending,
+            };
+            if written == 0 {
+                return Poll::Ready(Err(std::io::ErrorKind::WriteZero.into()));
+            }
+            self.tail.drain(..written);
+        }
+        Poll::Ready(Ok(()))
+    }
+
+    /// Offer one whole newline-terminated frame without waiting. Returns
+    /// whether the writer can take another one.
+    fn offer(&mut self, cx: &mut std::task::Context<'_>, frame: &[u8]) -> bool {
+        use std::pin::Pin;
+        use std::task::Poll;
+        use tokio::io::AsyncWrite;
+        if !matches!(self.poll_drain(cx), Poll::Ready(Ok(()))) {
+            return false;
+        }
+        match Pin::new(&mut self.inner).poll_write(cx, frame) {
+            Poll::Ready(Ok(written)) if written == frame.len() => {
+                // A buffering writer holds the bytes until a flush. One that
+                // cannot flush yet keeps them for the next write to push out.
+                let _ = Pin::new(&mut self.inner).poll_flush(cx);
+                true
+            }
+            Poll::Ready(Ok(written)) if written > 0 => {
+                self.tail.extend_from_slice(&frame[written..]);
+                false
+            }
+            Poll::Pending | Poll::Ready(_) => false,
+        }
+    }
+}
+
+impl tokio::io::AsyncWrite for FrameWriter {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        if let std::task::Poll::Ready(Err(error)) = this.poll_drain(cx) {
+            return std::task::Poll::Ready(Err(error));
+        }
+        if !this.tail.is_empty() {
+            return std::task::Poll::Pending;
+        }
+        std::pin::Pin::new(&mut this.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        if let std::task::Poll::Ready(Err(error)) = this.poll_drain(cx) {
+            return std::task::Poll::Ready(Err(error));
+        }
+        if !this.tail.is_empty() {
+            return std::task::Poll::Pending;
+        }
+        std::pin::Pin::new(&mut this.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        if let std::task::Poll::Ready(Err(error)) = this.poll_drain(cx) {
+            return std::task::Poll::Ready(Err(error));
+        }
+        if !this.tail.is_empty() {
+            return std::task::Poll::Pending;
+        }
+        std::pin::Pin::new(&mut this.inner).poll_shutdown(cx)
+    }
+}
+
 struct RetainedCodexIo {
     process: crate::TransportProcess,
-    stdin: crate::TransportWriter,
+    stdin: FrameWriter,
     reader: BufReader<crate::TransportReader>,
     stderr_task: tokio::task::JoinHandle<std::io::Result<String>>,
     stdout_task: Option<tokio::task::JoinHandle<std::io::Result<String>>>,
@@ -1007,7 +1119,19 @@ async fn supervise_idle_retained_process(
         match observed {
             None => {}
             Some(Ok(Some(line))) => match adapter.classify_idle_frame(&line) {
-                IdleFrame::Background => {}
+                IdleFrame::Background => {
+                    // Work an earlier turn left pending can still answer; the
+                    // adapter may need to clean up what it opened.
+                    let replies = adapter.idle_frame_writes(&line);
+                    if !replies.is_empty() {
+                        let mut io = retained.io.lock().await;
+                        if current(&retained) {
+                            if let Some(io) = io.as_mut() {
+                                write_optional_frames(Some(&mut io.stdin), &replies).await;
+                            }
+                        }
+                    }
+                }
                 IdleFrame::KeepaliveResult { active: true } => {
                     probe_deadline = None;
                     expires_at = tokio::time::Instant::now() + idle_timeout;
@@ -1030,7 +1154,7 @@ async fn supervise_idle_retained_process(
 async fn deliver_turn_message(
     adapter: &dyn AgentAdapter,
     provider: Provider,
-    stdin: &mut crate::TransportWriter,
+    stdin: &mut FrameWriter,
     state: &mut AdapterState,
     message: TurnMessage,
 ) -> Result<()> {
@@ -1125,9 +1249,14 @@ async fn apply_interrupted_frame(
             Err(_) => return false,
         }
     }
-    write_provider_frames(provider, Some(&mut io.stdin), &writes, "interrupt write")
+    if write_provider_frames(provider, Some(&mut io.stdin), &writes, "interrupt write")
         .await
-        .is_ok()
+        .is_err()
+    {
+        return false;
+    }
+    write_optional_frames(Some(&mut io.stdin), &output.optional_writes).await;
+    true
 }
 
 /// Encode a refusal for an approval or question no one can answer.
@@ -1285,9 +1414,14 @@ async fn park_frame(
         }
         parked.buffer(output.events, declined);
     }
-    write_provider_frames(provider, Some(&mut io.stdin), &writes, "parked write")
+    if write_provider_frames(provider, Some(&mut io.stdin), &writes, "parked write")
         .await
-        .is_ok()
+        .is_err()
+    {
+        return false;
+    }
+    write_optional_frames(Some(&mut io.stdin), &output.optional_writes).await;
+    true
 }
 
 /// Whether `event` announces an approval or question awaiting an answer.
@@ -1303,7 +1437,7 @@ fn is_interaction_request(event: &TurnEvent) -> bool {
 /// Write newline-terminated provider frames to an interactive stdin.
 async fn write_provider_frames(
     provider: Provider,
-    stdin: Option<&mut crate::TransportWriter>,
+    stdin: Option<&mut FrameWriter>,
     frames: &[Vec<u8>],
     stream: &'static str,
 ) -> Result<()> {
@@ -1334,6 +1468,27 @@ async fn write_provider_frames(
             stream,
             source,
         })
+}
+
+/// Write [`AdapterOutput::optional_writes`] without ever waiting for them.
+///
+/// Each frame is offered to the writer exactly once. If it accepts nothing
+/// right away (a full pipe, a provider that stopped reading) the frame and the
+/// rest of the batch are dropped; a closed or failing writer is ignored. A
+/// frame the writer accepted only in part keeps its remainder in the
+/// [`FrameWriter`], which sends it before anything else, so the stream stays
+/// framed. These writes therefore cannot delay a turn, and nothing here can
+/// turn a completed turn into an error.
+async fn write_optional_frames(stdin: Option<&mut FrameWriter>, frames: &[Vec<u8>]) {
+    let Some(writer) = stdin else { return };
+    for frame in frames {
+        let mut bytes = Vec::with_capacity(frame.len() + 1);
+        bytes.extend_from_slice(frame);
+        bytes.push(b'\n');
+        if !std::future::poll_fn(|cx| std::task::Poll::Ready(writer.offer(cx, &bytes))).await {
+            return;
+        }
+    }
 }
 
 /// Close a retained turn that reached its terminal frame or quiet completion.
@@ -1400,7 +1555,7 @@ async fn cancel_running_process(
     provider: Provider,
     adapter: &dyn AgentAdapter,
     state: &AdapterState,
-    stdin: &mut Option<crate::TransportWriter>,
+    stdin: &mut Option<FrameWriter>,
     process: &mut crate::TransportProcess,
 ) -> RuntimeError {
     if stdin.is_some() {
@@ -4382,7 +4537,7 @@ impl AgentRuntime {
                                     .to_string(),
                         }
                     })?;
-                    let mut writer = streams.writer;
+                    let mut writer = FrameWriter::new(streams.writer);
                     let mut reader = BufReader::new(streams.reader);
                     let mut pending_events = Vec::new();
                     loop {
@@ -4424,6 +4579,7 @@ impl AgentRuntime {
                             "OpenCode preflight",
                         )
                         .await?;
+                        write_optional_frames(Some(&mut writer), &output.optional_writes).await;
                     }
                 })
                 .await;
@@ -4521,12 +4677,14 @@ impl AgentRuntime {
             let setup_result: Result<_> = async {
                 let mut stdin = if provider == Provider::OpenCode {
                     let (writer, _reader) = tokio::io::duplex(1);
-                    Box::new(writer) as crate::TransportWriter
+                    FrameWriter::new(Box::new(writer) as crate::TransportWriter)
                 } else {
-                    process.take_stdin().ok_or_else(|| RuntimeError::Protocol {
-                        provider,
-                        message: "retained provider process did not expose stdin".to_string(),
-                    })?
+                    FrameWriter::new(process.take_stdin().ok_or_else(|| {
+                        RuntimeError::Protocol {
+                            provider,
+                            message: "retained provider process did not expose stdin".to_string(),
+                        }
+                    })?)
                 };
                 if let Some(initial) = &spec.initial_stdin {
                     write_provider_frames(
@@ -4560,7 +4718,7 @@ impl AgentRuntime {
                         }
                     })?;
                     (
-                        streams.writer,
+                        FrameWriter::new(streams.writer),
                         BufReader::new(streams.reader),
                         Some(tokio::spawn(crate::process::bounded_stderr(
                             stdout,
@@ -4656,7 +4814,7 @@ impl AgentRuntime {
                                     .to_string(),
                         }
                     })?;
-                    io.stdin = streams.writer;
+                    io.stdin = FrameWriter::new(streams.writer);
                     io.reader = BufReader::new(streams.reader);
                 }
             }
@@ -5126,6 +5284,7 @@ impl AgentRuntime {
                 "provider write",
             )
             .await?;
+            write_optional_frames(Some(&mut io.stdin), &output.optional_writes).await;
             if let Some(interaction) = output.interaction {
                 if self
                     .answer_retained_interaction(
@@ -5404,7 +5563,7 @@ impl AgentRuntime {
                 stream: "stdin setup",
                 source: std::io::Error::new(std::io::ErrorKind::BrokenPipe, "stdin was not piped"),
             })?;
-        let mut stdin = Some(stdin);
+        let mut stdin = Some(FrameWriter::new(stdin));
         if let Some(initial) = &spec.initial_stdin {
             let writer = stdin.as_mut().expect("stdin initialized");
             writer
@@ -5463,7 +5622,7 @@ impl AgentRuntime {
         let reader: crate::TransportReader = match adapter.attach(request, &state).await {
             Ok(Some(streams)) => {
                 attached = true;
-                stdin = Some(streams.writer);
+                stdin = Some(FrameWriter::new(streams.writer));
                 streams.reader
             }
             Ok(None) => stdout,
@@ -5529,6 +5688,7 @@ impl AgentRuntime {
             }
             write_provider_frames(provider, stdin.as_mut(), &output.writes, "provider write")
                 .await?;
+            write_optional_frames(stdin.as_mut(), &output.optional_writes).await;
             if let Some(interaction) = output.interaction {
                 let response = match interaction {
                     InteractionRequest::Approval {
@@ -6364,6 +6524,102 @@ impl EventSink for CompactionGuard<'_> {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn optional_frames_are_written_in_order_when_the_writer_has_room() {
+        use tokio::io::AsyncReadExt;
+        let (writer, mut reader) = tokio::io::duplex(1024);
+        let mut writer = FrameWriter::new(Box::new(writer));
+        write_optional_frames(Some(&mut writer), &[b"one".to_vec(), b"two".to_vec()]).await;
+        drop(writer);
+        let mut written = String::new();
+        reader.read_to_string(&mut written).await.unwrap();
+        assert_eq!(written, "one\ntwo\n");
+    }
+
+    #[tokio::test]
+    async fn an_optional_frame_a_blocked_writer_cannot_take_is_dropped_without_waiting() {
+        use tokio::io::AsyncReadExt;
+        // Eight bytes of room, filled by a required frame nobody reads.
+        let (writer, mut reader) = tokio::io::duplex(8);
+        let mut writer = FrameWriter::new(Box::new(writer));
+        write_provider_frames(
+            Provider::Codex,
+            Some(&mut writer),
+            &[b"1234567".to_vec()],
+            "test write",
+        )
+        .await
+        .unwrap();
+
+        // Would block forever if awaited; it must return at once.
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            write_optional_frames(Some(&mut writer), &[b"cleanup".to_vec()]),
+        )
+        .await
+        .expect("an optional write must not wait for a blocked writer");
+
+        drop(writer);
+        let mut written = String::new();
+        reader.read_to_string(&mut written).await.unwrap();
+        assert_eq!(
+            written, "1234567\n",
+            "the dropped frame left no partial bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_partly_accepted_optional_frame_is_finished_before_the_next_frame() {
+        use tokio::io::AsyncReadExt;
+        // Ten bytes of room for a seventeen-byte frame.
+        let (writer, mut reader) = tokio::io::duplex(10);
+        let mut writer = FrameWriter::new(Box::new(writer));
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            write_optional_frames(Some(&mut writer), &[b"abcdefghijklmnop".to_vec()]),
+        )
+        .await
+        .expect("an optional write must not wait for a slow writer");
+        assert_eq!(writer.tail, b"klmnop\n", "the unsent remainder is kept");
+
+        // A later required frame goes out after the remainder, never inside it.
+        let expected = "abcdefghijklmnop\nnext\n";
+        let required = [b"next".to_vec()];
+        let write =
+            write_provider_frames(Provider::Codex, Some(&mut writer), &required, "test write");
+        let read = async {
+            let mut written = vec![0; expected.len()];
+            reader.read_exact(&mut written).await.unwrap();
+            String::from_utf8(written).unwrap()
+        };
+        let (written, received) =
+            tokio::time::timeout(Duration::from_secs(5), async { tokio::join!(write, read) })
+                .await
+                .expect("the remainder drains once the reader catches up");
+        written.unwrap();
+        assert_eq!(received, expected);
+        assert_eq!(writer.tail.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn an_optional_frame_cannot_fail_on_a_closed_writer() {
+        let (writer, reader) = tokio::io::duplex(1024);
+        drop(reader);
+        let mut writer = FrameWriter::new(Box::new(writer));
+        write_optional_frames(Some(&mut writer), &[b"cleanup".to_vec()]).await;
+        // A required write to the same writer does fail, which is the
+        // difference an optional frame exists for.
+        let required = write_provider_frames(
+            Provider::Codex,
+            Some(&mut writer),
+            &[b"cleanup".to_vec()],
+            "test write",
+        )
+        .await;
+        assert!(matches!(required, Err(RuntimeError::ProcessIo { .. })));
+        write_optional_frames(None, &[b"cleanup".to_vec()]).await;
+    }
+
     #[test]
     fn only_native_compaction_silences_the_empty_reply_warning() {
         let compact = TurnRequest::new(Provider::Codex, ".", "/compact");
@@ -6592,7 +6848,7 @@ mod tests {
             .unwrap();
         adapter.mark_retained_turn(&mut state);
         let (writer, mut reader) = tokio::io::duplex(64 * 1024);
-        let mut stdin: crate::TransportWriter = Box::new(writer);
+        let mut stdin = FrameWriter::new(Box::new(writer));
         let send = |text: &str, claim: u8| {
             let (reply, delivered) = oneshot::channel();
             (
@@ -7449,6 +7705,7 @@ mod tests {
                         original: value,
                     }),
                     writes: Vec::new(),
+                    optional_writes: Vec::new(),
                     terminal: false,
                     turn_submitted: false,
                 })

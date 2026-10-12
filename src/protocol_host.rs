@@ -936,6 +936,7 @@ fn protocol_turn_input(input: ProtocolTurnInput) -> Result<TurnInput, RuntimeFai
     turn.environment = protocol_environment(input.environment);
     turn.attachments = input.attachments;
     turn.interaction_policy = input.interaction_policy;
+    turn.request_session_title = input.request_session_title;
     Ok(turn)
 }
 
@@ -1158,6 +1159,7 @@ mod tests {
                     environment: Vec::new(),
                     attachments: Vec::new(),
                     interaction_policy: InteractionPolicy::Deny,
+                    request_session_title: None,
                 },
             },
         }

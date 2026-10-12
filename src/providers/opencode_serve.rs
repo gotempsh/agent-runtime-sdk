@@ -537,20 +537,20 @@ fn response(
                 return Ok(());
             };
             turn.session_id = Some(session.to_string());
-            if let Some(title) = body
+            let title = body
                 .get("title")
                 .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|title| !title.is_empty())
-            {
-                state.result.session_title = Some(title.to_string());
-            }
+                .filter(|title| !is_placeholder_title(title));
             if state.result.session_id.as_deref() != Some(session) {
                 state.result.session_id = Some(session.to_string());
                 output.events.push(TurnEvent::SessionStarted {
                     session_id: session.to_string(),
-                    title: state.result.session_title.clone(),
+                    title: title.map(|title| title.trim().to_string()),
                 });
+            }
+            // Includes a title OpenCode generated after an earlier turn ended.
+            if let Some(title) = title {
+                super::report_session_title(title, state, output);
             }
             // Subscribe before prompting so nothing emitted in the turn's
             // first moments is missed; the prompt follows `@subscribed`.
@@ -578,6 +578,27 @@ fn response(
     Ok(())
 }
 
+/// OpenCode names every session `New session - <ISO time>` (or `Child
+/// session - …`) until its title model has run; that is not a title.
+fn is_placeholder_title(title: &str) -> bool {
+    let title = title.trim();
+    title.is_empty()
+        || ["New session - ", "Child session - "].iter().any(|prefix| {
+            // OpenCode's own check: `\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z`.
+            title.strip_prefix(prefix).is_some_and(|time| {
+                time.len() == 24
+                    && time.bytes().enumerate().all(|(index, byte)| match index {
+                        4 | 7 => byte == b'-',
+                        10 => byte == b'T',
+                        13 | 16 => byte == b':',
+                        19 => byte == b'.',
+                        23 => byte == b'Z',
+                        _ => byte.is_ascii_digit(),
+                    })
+            })
+        })
+}
+
 /// Map one OpenCode SSE event onto the normalized stream.
 fn event(
     event: &Value,
@@ -593,7 +614,19 @@ fn event(
     // A retained server carries traffic for more than one turn. Fail closed:
     // every event that can mutate or finish a turn must identify the current
     // session, so delayed or unrelated traffic cannot leak across turns.
-    let reported = properties.get("sessionID").and_then(Value::as_str);
+    // `session.updated` carries the whole session as `info` instead.
+    let reported = properties
+        .get("sessionID")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            (kind == "session.updated")
+                .then(|| properties.pointer("/info/id").and_then(Value::as_str))
+                .flatten()
+        });
+    if kind == "session.updated" && reported.is_none_or(|id| turn.session_id.as_deref() != Some(id))
+    {
+        return;
+    }
     if turn.retained {
         if reported
             .zip(turn.session_id.as_deref())
@@ -702,6 +735,17 @@ fn event(
             emit_delta(&kind, delta, state, output);
         }
         "permission.asked" => permission(properties, turn, output),
+        // OpenCode titles a new session with a small model after its first
+        // prompt and announces it here.
+        "session.updated" => {
+            if let Some(title) = properties
+                .pointer("/info/title")
+                .and_then(Value::as_str)
+                .filter(|title| !is_placeholder_title(title))
+            {
+                super::report_session_title(title, state, output);
+            }
+        }
         "session.compacted" => {
             let trigger = turn
                 .open_compaction
@@ -1219,6 +1263,109 @@ mod tests {
             .iter()
             .flat_map(|frame| parse_line(frame, state).unwrap().events)
             .collect()
+    }
+
+    #[test]
+    fn placeholder_titles_are_not_titles() {
+        assert!(is_placeholder_title(
+            "New session - 2026-10-11T14:19:52.792Z"
+        ));
+        assert!(is_placeholder_title(
+            "Child session - 2026-10-11T14:19:52.792Z"
+        ));
+        assert!(is_placeholder_title("  "));
+        assert!(!is_placeholder_title("Create hello.txt file"));
+        assert!(!is_placeholder_title("New session - plan the migration"));
+    }
+
+    #[test]
+    fn opencode_s_generated_title_is_reported_when_it_arrives() {
+        let mut state = running_turn(PermissionMode::Default);
+        let events = feed(
+            &mut state,
+            &[
+                sse(
+                    "session.updated",
+                    json!({"info": {"id": "session-1",
+                    "title": "New session - 2026-10-11T14:19:52.792Z"}}),
+                ),
+                sse(
+                    "session.updated",
+                    json!({"info": {"id": "session-other",
+                    "title": "Someone else's work"}}),
+                ),
+                sse(
+                    "session.updated",
+                    json!({"info": {"id": "session-1",
+                    "title": "Create hello.txt file"}}),
+                ),
+                sse(
+                    "session.updated",
+                    json!({"info": {"id": "session-1",
+                    "title": "Create hello.txt file"}}),
+                ),
+            ],
+        );
+        assert_eq!(
+            events,
+            vec![TurnEvent::SessionTitle {
+                title: "Create hello.txt file".into()
+            }]
+        );
+        assert_eq!(
+            state.result.session_title.as_deref(),
+            Some("Create hello.txt file")
+        );
+    }
+
+    #[test]
+    fn a_session_opened_with_its_placeholder_has_no_title() {
+        let request = request(PermissionMode::Default);
+        let mut state = AdapterState::default();
+        prepare_turn(&request, &mut state, 4242);
+        let mut events = Vec::new();
+        for frame in [
+            json!({"type": FRAME_READY}),
+            json!({"type": FRAME_RESPONSE, "id": ID_SESSION, "status": 200,
+                   "body": {"id": "session-1", "title": "New session - 2026-10-11T14:19:52.792Z"}}),
+        ] {
+            events.extend(parse_line(&frame.to_string(), &mut state).unwrap().events);
+        }
+        assert_eq!(
+            events,
+            vec![TurnEvent::SessionStarted {
+                session_id: "session-1".into(),
+                title: None
+            }]
+        );
+        assert!(state.result.session_title.is_none());
+    }
+
+    #[test]
+    fn a_session_reopened_with_its_generated_title_reports_it() {
+        let request = request(PermissionMode::Default);
+        let mut state = AdapterState::default();
+        prepare_turn(&request, &mut state, 4242);
+        let mut events = Vec::new();
+        for frame in [
+            json!({"type": FRAME_READY}),
+            json!({"type": FRAME_RESPONSE, "id": ID_SESSION, "status": 200,
+                   "body": {"id": "session-1", "title": "Create hello.txt file"}}),
+        ] {
+            events.extend(parse_line(&frame.to_string(), &mut state).unwrap().events);
+        }
+        assert_eq!(
+            events,
+            vec![
+                TurnEvent::SessionStarted {
+                    session_id: "session-1".into(),
+                    title: Some("Create hello.txt file".into()),
+                },
+                TurnEvent::SessionTitle {
+                    title: "Create hello.txt file".into()
+                },
+            ]
+        );
     }
 
     fn is_compaction(event: &TurnEvent) -> bool {

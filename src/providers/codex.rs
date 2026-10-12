@@ -1057,6 +1057,14 @@ impl AgentAdapter for Codex {
         }
     }
 
+    fn idle_frame_writes(&self, line: &str) -> Vec<Vec<u8>> {
+        if self.app_server_mode() {
+            codex_app_server::idle_frame_writes(line)
+        } else {
+            Vec::new()
+        }
+    }
+
     fn interrupt_request(&self, state: &AdapterState) -> Option<Vec<u8>> {
         self.app_server_mode()
             .then(|| codex_app_server::interrupt(state))
