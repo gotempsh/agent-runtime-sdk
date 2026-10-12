@@ -636,15 +636,30 @@ impl TitleFlow {
             "default_permissions".to_string(),
             json!(READ_ONLY_PERMISSION_PROFILE),
         );
-        config.insert(
-            "mcp_servers".to_string(),
-            Value::Object(
-                self.mcp_servers
-                    .iter()
-                    .map(|name| (name.clone(), json!({"enabled": false})))
-                    .collect(),
-            ),
-        );
+        // One dotted key per server merges `enabled = false` into the
+        // server's own definition. A nested `mcp_servers` object replaces it
+        // instead, which Codex refuses ("invalid transport") for a server
+        // that only a `--config` override on the app-server defines, such as
+        // the ones an application launches it with.
+        if self
+            .mcp_servers
+            .iter()
+            .all(|name| is_plain_server_name(name))
+        {
+            for name in &self.mcp_servers {
+                config.insert(format!("mcp_servers.{name}.enabled"), json!(false));
+            }
+        } else {
+            config.insert(
+                "mcp_servers".to_string(),
+                Value::Object(
+                    self.mcp_servers
+                        .iter()
+                        .map(|name| (name.clone(), json!({"enabled": false})))
+                        .collect(),
+                ),
+            );
+        }
         let mut params = json!({
             "cwd": self.cwd,
             "sandbox": "read-only",
@@ -860,6 +875,14 @@ fn push_frame(output: &mut AdapterOutput, frame: &Value) {
     if let Ok(bytes) = encode(frame) {
         output.writes.push(bytes);
     }
+}
+
+/// Whether `name` can sit unquoted inside a dotted config key.
+fn is_plain_server_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
 /// A process-unique flow id. Ids only need to be unique per connection.
@@ -2484,6 +2507,32 @@ mod tests {
     }
 
     #[test]
+    fn a_server_name_that_cannot_be_a_dotted_key_is_disabled_as_a_table() {
+        let mut request = title_request(Some(DESCRIPTION));
+        for name in ["plain-server", "needs.quotes"] {
+            request.launch_context.mcp_servers.insert(
+                name.into(),
+                crate::McpServerConfig::Stdio {
+                    command: "server".into(),
+                    args: Vec::new(),
+                    environment_from: std::collections::BTreeMap::new(),
+                },
+            );
+        }
+        let (state, _) = open(&request, json!({"id": "thread-1"}));
+        let mut flow = load(&state).title.expect("a title flow");
+        let mut output = AdapterOutput::default();
+        flow.start_thread(&mut output);
+        let frame = &writes(&output)[0];
+        let config = &frame["params"]["config"];
+        assert_eq!(
+            config["mcp_servers"],
+            json!({"needs.quotes": {"enabled": false}, "plain-server": {"enabled": false}})
+        );
+        assert!(config.get("mcp_servers.plain-server.enabled").is_none());
+    }
+
+    #[test]
     fn a_requested_title_runs_on_a_hidden_read_only_thread_and_names_the_users_thread() {
         let mut request = title_request(Some(DESCRIPTION));
         request.launch_context.mcp_servers.insert(
@@ -2537,10 +2586,11 @@ mod tests {
         assert_eq!(config["tools.update_plan.enabled"], false);
         assert_eq!(config["web_search"], "disabled");
         assert_eq!(config["default_permissions"], ":read-only");
-        assert_eq!(
-            config["mcp_servers"],
-            json!({"github": {"enabled": false}, "temps_fleet": {"enabled": false}})
-        );
+        // Merged into each server's own definition, so a server only a
+        // `--config` override defines is not replaced by a transport-less one.
+        assert_eq!(config["mcp_servers.github.enabled"], false);
+        assert_eq!(config["mcp_servers.temps_fleet.enabled"], false);
+        assert!(config.get("mcp_servers").is_none());
         assert!(thread_start["id"]
             .as_str()
             .unwrap()
