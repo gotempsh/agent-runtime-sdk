@@ -5990,9 +5990,12 @@ impl AgentRuntime {
             crate::ToolProcessPolicy::TerminateOnCompletion => {}
         }
         // The process is gone, but a descendant it left behind can still hold
-        // stderr open; the finished turn must not wait for it.
+        // stderr open; the finished turn must not wait for it. The reader
+        // keeps draining in the background past the grace, because stopping it
+        // would break the pipe under a tool that
+        // `ToolProcessPolicy::PreserveOnCompletion` meant to keep running.
         let stderr = stderr_task
-            .finish(STDERR_DRAIN_GRACE)
+            .finish_detached(STDERR_DRAIN_GRACE)
             .await
             .map_err(|source| RuntimeError::ProcessIo {
                 provider,

@@ -183,8 +183,11 @@ Versioning and Keep a Changelog conventions.
 - A finished turn, probe or metadata query no longer waits for a descendant
   of the provider that kept its stderr open after the process ended, which
   turned a completed ACP turn into a timeout when the agent's terminal grace
-  stopped it. The runtime waits a bounded 2 seconds for stderr to close,
-  then stops reading and keeps the tail that had arrived for diagnostics.
+  stopped it. The runtime waits a bounded 2 seconds for stderr to close and
+  keeps the tail that had arrived for diagnostics. A turn keeps draining the
+  pipe in the background past that point, so a tool left running by
+  `ToolProcessPolicy::PreserveOnCompletion` never gets a broken pipe; probes,
+  which have already stopped the process, stop reading.
 - Changing a Claude turn's model, effort or permission mode no longer
   replaces the retained process and stops its background subagents and
   shells. The process switches them in place with `set_model`,

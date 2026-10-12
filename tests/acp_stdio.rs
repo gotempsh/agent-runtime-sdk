@@ -34,7 +34,17 @@ if [ "$1" = --version ]; then echo "mock-agent 0.1.0"; exit 0; fi
 log="$MOCK_ACP_LOG"
 say() { printf '%s\n' "$1"; }
 update() { say "{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"mock-session\",\"update\":$1}}"; }
-if [ "$MOCK_ACP_MODE" = orphan ] || [ "$MOCK_ACP_MODE" = finish_orphan ]; then
+if [ "$MOCK_ACP_MODE" = finish_orphan ]; then
+  # Outlives the turn, then writes to the inherited stderr and records that
+  # the write succeeded: a closed pipe would kill it with SIGPIPE first.
+  child='sleep 8; echo late diagnostic >&2; echo wrote > "$1"'
+  if command -v perl >/dev/null 2>&1; then
+    perl -MPOSIX -e 'POSIX::setsid(); exec @ARGV' sh -c "$child" sh "$log.late" >/dev/null &
+  else
+    setsid sh -c "$child" sh "$log.late" >/dev/null &
+  fi
+  echo $! > "$log.orphan"
+elif [ "$MOCK_ACP_MODE" = orphan ]; then
   if command -v perl >/dev/null 2>&1; then
     perl -MPOSIX -e 'POSIX::setsid(); exec "sleep", "20"' >/dev/null &
   else
@@ -549,26 +559,40 @@ async fn a_finished_turn_does_not_wait_for_a_descendant_that_kept_stderr_open() 
     let fixture = Fixture::new();
     let mut request = fixture.request("run the tests");
     request.permission_mode = PermissionMode::FullAccess;
-    // The descendant holds stderr for 20 seconds; a turn that waited for it
+    // The descendant holds stderr for 8 seconds; a turn that waited for it
     // would hit this deadline instead of returning its result.
-    request.timeout = Duration::from_secs(8);
+    request.timeout = Duration::from_secs(6);
     let started = Instant::now();
     let result = fixture
         .runtime("finish_orphan")
         .run(request, &Collector::default(), None)
         .await;
     let elapsed = started.elapsed();
-    if let Ok(pid) = std::fs::read_to_string(format!("{}.orphan", fixture.log.display())) {
-        let _ = std::process::Command::new("kill").arg(pid.trim()).status();
-    }
     let result = result.unwrap_or_else(|error| {
         panic!("the finished turn failed after {elapsed:?}: {error:?}");
     });
     assert_eq!(result.text, "Running tests. All green.");
     assert!(
-        elapsed < Duration::from_secs(8),
+        elapsed < Duration::from_secs(6),
         "the finished turn waited {elapsed:?} for stderr to close"
     );
+
+    // The default policy preserves what the agent left running, so the
+    // runtime must not have closed the pipe under it: its late write has to
+    // succeed rather than raise SIGPIPE.
+    let marker = format!("{}.late", fixture.log.display());
+    let mut wrote = false;
+    for _ in 0..300 {
+        if std::fs::read_to_string(&marker).is_ok_and(|text| text.trim() == "wrote") {
+            wrote = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    if let Ok(pid) = std::fs::read_to_string(format!("{}.orphan", fixture.log.display())) {
+        let _ = std::process::Command::new("kill").arg(pid.trim()).status();
+    }
+    assert!(wrote, "the preserved descendant lost its stderr pipe");
 }
 
 #[tokio::test]

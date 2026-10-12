@@ -116,6 +116,8 @@ so run it on an explicit user action.
   `terminal_exit_grace` (3 seconds), which also stops tool processes it left
   running. A descendant that escaped the agent's process group and still
   holds its stderr no longer delays the finished turn: the runtime waits at
-  most 2 seconds for stderr to close and keeps what had arrived.
+  most 2 seconds for stderr to close, keeps what had arrived, and goes on
+  draining the pipe in the background so a preserved tool is never given a
+  broken pipe.
 - Questions (elicitation) and client-side file system and terminal methods
   are not offered.

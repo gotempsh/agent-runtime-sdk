@@ -204,13 +204,13 @@ where
 /// Reads a child's stderr into a bounded tail while the process runs.
 ///
 /// A descendant that outlives its parent can keep the pipe open, so the
-/// stream may not reach end-of-file when the process does. [`Self::finish`]
-/// therefore waits only a bounded time for it, then stops reading and keeps
-/// what arrived: a finished process never waits on a stray descendant, and a
-/// failure diagnostic still carries the stderr the process wrote. Dropping the
-/// capture stops the reader, so an early return cannot leave it running.
+/// stream may not reach end-of-file when the process does. Both finishers
+/// therefore wait only a bounded time for it and keep what arrived: a finished
+/// process never waits on a stray descendant, and a failure diagnostic still
+/// carries the stderr the process wrote. Dropping the capture stops the
+/// reader, so an early return cannot leave it running.
 pub(crate) struct StderrCapture {
-    task: tokio::task::JoinHandle<std::io::Result<()>>,
+    task: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
     tail: Arc<Mutex<VecDeque<u8>>>,
 }
 
@@ -239,18 +239,45 @@ impl StderrCapture {
                 }
             }
         });
-        Self { task, tail }
+        Self {
+            task: Some(task),
+            tail,
+        }
     }
 
     /// Stop reading now.
     pub(crate) fn abort(&self) {
-        self.task.abort();
+        if let Some(task) = &self.task {
+            task.abort();
+        }
     }
 
     /// Wait up to `grace` for end-of-file, then stop reading and return the
     /// tail captured so far.
-    pub(crate) async fn finish(mut self, grace: Duration) -> std::io::Result<String> {
-        match tokio::time::timeout(grace, &mut self.task).await {
+    ///
+    /// Use this once the owner has stopped the process and everything it
+    /// started: closing the read end then cannot hurt a process that is meant
+    /// to survive.
+    pub(crate) async fn finish(self, grace: Duration) -> std::io::Result<String> {
+        self.finish_with(grace, false).await
+    }
+
+    /// Wait up to `grace` for end-of-file, then return the tail captured so
+    /// far while the reader keeps draining in the background.
+    ///
+    /// Use this when descendants may be meant to outlive the process: a
+    /// reader that went away would hand them a broken pipe (`SIGPIPE`) on
+    /// their next write. The background reader holds only the bounded tail
+    /// and ends when the last writer closes the pipe.
+    pub(crate) async fn finish_detached(self, grace: Duration) -> std::io::Result<String> {
+        self.finish_with(grace, true).await
+    }
+
+    async fn finish_with(mut self, grace: Duration, detach: bool) -> std::io::Result<String> {
+        let Some(mut task) = self.task.take() else {
+            return Ok(String::new());
+        };
+        match tokio::time::timeout(grace, &mut task).await {
             Ok(Ok(Ok(()))) => {}
             Ok(Ok(Err(error))) => return Err(error),
             Ok(Err(error)) => {
@@ -258,7 +285,9 @@ impl StderrCapture {
                     "stderr reader task failed: {error}"
                 )))
             }
-            Err(_) => self.task.abort(),
+            // Dropping a join handle detaches the task.
+            Err(_) if detach => drop(task),
+            Err(_) => task.abort(),
         }
         let tail = self
             .tail
@@ -271,7 +300,7 @@ impl StderrCapture {
 
 impl Drop for StderrCapture {
     fn drop(&mut self) {
-        self.task.abort();
+        self.abort();
     }
 }
 
@@ -483,6 +512,24 @@ mod tests {
         assert_eq!(tail, "23456789");
         assert!(started.elapsed() < Duration::from_secs(5));
         drop(writer);
+    }
+
+    #[tokio::test]
+    async fn a_detached_stderr_capture_keeps_draining_for_a_late_writer() {
+        let (reader, mut writer) = tokio::io::duplex(8);
+        let capture = StderrCapture::spawn(reader, 64);
+        writer.write_all(b"early").await.unwrap();
+        let tail = capture
+            .finish_detached(Duration::from_millis(200))
+            .await
+            .unwrap();
+        assert_eq!(tail, "early");
+        // The reader is still there: a write far larger than the pipe's
+        // buffer completes instead of failing with a broken pipe.
+        tokio::time::timeout(Duration::from_secs(5), writer.write_all(&[b'x'; 1024]))
+            .await
+            .expect("the late writer was blocked")
+            .expect("the reader closed the pipe");
     }
 
     #[tokio::test]
