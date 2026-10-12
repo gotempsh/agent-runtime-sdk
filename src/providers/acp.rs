@@ -2170,7 +2170,7 @@ mod tests {
             json!({"jsonrpc": "2.0", "method": "session/update",
             "params": {"sessionId": "other", "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "x"}}}}),
         );
-        assert!(out.events.is_empty());
+        assert_eq!(out.events.len(), 0);
 
         let out = feed(
             &adapter,
@@ -2229,14 +2229,14 @@ mod tests {
             json!({"jsonrpc": "2.0", "method": "session/update",
             "params": {"sessionId": "s-1", "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "old"}}}}),
         );
-        assert!(out.events.is_empty());
+        assert_eq!(out.events.len(), 0);
         let out = feed(
             &adapter,
             &mut state,
             json!({"jsonrpc": "2.0", "id": ID_SESSION, "result": null}),
         );
         assert_eq!(written(&out)[0]["method"], "session/prompt");
-        assert!(state.result.text.is_empty());
+        assert_eq!(state.result.text.len(), 0);
     }
 
     #[test]
@@ -2542,7 +2542,7 @@ mod tests {
             .unwrap();
         assert_eq!(out.events.len(), 1);
         let out = adapter.parse_line("more noise", &mut state).unwrap();
-        assert!(out.events.is_empty());
+        assert_eq!(out.events.len(), 0);
         assert!(!out.terminal);
     }
 
