@@ -177,6 +177,8 @@ pub enum Provider {
     OpenCode,
     /// pi coding agent CLI.
     Pi,
+    /// Any agent speaking the Agent Client Protocol, selected per turn.
+    Acp,
 }
 
 impl fmt::Display for Provider {
@@ -186,6 +188,7 @@ impl fmt::Display for Provider {
             Self::Codex => "Codex",
             Self::OpenCode => "OpenCode",
             Self::Pi => "pi",
+            Self::Acp => "ACP agent",
         })
     }
 }
@@ -1032,6 +1035,31 @@ pub(crate) fn is_standard_base64(data: &str) -> bool {
     }
 }
 
+/// One step of an agent's execution plan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanEntry {
+    /// What the step does.
+    pub content: String,
+    /// Progress of the step.
+    pub status: PlanEntryStatus,
+    /// Agent-reported priority such as `high`, `medium` or `low`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<String>,
+}
+
+/// Progress of a [`PlanEntry`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum PlanEntryStatus {
+    /// Not started.
+    Pending,
+    /// Being worked on.
+    InProgress,
+    /// Finished.
+    Completed,
+}
+
 /// Provider-neutral streaming event.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -1089,6 +1117,14 @@ pub enum TurnEvent {
         /// browser screenshot), in result order. Never part of `output`.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         images: Vec<ToolImage>,
+    },
+    /// Full replacement of the agent's execution plan.
+    ///
+    /// Agents that publish a plan (ACP `plan` updates) send every entry on
+    /// each change, so consumers replace the previous plan.
+    PlanUpdated {
+        /// Plan entries in the agent's order.
+        entries: Vec<PlanEntry>,
     },
     /// Replaceable snapshot of provider-native tasks and subagents.
     TasksChanged {

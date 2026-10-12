@@ -32,6 +32,40 @@ Versioning and Keep a Changelog conventions.
   cleanup of its hidden Codex thread can neither delay a turn nor replace a
   completed turn's success with a write error. Code that constructs
   `AdapterOutput` with struct syntax must now set `optional_writes`.
+- `Provider::Acp` and `providers::acp::Acp` (default feature `acp`): one
+  adapter for any agent that speaks the Agent Client Protocol over stdio —
+  Gemini CLI (`gemini --acp`), GitHub Copilot (`copilot --acp`), Cursor
+  (`cursor-agent acp`) and the rest of the ACP registry. Agents live in a
+  shared, updatable `AcpAgents` registry and a turn selects one with the
+  `agent` harness option, advertised as a `HarnessControlKind::Agent`
+  control. Turns run `initialize`, `session/new` (or `session/resume`, else
+  `session/load` without its replay), optional mode and model selection, then
+  `session/prompt`; `session/request_permission` reaches the interaction
+  handler unless `AcceptEdits`/`FullAccess` decide it, cancellation sends
+  `session/cancel`, and `-32000` fails as an authentication error before the
+  prompt. ACP requires an absolute working directory; a relative one is
+  refused before the agent starts. `Acp::probe_agent` runs the handshake (and
+  optionally opens a session) to report capabilities and sign-in state. See
+  `docs/how-to/run-acp-agents.md`.
+- ACP agents appear in harness discovery and readiness. `discover_harnesses`
+  now includes `Provider::Acp` when the adapter is registered and
+  `AgentRuntime::readiness(Provider::Acp)` resolves each registered agent's
+  own command inside the configured transport instead of a placeholder `acp`
+  executable: the harness is `Ready` when at least one agent is installed,
+  `readiness.detail` names every agent, and the `Agent` control group lists
+  only installed agents. New `AgentAdapter::selectable_executables` (default
+  `None`, so existing adapters are unchanged) and `SelectableExecutable`
+  expose that per-turn choice to the runtime.
+- `TurnEvent::PlanUpdated` with `PlanEntry`/`PlanEntryStatus`: a complete
+  replacement of an agent's execution plan, emitted for ACP `plan` updates.
+- `AgentAdapter::interaction_answered`: called by the turn loop right after
+  an approval or question reply is encoded, so an adapter that tracks
+  unanswered requests stops refusing one the application already answered
+  when the turn is cancelled. The default does nothing.
+- `AgentAdapter::terminal_exit_grace`: a stdio provider that keeps running
+  after its terminal frame and end-of-input is stopped after this grace
+  period instead of holding the finished turn until its deadline. The default
+  (`None`) keeps reading to end-of-output as before.
 - `AgentTask::model`: the model a Claude Code subagent runs on, as its own
   messages report it (for example `claude-haiku-5-5`), including a subagent
   that inherits the parent's model. It is `None` until the subagent's first
@@ -146,6 +180,14 @@ Versioning and Keep a Changelog conventions.
 
 ### Fixed
 
+- A finished turn, probe or metadata query no longer waits for a descendant
+  of the provider that kept its stderr open after the process ended, which
+  turned a completed ACP turn into a timeout when the agent's terminal grace
+  stopped it. The runtime waits a bounded 2 seconds for stderr to close and
+  keeps the tail that had arrived for diagnostics. A turn keeps draining the
+  pipe in the background past that point, so a tool left running by
+  `ToolProcessPolicy::PreserveOnCompletion` never gets a broken pipe; probes,
+  which have already stopped the process, stop reading.
 - Changing a Claude turn's model, effort or permission mode no longer
   replaces the retained process and stops its background subagents and
   shells. The process switches them in place with `set_model`,

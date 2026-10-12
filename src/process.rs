@@ -1,6 +1,8 @@
 use std::collections::VecDeque;
 use std::ffi::OsStr;
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
@@ -199,6 +201,115 @@ where
     Ok(String::from_utf8_lossy(&tail.into_iter().collect::<Vec<_>>()).into_owned())
 }
 
+/// Reads a child's stderr into a bounded tail while the process runs.
+///
+/// A descendant that outlives its parent can keep the pipe open, so the
+/// stream may not reach end-of-file when the process does. [`Self::finish`]
+/// therefore waits only a bounded time for it and keeps what arrived: a
+/// finished process never waits on a stray descendant, and a failure
+/// diagnostic still carries the stderr the process wrote.
+///
+/// What happens to the reader once the wait is over, or the capture is
+/// dropped, depends on who owns the process:
+///
+/// - By default the reader stops. This is for probes, which have already
+///   stopped the process they started.
+/// - [`Self::detach`] leaves it draining in the background. A process
+///   started with `ToolProcessPolicy::PreserveOnCompletion` may leave tools
+///   running that inherited this pipe, and closing the read end would hand
+///   them a broken pipe (`SIGPIPE`) on their next write. The reader holds
+///   only the bounded tail and ends when the last writer closes the pipe.
+pub(crate) struct StderrCapture {
+    task: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
+    tail: Arc<Mutex<VecDeque<u8>>>,
+    detached: bool,
+}
+
+impl StderrCapture {
+    pub(crate) fn spawn<R>(mut stderr: R, capacity: usize) -> Self
+    where
+        R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    {
+        let tail = Arc::new(Mutex::new(VecDeque::new()));
+        let shared = Arc::clone(&tail);
+        let task = tokio::spawn(async move {
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let read = stderr.read(&mut buffer).await?;
+                if read == 0 {
+                    return Ok(());
+                }
+                let mut tail = shared
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                for byte in &buffer[..read] {
+                    if tail.len() == capacity {
+                        tail.pop_front();
+                    }
+                    tail.push_back(*byte);
+                }
+            }
+        });
+        Self {
+            task: Some(task),
+            tail,
+            detached: false,
+        }
+    }
+
+    /// Keep reading in the background when the wait ends or this is dropped.
+    ///
+    /// Call this only once the owner has decided to leave descendants
+    /// running; until then an early return stops the reader with the process.
+    pub(crate) fn detach(&mut self) {
+        self.detached = true;
+    }
+
+    /// Stop reading now, even when [`Self::detach`]ed.
+    pub(crate) fn abort(&self) {
+        if let Some(task) = &self.task {
+            task.abort();
+        }
+    }
+
+    /// Wait up to `grace` for end-of-file and return the tail captured so far.
+    pub(crate) async fn finish(mut self, grace: Duration) -> std::io::Result<String> {
+        // The handle stays in `self` while waiting, so cancelling this future
+        // drops `self`, which applies the same policy as an elapsed grace.
+        let Some(task) = self.task.as_mut() else {
+            return Ok(String::new());
+        };
+        match tokio::time::timeout(grace, task).await {
+            Ok(Ok(Ok(()))) => {
+                self.task = None;
+            }
+            Ok(Ok(Err(error))) => return Err(error),
+            Ok(Err(error)) => {
+                return Err(std::io::Error::other(format!(
+                    "stderr reader task failed: {error}"
+                )))
+            }
+            // The reader is still running; dropping `self` below leaves it
+            // or stops it according to `detach`.
+            Err(_) => {}
+        }
+        let tail = self
+            .tail
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let bytes = tail.iter().copied().collect::<Vec<_>>();
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
+}
+
+impl Drop for StderrCapture {
+    fn drop(&mut self) {
+        if !self.detached {
+            self.abort();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -394,5 +505,85 @@ mod tests {
             .expect("termination deadline")
             .expect("termination status");
         assert!(!status.success());
+    }
+
+    #[tokio::test]
+    async fn stderr_capture_keeps_what_arrived_when_the_pipe_stays_open() {
+        let (reader, mut writer) = tokio::io::duplex(64);
+        let capture = StderrCapture::spawn(reader, 8);
+        writer.write_all(b"0123456789").await.unwrap();
+        // The writer stays open, as a descendant holding stderr would.
+        let started = std::time::Instant::now();
+        let tail = capture.finish(Duration::from_millis(200)).await.unwrap();
+        assert_eq!(tail, "23456789");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        drop(writer);
+    }
+
+    #[tokio::test]
+    async fn a_detached_stderr_capture_keeps_draining_for_a_late_writer() {
+        let (reader, mut writer) = tokio::io::duplex(8);
+        let mut capture = StderrCapture::spawn(reader, 64);
+        capture.detach();
+        writer.write_all(b"early").await.unwrap();
+        let tail = capture.finish(Duration::from_millis(200)).await.unwrap();
+        assert_eq!(tail, "early");
+        // The reader is still there: a write far larger than the pipe's
+        // buffer completes instead of failing with a broken pipe.
+        tokio::time::timeout(Duration::from_secs(5), writer.write_all(&[b'x'; 1024]))
+            .await
+            .expect("the late writer was blocked")
+            .expect("the reader closed the pipe");
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_detached_wait_keeps_draining_for_a_late_writer() {
+        let (reader, mut writer) = tokio::io::duplex(8);
+        let mut capture = StderrCapture::spawn(reader, 64);
+        capture.detach();
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(50),
+            capture.finish(Duration::from_secs(30)),
+        )
+        .await;
+        assert!(cancelled.is_err(), "the wait should still be pending");
+        tokio::time::timeout(Duration::from_secs(5), writer.write_all(&[b'x'; 1024]))
+            .await
+            .expect("the late writer was blocked")
+            .expect("cancelling the wait closed the pipe");
+    }
+
+    #[tokio::test]
+    async fn cancelling_the_wait_stops_the_reader() {
+        let (reader, mut writer) = tokio::io::duplex(8);
+        let capture = StderrCapture::spawn(reader, 64);
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(50),
+            capture.finish(Duration::from_secs(30)),
+        )
+        .await;
+        assert!(cancelled.is_err(), "the wait should still be pending");
+        // Once the reader is gone the pipe is broken for the writer.
+        let mut broken = false;
+        for _ in 0..100 {
+            if writer.write_all(&[b'x'; 64]).await.is_err() {
+                broken = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(broken, "the reader kept running after the wait was dropped");
+    }
+
+    #[tokio::test]
+    async fn stderr_capture_returns_at_end_of_file_without_waiting_out_the_grace() {
+        let (reader, mut writer) = tokio::io::duplex(64);
+        let capture = StderrCapture::spawn(reader, 32);
+        writer.write_all(b"boom").await.unwrap();
+        drop(writer);
+        let started = std::time::Instant::now();
+        let tail = capture.finish(Duration::from_secs(30)).await.unwrap();
+        assert_eq!(tail, "boom");
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 }

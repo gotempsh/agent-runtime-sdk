@@ -86,6 +86,36 @@ pub struct AuthenticationProbeSpec {
     pub command: CommandSpec,
 }
 
+/// One executable an adapter may run, chosen per turn rather than fixed.
+///
+/// See [`AgentAdapter::selectable_executables`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SelectableExecutable {
+    /// Value that selects this executable. It is the id of the matching option
+    /// in the adapter's [`crate::HarnessControlKind::Agent`] control group.
+    pub id: String,
+    /// User-facing name, used in readiness diagnostics.
+    pub label: String,
+    /// Executable name or path meaningful inside the selected transport.
+    pub executable: PathBuf,
+}
+
+impl SelectableExecutable {
+    /// Describe one selectable executable.
+    pub fn new(
+        id: impl Into<String>,
+        label: impl Into<String>,
+        executable: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            label: label.into(),
+            executable: executable.into(),
+        }
+    }
+}
+
 impl CommandSpec {
     /// Create a process specification for an executable.
     pub fn new(program: impl Into<PathBuf>) -> Self {
@@ -327,7 +357,22 @@ pub trait AgentAdapter: Send + Sync {
             Provider::Codex => "codex",
             Provider::OpenCode => "opencode",
             Provider::Pi => "pi",
+            Provider::Acp => "acp",
         })
+    }
+
+    /// Executables this adapter can run when a turn chooses among several,
+    /// such as the agents registered with the ACP adapter.
+    ///
+    /// `None`, the default, means [`Self::executable`] is the one program the
+    /// adapter runs. `Some` replaces it for readiness: the runtime resolves
+    /// every entry inside the configured transport, reports the provider as
+    /// installed when at least one resolves, names each entry in the
+    /// readiness detail, and keeps only the installed entries as options of
+    /// the [`crate::HarnessControlKind::Agent`] control group in discovery.
+    /// An empty `Some` means nothing is registered yet.
+    fn selectable_executables(&self) -> Option<Vec<SelectableExecutable>> {
+        None
     }
 
     /// Static and interactive permission behavior implemented by this adapter.
@@ -657,6 +702,19 @@ pub trait AgentAdapter: Send + Sync {
         Ok(AdapterOutput::default())
     }
 
+    /// How long a stdio provider may take to exit on its own after its
+    /// terminal frame and the closing of its stdin.
+    ///
+    /// `None` — the default — reads the provider to end-of-output and waits
+    /// for it to exit, because closing stdin is what makes it exit. `Some`
+    /// stops reading at the terminal frame and terminates a provider that is
+    /// still running when the grace period ends; the protocol already decided
+    /// the turn, so that stop is not a failure. Protocol servers such as ACP
+    /// agents need this: nothing obliges them to exit at end-of-input.
+    fn terminal_exit_grace(&self) -> Option<std::time::Duration> {
+        None
+    }
+
     /// Encode a provider-native cooperative interrupt for the running turn.
     ///
     /// Returning `Some` makes the runtime write the frame on cancellation and
@@ -685,6 +743,21 @@ pub trait AgentAdapter: Send + Sync {
         original: &Value,
         answer: Option<QuestionAnswer>,
     ) -> Result<Option<Vec<u8>>>;
+
+    /// Record that the reply to the approval or question `original` was
+    /// encoded and is being written to the provider.
+    ///
+    /// Called by the turn loop right after
+    /// [`AgentAdapter::approval_response`] or
+    /// [`AgentAdapter::question_response`], with the same `original`. An
+    /// adapter that tracks requests still waiting for an answer — to refuse
+    /// them when it encodes an [`AgentAdapter::interrupt_request`] — drops
+    /// this one here, so a cancellation that arrives before the provider
+    /// reacts to the answer does not answer the same request twice. The
+    /// default does nothing.
+    fn interaction_answered(&self, original: &Value, state: &mut AdapterState) {
+        let _ = (original, state);
+    }
 }
 
 /// Resolve an executable override or search common user-local `PATH` roots.

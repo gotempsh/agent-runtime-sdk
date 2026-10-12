@@ -10,7 +10,7 @@ repository = "https://github.com/gotempsh/agent-runtime-sdk"
 homepage = "https://github.com/gotempsh/agent-runtime-sdk"
 documentation = "https://docs.rs/temps-agent-runtime"
 readme = "README.md"
-keywords = ["agents", "claude", "codex", "opencode", "sandbox"]
+keywords = ["agents", "claude", "codex", "acp", "sandbox"]
 categories = ["api-bindings", "asynchronous", "development-tools"]
 include = [
   "/src/**",
@@ -29,11 +29,13 @@ include = [
 ]
 
 [features]
-default = ["claude", "codex", "opencode", "pi", "nono", "ssh", "docker", "tailnet"]
+default = ["claude", "codex", "opencode", "pi", "acp", "nono", "ssh", "docker", "tailnet"]
 claude = []
 codex = []
 opencode = []
 pi = []
+# Any agent that speaks the Agent Client Protocol over stdio.
+acp = []
 nono = []
 ssh = []
 # Run provider CLIs inside an existing container through `docker exec`.
