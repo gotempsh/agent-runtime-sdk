@@ -2093,7 +2093,7 @@ fn runtime_error_to_failure(
             DeliveryState::Accepted,
             None,
         ),
-        RuntimeError::Timeout { .. } => (
+        RuntimeError::Timeout { .. } | RuntimeError::StartupTimeout { .. } => (
             RuntimeFailureKind::Timeout,
             RetryAdvice::RequiresUserAction,
             DeliveryState::Accepted,

@@ -252,6 +252,7 @@ impl Fixture {
                 idle_timeout: Duration::from_secs(30),
                 initialization_timeout: Duration::from_secs(10),
                 active_inactivity_timeout: Some(Duration::from_secs(10)),
+                held_task_quiet_timeout: None,
             });
         }
         let client = InProcessRuntimeClient::new(builder.build().unwrap());

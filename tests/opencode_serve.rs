@@ -846,6 +846,7 @@ async fn retained_fixture(
             idle_timeout: Duration::from_secs(30),
             initialization_timeout: Duration::from_secs(3),
             active_inactivity_timeout: Some(active),
+            held_task_quiet_timeout: None,
         });
     builder.register(OpenCode::serve());
     let client = InProcessRuntimeClient::new(builder.build().unwrap());

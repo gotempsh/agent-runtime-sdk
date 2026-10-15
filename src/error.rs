@@ -118,6 +118,16 @@ pub enum RuntimeError {
         /// Configured deadline.
         seconds: u64,
     },
+    /// A provider process that was still starting up produced nothing within
+    /// its startup deadline. Unlike [`Self::Timeout`], no turn work had begun:
+    /// the process never answered, so retrying on a fresh one is safe.
+    #[error("{provider} did not respond within {seconds} seconds of starting")]
+    StartupTimeout {
+        /// Provider that did not respond.
+        provider: Provider,
+        /// Configured startup deadline.
+        seconds: u64,
+    },
     /// A turn was cancelled by its owner.
     #[error("{provider} turn was cancelled")]
     Cancelled {

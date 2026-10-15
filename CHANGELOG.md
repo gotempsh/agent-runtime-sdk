@@ -14,6 +14,22 @@ Versioning and Keep a Changelog conventions.
   session through its loopback port, including a port forwarded to the SDK
   host for an SSH target.
 
+### Changed
+
+- **Breaking:** `ProviderProcessRetention` has a new field,
+  `held_task_quiet_timeout: Option<Duration>`. A retained turn that has answered
+  and is held open only by background work that reports nothing now completes
+  successfully with a `TurnEvent::Warning` after that period instead of staying
+  open until the inactivity limit. Set `None` for the previous behavior.
+- A reused retained process that has already answered a turn is no longer held
+  to `initialization_timeout`; it is judged by `active_inactivity_timeout`, so a
+  process busy with earlier work is not failed as "starting".
+- `RuntimeError::StartupTimeout`: a process that never answered within
+  `initialization_timeout` now fails with this variant ("did not respond within N
+  seconds of starting") instead of `Timeout` ("turn timed out"), so applications
+  can tell a failed start from a turn that ran too long. Both map to
+  `RuntimeFailureKind::Timeout`.
+
 ### Added
 
 - `TurnRequest::request_session_title`, `TurnEvent::SessionTitle` and
