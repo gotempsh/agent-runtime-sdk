@@ -89,6 +89,17 @@ pub struct ProviderProcessRetention {
     pub initialization_timeout: Duration,
     /// Optional maximum silence while a submitted turn is active.
     pub active_inactivity_timeout: Option<Duration>,
+    /// Optional maximum silence once a turn has answered and only background
+    /// work (such as Claude subagents) keeps it open.
+    ///
+    /// A background task whose completion is never reported would otherwise
+    /// hold the turn open for as long as `active_inactivity_timeout` allows,
+    /// which an application that waits on background work leaves unbounded.
+    /// When this elapses the turn completes successfully with a
+    /// [`TurnEvent::Warning`] naming the tasks it stopped waiting for. The
+    /// process is parked with that work exactly as after a hand-off, so a task
+    /// that finishes later is still reported as a background follow-up.
+    pub held_task_quiet_timeout: Option<Duration>,
 }
 
 impl ProviderProcessRetention {
@@ -111,6 +122,15 @@ impl ProviderProcessRetention {
         {
             return Err(RuntimeError::InvalidRequest {
                 field: "provider_process_retention.active_inactivity_timeout",
+                message: "must be greater than zero when configured".to_string(),
+            });
+        }
+        if self
+            .held_task_quiet_timeout
+            .is_some_and(|timeout| timeout.is_zero())
+        {
+            return Err(RuntimeError::InvalidRequest {
+                field: "provider_process_retention.held_task_quiet_timeout",
                 message: "must be greater than zero when configured".to_string(),
             });
         }
@@ -487,6 +507,11 @@ struct RetainedCodexProcess {
 #[derive(Default)]
 struct RetainedHandoff {
     ready: AtomicBool,
+    /// The process has already answered a turn. A reused process is not
+    /// starting up, so its silence is judged by the active limits rather than
+    /// the (short) initialization deadline: it may be busy finishing work an
+    /// earlier turn left behind, or running a long tool for a queued message.
+    initialized: AtomicBool,
     wake: Notify,
     request: Mutex<Option<oneshot::Sender<bool>>>,
     /// Parser state of the turn that yielded, until the next turn claims it.
@@ -1565,6 +1590,26 @@ async fn finish_retained_turn(
 /// lets outlive the turn (Claude's background shells) keeps the process
 /// parked with the parser state, which a continuation or the next turn
 /// picks up; otherwise the process waits idle for the next turn.
+/// What a turn tells its viewers when it stops waiting for background work
+/// that reported nothing for `quiet`.
+fn held_work_warning(quiet: Duration, work: &[String]) -> String {
+    let minutes = quiet.as_secs().div_ceil(60).max(1);
+    let waited = if quiet.as_secs() < 60 {
+        format!("{} seconds", quiet.as_secs())
+    } else {
+        format!("{minutes} minute{}", if minutes == 1 { "" } else { "s" })
+    };
+    let names = if work.is_empty() {
+        "background work".to_owned()
+    } else {
+        work.join("; ")
+    };
+    format!(
+        "Stopped waiting for {names}: it reported nothing for {waited}. It may still be running; \
+         its result is delivered as a follow-up if it finishes."
+    )
+}
+
 async fn complete_retained_turn(
     adapter: &dyn AgentAdapter,
     request: &TurnRequest,
@@ -1942,6 +1987,7 @@ impl AgentRuntimeBuilder {
                     idle_timeout: config.idle_timeout,
                     initialization_timeout: Duration::from_secs(30),
                     active_inactivity_timeout: None,
+                    held_task_quiet_timeout: None,
                 })
         });
         Ok(AgentRuntime {
@@ -5259,7 +5305,8 @@ impl AgentRuntime {
         let mut first_output = true;
         // A continuation resumes an exchange already under way, so it is
         // past initialization from its first moment.
-        let mut saw_semantic_activity = request.continuation;
+        let mut saw_semantic_activity =
+            request.continuation || handoff.initialized.load(Ordering::Acquire);
         let mut turn_submitted = provider != Provider::OpenCode;
         let mut last_semantic_activity = tokio::time::Instant::now();
         let mut first_text = true;
@@ -5291,19 +5338,41 @@ impl AgentRuntime {
                     .active_inactivity_timeout
                     .unwrap_or(request.timeout)
             };
+            let starting = !saw_semantic_activity || !turn_submitted;
+            let timed_out = || {
+                if starting {
+                    RuntimeError::StartupTimeout {
+                        provider,
+                        seconds: inactivity_timeout.as_secs(),
+                    }
+                } else {
+                    RuntimeError::Timeout {
+                        provider,
+                        seconds: inactivity_timeout.as_secs(),
+                    }
+                }
+            };
             let deadline = last_semantic_activity + inactivity_timeout;
             let frame = if let Some(line) = prefetched_lines.pop_front() {
                 Some(ProviderFrame::Line(line))
             } else {
                 let handoff_ready = adapter.retained_handoff_ready(&state);
                 handoff.ready.store(handoff_ready, Ordering::Release);
+                // A turn that has answered and is held open only by
+                // background work stops waiting for it after the configured
+                // quiet period (never later than the inactivity deadline).
+                let held_quiet = retention
+                    .held_task_quiet_timeout
+                    .filter(|quiet| handoff_ready && *quiet < inactivity_timeout);
                 // Anchored to semantic activity like the inactivity deadline,
                 // so frames that carry nothing cannot postpone it. While armed
                 // it replaces that deadline: it is the shorter bound on a
                 // turn whose work is already done.
-                let quiet_completion = adapter
-                    .retained_completion_grace(&state)
-                    .map(|grace| last_semantic_activity + grace);
+                let grace = adapter.retained_completion_grace(&state);
+                let held_quiet = held_quiet.filter(|_| grace.is_none());
+                let quiet_completion = grace
+                    .or(held_quiet)
+                    .map(|quiet| last_semantic_activity + quiet);
                 // Wait for the next frame to begin without consuming it, so a
                 // hand-off or a quiet completion never splits a frame that
                 // the process (and the next turn) still owns.
@@ -5321,10 +5390,7 @@ impl AgentRuntime {
                         })?;
                     }
                     _ = tokio::time::sleep_until(deadline), if quiet_completion.is_none() => {
-                        return Err(RuntimeError::Timeout {
-                            provider,
-                            seconds: inactivity_timeout.as_secs(),
-                        });
+                        return Err(timed_out());
                     }
                     () = handoff.wake.notified() => {
                         if handoff.answer(adapter, &state) {
@@ -5341,6 +5407,16 @@ impl AgentRuntime {
                         continue;
                     }
                     () = tokio::time::sleep_until(quiet_completion.unwrap_or(deadline)), if quiet_completion.is_some() => {
+                        if let Some(quiet) = held_quiet {
+                            events
+                                .emit(TurnEvent::Warning {
+                                    message: held_work_warning(
+                                        quiet,
+                                        &adapter.retained_background_summary(&state),
+                                    ),
+                                })
+                                .await?;
+                        }
                         return complete_retained_turn(adapter, request, events, state).await;
                     }
                 }
@@ -5365,10 +5441,7 @@ impl AgentRuntime {
                             return Err(if cancel_seen {
                                 RuntimeError::Cancelled { provider }
                             } else {
-                                RuntimeError::Timeout {
-                                    provider,
-                                    seconds: inactivity_timeout.as_secs(),
-                                }
+                                timed_out()
                             });
                         }
                         _ = request.cancellation.cancelled(), if !cancel_seen => {
@@ -5431,6 +5504,7 @@ impl AgentRuntime {
                     })
                     .await?;
                 process_ready = true;
+                handoff.initialized.store(true, Ordering::Release);
             }
             for event in output.events {
                 if first_text && matches!(&event, TurnEvent::TextDelta { text } if !text.is_empty())

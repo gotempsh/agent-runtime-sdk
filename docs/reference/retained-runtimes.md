@@ -26,6 +26,7 @@ let mut builder = AgentRuntime::builder()
         idle_timeout: Duration::from_secs(120),
         initialization_timeout: Duration::from_secs(30),
         active_inactivity_timeout: Some(Duration::from_secs(30 * 60)),
+        held_task_quiet_timeout: Some(Duration::from_secs(15 * 60)),
     });
 builder.register(Claude::default());
 builder.register(Codex::app_server());
@@ -36,6 +37,23 @@ let runtime = builder.build()?;
 `codex_process_retention` remains available for applications that only want
 Codex app-server reuse. Both settings are disabled by default. One-shot modes,
 custom adapters, and remote OpenCode transports retain their existing behavior.
+
+Three deadlines bound a retained turn's silence:
+
+- `initialization_timeout` applies only to a process that has not yet answered
+  anything. Missing it fails with `RuntimeError::StartupTimeout`
+  ("… did not respond within N seconds of starting"). A process that has already
+  answered a turn is reused as initialized: when it is busy (finishing background
+  work, or running a long tool for a queued message) its silence is judged by the
+  active limits below, not reported as a failed start.
+- `active_inactivity_timeout` bounds silence while a submitted turn is active and
+  fails the turn with `RuntimeError::Timeout`.
+- `held_task_quiet_timeout` bounds how long a turn that has already answered keeps
+  waiting for background work (such as Claude subagents) that reports nothing.
+  Any task progress resets it. When it elapses the turn completes successfully
+  with a `TurnEvent::Warning` naming the work it stopped waiting for, and the
+  process is parked with that work as after a hand-off, so a task that finishes
+  later is still delivered as a background follow-up. `None` waits indefinitely.
 
 Pass that runtime to `InProcessRuntimeClient::new`. Each `RuntimeId` owns at most
 one process. The SDK compares the complete sandbox-wrapped command plus working

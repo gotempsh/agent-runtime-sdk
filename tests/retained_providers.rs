@@ -41,6 +41,17 @@ def subagent(follow_up):
   emit({'type':'system','subtype':'init','session_id':'fixture-session'})
   emit({'type':'assistant','parent_tool_use_id':None,'message':{'content':[{'type':'text','text':'FOLLOWUP'}]}})
   result('FOLLOWUP')
+def silent_subagent():
+ # A background subagent that reports nothing while it works (a long tool
+ # call), then notifies and wakes the parent agent.
+ log('bg-start')
+ while not os.path.exists(RELEASE):time.sleep(.02)
+ emit({'type':'system','subtype':'background_tasks_changed','tasks':[]})
+ emit({'type':'system','subtype':'task_notification','task_id':'bg-1','status':'completed','summary':'background done'})
+ log('bg-finished')
+ emit({'type':'system','subtype':'init','session_id':'fixture-session'})
+ emit({'type':'assistant','parent_tool_use_id':None,'message':{'content':[{'type':'text','text':'QUIET-FOLLOWUP'}]}})
+ result('QUIET-FOLLOWUP')
 def shell(follow_up):
  # A background shell (`run_in_background`), as Claude reports one: nothing
  # while it runs, then a notification that wakes the parent agent.
@@ -87,6 +98,16 @@ for line in sys.stdin:
    emit({'type':'assistant','parent_tool_use_id':None,'message':{'content':[{'type':'text','text':'LAUNCHED'}]}})
    result('LAUNCHED')
    thread=threading.Thread(target=subagent,args=(prompt=='spawn-bg',),daemon=True)
+   BACKGROUND.append(thread);thread.start()
+   continue
+  if prompt=='slow':
+   time.sleep(4.5)
+  if prompt=='spawn-bg-quiet':
+   emit({'type':'system','subtype':'task_started','task_id':'bg-1','tool_use_id':'toolu_bg','description':'Background work','subagent_type':'general-purpose','task_type':'local_agent','is_backgrounded':True})
+   emit({'type':'system','subtype':'background_tasks_changed','tasks':[{'task_id':'bg-1','task_type':'local_agent','description':'Background work'}]})
+   emit({'type':'assistant','parent_tool_use_id':None,'message':{'content':[{'type':'text','text':'LAUNCHED'}]}})
+   result('LAUNCHED')
+   thread=threading.Thread(target=silent_subagent,daemon=True)
    BACKGROUND.append(thread);thread.start()
    continue
   if prompt=='spawn-two-shells':
@@ -155,6 +176,22 @@ impl Running {
 }
 impl Fixture {
     async fn new(enabled: bool, idle_timeout: Duration) -> Self {
+        Self::configured(
+            enabled,
+            idle_timeout,
+            Duration::from_secs(10),
+            Duration::from_secs(2),
+            None,
+        )
+        .await
+    }
+    async fn configured(
+        enabled: bool,
+        idle_timeout: Duration,
+        initialization_timeout: Duration,
+        active_inactivity_timeout: Duration,
+        held_task_quiet_timeout: Option<Duration>,
+    ) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let executable = dir.path().join("claude-fixture");
         let log = dir.path().join("events.jsonl");
@@ -173,8 +210,9 @@ impl Fixture {
             builder = builder.provider_process_retention(ProviderProcessRetention {
                 max_processes: 1,
                 idle_timeout,
-                initialization_timeout: Duration::from_secs(10),
-                active_inactivity_timeout: Some(Duration::from_secs(2)),
+                initialization_timeout,
+                active_inactivity_timeout: Some(active_inactivity_timeout),
+                held_task_quiet_timeout,
             });
         }
         let runtime = builder.build().unwrap();
@@ -797,5 +835,149 @@ async fn claude_a_silent_shell_ending_never_retires_a_process_still_running_anot
         .contains("reply:second"));
     assert_eq!(f.spawns().len(), 1, "{:?}", f.events());
     fs::write(format!("{}-2", f.release.display()), b"done").unwrap();
+    f.dispose().await;
+}
+
+#[tokio::test]
+async fn claude_turn_held_by_silent_background_work_stops_waiting_after_the_quiet_limit() {
+    let f = Fixture::configured(
+        true,
+        Duration::from_secs(30),
+        Duration::from_secs(10),
+        Duration::from_secs(2),
+        Some(Duration::from_millis(400)),
+    )
+    .await;
+    let mut follow_ups = f.runtime.subscribe_background_follow_ups();
+    let turn = Running::new(
+        f.handle
+            .start_turn(Fixture::input("one", "spawn-bg-quiet"))
+            .await
+            .unwrap(),
+    );
+    f.wait_for_log("bg-start").await;
+    // The subagent is never released: without the limit this turn would stay
+    // open until the (here 2 s) inactivity timeout and fail.
+    let (events, result) = turn.finish().await;
+    assert_eq!(result.unwrap().text, "LAUNCHED");
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            TurnEvent::Warning { message } if message.contains("Stopped waiting for")
+                && message.contains("Background work")
+        )),
+        "{events:?}"
+    );
+    // The process was parked with its work, not killed.
+    let runtime_id = RuntimeId::new("claude-native").unwrap();
+    assert_eq!(
+        f.runtime.parked_background_tasks(&runtime_id).await.len(),
+        1,
+        "the silent subagent is still running in the parked process"
+    );
+
+    // The subagent finishes after the turn stopped waiting: its answer is
+    // announced and delivered once, by a continuation, on the same process.
+    f.release_background();
+    let announced = tokio::time::timeout(Duration::from_secs(10), follow_ups.recv())
+        .await
+        .expect("the late answer must be announced")
+        .unwrap();
+    assert_eq!(announced, runtime_id);
+    let (_, late) = Running::new(
+        f.handle
+            .start_turn(Fixture::continuation("cont"))
+            .await
+            .unwrap(),
+    )
+    .finish()
+    .await;
+    assert_eq!(late.unwrap().text, "QUIET-FOLLOWUP");
+    let again = f
+        .handle
+        .start_turn(Fixture::continuation("cont-again"))
+        .await
+        .unwrap()
+        .wait()
+        .await
+        .expect_err("the answer was already delivered");
+    assert_eq!(again.kind, RuntimeFailureKind::InvalidRequest);
+    assert_eq!(again.delivery, DeliveryState::NotSent);
+    assert_eq!(f.logged("bg-finished"), 1, "{:?}", f.events());
+
+    assert_eq!(f.turn("two", "second").await.unwrap().text, "reply:second");
+    assert_eq!(f.spawns().len(), 1, "{:?}", f.events());
+    f.dispose().await;
+}
+
+#[tokio::test]
+async fn claude_background_work_that_keeps_reporting_is_not_cut_off_by_the_quiet_limit() {
+    let f = Fixture::configured(
+        true,
+        Duration::from_secs(30),
+        Duration::from_secs(10),
+        Duration::from_secs(2),
+        Some(Duration::from_millis(400)),
+    )
+    .await;
+    let turn = Running::new(
+        f.handle
+            .start_turn(Fixture::input("one", "spawn-bg"))
+            .await
+            .unwrap(),
+    );
+    f.wait_for_log("bg-start").await;
+    // Several quiet periods pass; the subagent's progress frames keep resetting it.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    f.release_background();
+    let (events, result) = turn.finish().await;
+    let text = result.unwrap().text;
+    assert!(text.contains("FOLLOWUP"), "{text}");
+    assert!(
+        events
+            .iter()
+            .all(|event| !matches!(event, TurnEvent::Warning { .. })),
+        "{events:?}"
+    );
+    f.dispose().await;
+}
+
+#[tokio::test]
+async fn claude_process_that_never_starts_reports_a_startup_timeout() {
+    let f = Fixture::configured(
+        true,
+        Duration::from_secs(30),
+        Duration::from_secs(1),
+        Duration::from_secs(2),
+        None,
+    )
+    .await;
+    let failure = f.turn("one", "initial-hang").await.unwrap_err();
+    assert_eq!(failure.kind, RuntimeFailureKind::Timeout);
+    assert!(
+        failure
+            .message
+            .contains("did not respond within 1 seconds of starting"),
+        "{}",
+        failure.message
+    );
+    f.dispose().await;
+}
+
+#[tokio::test]
+async fn claude_reused_process_busy_past_the_startup_deadline_is_not_a_startup_failure() {
+    let f = Fixture::configured(
+        true,
+        Duration::from_secs(30),
+        Duration::from_secs(3),
+        Duration::from_secs(30),
+        None,
+    )
+    .await;
+    assert_eq!(f.turn("one", "first").await.unwrap().text, "reply:first");
+    // 4.5 s of silence exceeds the 3 s initialization deadline, but this
+    // process already started: it is busy, not starting.
+    assert_eq!(f.turn("two", "slow").await.unwrap().text, "reply:slow");
+    assert_eq!(f.spawns().len(), 1, "{:?}", f.events());
     f.dispose().await;
 }
