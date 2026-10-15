@@ -258,6 +258,24 @@ impl Fixture {
         .await
         .unwrap_or_else(|_| panic!("fixture never logged {kind}: {:?}", self.events()));
     }
+    async fn wait_for_prompt(&self, prompt: &str) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !self
+                .events()
+                .iter()
+                .any(|v| v["kind"] == "prompt" && v["prompt"] == prompt)
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "fixture never received prompt {prompt}: {:?}",
+                self.events()
+            )
+        });
+    }
     /// Start a turn, retrying briefly while the runtime reports busy, as an
     /// application following `RetryAdvice::After` does.
     async fn start_retrying(&self, id: &str, prompt: &str) -> TurnHandle {
@@ -546,7 +564,10 @@ async fn claude_background_subagent_survives_a_new_turn() {
     let second = Running::new(f.start_retrying("two", "second").await);
     let (_, first_result) = first.finish().await;
     assert_eq!(first_result.unwrap().text, "LAUNCHED");
-    f.wait_for_log("prompt").await;
+    // The first turn's prompt is already in the log, so wait for the second
+    // one: only once the new turn is reading the process does the subagent's
+    // output belong to it.
+    f.wait_for_prompt("second").await;
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(
         !second.completion.is_finished(),
