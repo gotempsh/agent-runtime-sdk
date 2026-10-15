@@ -848,6 +848,7 @@ async fn claude_turn_held_by_silent_background_work_stops_waiting_after_the_quie
         Some(Duration::from_millis(400)),
     )
     .await;
+    let mut follow_ups = f.runtime.subscribe_background_follow_ups();
     let turn = Running::new(
         f.handle
             .start_turn(Fixture::input("one", "spawn-bg-quiet"))
@@ -867,7 +868,43 @@ async fn claude_turn_held_by_silent_background_work_stops_waiting_after_the_quie
         )),
         "{events:?}"
     );
-    // The process was parked with its work, not killed, and still serves turns.
+    // The process was parked with its work, not killed.
+    let runtime_id = RuntimeId::new("claude-native").unwrap();
+    assert_eq!(
+        f.runtime.parked_background_tasks(&runtime_id).await.len(),
+        1,
+        "the silent subagent is still running in the parked process"
+    );
+
+    // The subagent finishes after the turn stopped waiting: its answer is
+    // announced and delivered once, by a continuation, on the same process.
+    f.release_background();
+    let announced = tokio::time::timeout(Duration::from_secs(10), follow_ups.recv())
+        .await
+        .expect("the late answer must be announced")
+        .unwrap();
+    assert_eq!(announced, runtime_id);
+    let (_, late) = Running::new(
+        f.handle
+            .start_turn(Fixture::continuation("cont"))
+            .await
+            .unwrap(),
+    )
+    .finish()
+    .await;
+    assert_eq!(late.unwrap().text, "QUIET-FOLLOWUP");
+    let again = f
+        .handle
+        .start_turn(Fixture::continuation("cont-again"))
+        .await
+        .unwrap()
+        .wait()
+        .await
+        .expect_err("the answer was already delivered");
+    assert_eq!(again.kind, RuntimeFailureKind::InvalidRequest);
+    assert_eq!(again.delivery, DeliveryState::NotSent);
+    assert_eq!(f.logged("bg-finished"), 1, "{:?}", f.events());
+
     assert_eq!(f.turn("two", "second").await.unwrap().text, "reply:second");
     assert_eq!(f.spawns().len(), 1, "{:?}", f.events());
     f.dispose().await;
