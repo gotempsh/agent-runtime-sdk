@@ -1760,7 +1760,9 @@ const MCP_ELICITATION_METHOD: &str = "mcpServer/elicitation/request";
 /// The approval behind an MCP elicitation, when it asks whether a tool may
 /// run (`_meta.codex_approval_kind == "mcp_tool_call"`). The tool is named the
 /// way Claude names MCP tools, `mcp__<server>__<tool>`, so one allow-list
-/// covers every harness.
+/// covers every harness. When the tool cannot be read from the message the
+/// name stops at the server, `mcp__<server>`: it can never match a per-tool
+/// allow-list entry, so the application asks instead of guessing.
 fn mcp_tool_approval(id: &Value, params: &Value) -> Option<ApprovalRequest> {
     let meta = params.get("_meta")?;
     if meta.get("codex_approval_kind").and_then(Value::as_str) != Some("mcp_tool_call") {
@@ -1779,13 +1781,15 @@ fn mcp_tool_approval(id: &Value, params: &Value) -> Option<ApprovalRequest> {
         .split_once("run tool \"")
         .and_then(|(_, rest)| rest.split_once('"'))
         .map(|(tool, _)| tool)
-        .filter(|tool| !tool.is_empty())
-        .unwrap_or("tool");
+        .filter(|tool| !tool.is_empty());
     Some(ApprovalRequest {
         id: interaction_id(id),
-        tool_name: format!("mcp__{server}__{tool}"),
+        tool_name: tool.map_or_else(
+            || format!("mcp__{server}"),
+            |tool| format!("mcp__{server}__{tool}"),
+        ),
         description: Some(if message.is_empty() {
-            format!("Run the {tool} tool of the {server} MCP server")
+            format!("Run a tool of the {server} MCP server")
         } else {
             message.to_string()
         }),
@@ -2582,6 +2586,34 @@ mod tests {
             assert_eq!(response["result"]["action"], json!(action));
             assert!(response["result"].get("decision").is_none());
         }
+    }
+
+    #[test]
+    fn an_mcp_tool_approval_whose_tool_cannot_be_read_is_not_given_a_tool_name() {
+        // Codex rewording the message must not turn into a made-up tool name
+        // that an application's allow-list could match.
+        let mut state = AdapterState::default();
+        let line = MCP_TOOL_APPROVAL.replace("run tool", "run the operation");
+        let output = parse_line(&line, &mut state).unwrap();
+        let Some(InteractionRequest::Approval { request, .. }) = output.interaction else {
+            panic!("the approval must still wait for a decision");
+        };
+        assert_eq!(request.tool_name, "mcp__temps_fleet");
+
+        let without_message = MCP_TOOL_APPROVAL.replace(
+            r#""message":"Allow the temps_fleet MCP server to run tool \"report_finding\"?","#,
+            "",
+        );
+        assert!(!without_message.contains("\"message\""));
+        let output = parse_line(&without_message, &mut state).unwrap();
+        let Some(InteractionRequest::Approval { request, .. }) = output.interaction else {
+            panic!("the approval must still wait for a decision");
+        };
+        assert_eq!(request.tool_name, "mcp__temps_fleet");
+        assert_eq!(
+            request.description.as_deref(),
+            Some("Run a tool of the temps_fleet MCP server")
+        );
     }
 
     #[test]
