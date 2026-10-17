@@ -2562,7 +2562,7 @@ mod tests {
 
         // Nothing is written: an `{}` reply is what made Codex fail the call
         // with "user rejected MCP tool call".
-        assert!(output.writes.is_empty());
+        assert_eq!(output.writes.len(), 0);
         let Some(InteractionRequest::Approval { request, original }) = output.interaction else {
             panic!("the tool approval must wait for a decision");
         };
