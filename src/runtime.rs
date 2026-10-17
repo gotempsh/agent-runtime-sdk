@@ -370,12 +370,10 @@ impl ClaudeProcessSettings {
                 "settings": {"effortLevel": wanted.effort},
             }));
         }
-        // Unlike the settings above, a caller that never mentions Fast mode
-        // has nothing to reset after a failed switch.
-        if current.as_ref().map_or_else(
-            || wanted.fast_mode.is_some(),
-            |current| current.fast_mode != wanted.fast_mode,
-        ) {
+        if current
+            .as_ref()
+            .is_none_or(|current| current.fast_mode != wanted.fast_mode)
+        {
             if wanted.fast_mode.is_none() && self.launch.fast_mode.is_some() {
                 return Err("the default Fast mode".to_owned());
             }
@@ -7095,7 +7093,7 @@ mod tests {
             settings
                 .switch_to(&live(None, None, "bypassPermissions"))
                 .map(|requests| requests.len()),
-            Ok(3)
+            Ok(4)
         );
     }
 
@@ -7152,7 +7150,27 @@ mod tests {
                 "settings": {"fastMode": true},
             })])
         );
+        // After a failed switch the live Fast mode is unknown, so it is reset
+        // even when the next turn does not mention it.
+        let unlaunched = claude_process_settings(&["--print"]);
+        unlaunched.set_current(None);
+        assert_eq!(
+            unlaunched.switch_to(&live(None, None, "manual")),
+            Ok(vec![
+                serde_json::json!({"subtype": "set_model", "model": null}),
+                serde_json::json!({"subtype": "apply_flag_settings",
+                    "settings": {"effortLevel": null}}),
+                serde_json::json!({"subtype": "apply_flag_settings",
+                    "settings": {"fastMode": null}}),
+                serde_json::json!({"subtype": "set_permission_mode", "mode": "manual"}),
+            ])
+        );
         // A launch with Fast mode set cannot be put back to Claude's default.
+        assert_eq!(
+            process.switch_to(&live(None, None, "manual")),
+            Err("the default Fast mode".to_owned())
+        );
+        process.set_current(None);
         assert_eq!(
             process.switch_to(&live(None, None, "manual")),
             Err("the default Fast mode".to_owned())

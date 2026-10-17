@@ -789,6 +789,8 @@ async fn a_refused_switch_keeps_background_work() {
         [
             "set_model null",
             "apply_flag_settings null",
+            // Fast mode too: after a refused switch its live value is unknown.
+            "apply_flag_settings null",
             r#"set_permission_mode "manual""#,
         ]
     );
