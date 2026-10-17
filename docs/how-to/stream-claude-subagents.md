@@ -198,11 +198,12 @@ few seconds after the work drains if Claude stays silent.
 Without process retention every turn is its own process, so overlap is still
 `RuntimeBusy` and background subagents end with the turn that started them.
 
-A turn may change the model, effort or permission mode: the retained Claude
-process switches them in place (`set_model`, `apply_flag_settings`,
-`set_permission_mode`) before the prompt, and background work keeps running.
-Other changes need a new process: the working directory, MCP servers or launch
-context, sandbox, harness options, turning thinking off or ultracode on, going
+A turn may change the model, effort, Fast mode (`harness_options.fast_mode`)
+or permission mode: the retained Claude process switches them in place
+(`set_model`, `apply_flag_settings`, `set_permission_mode`) before the prompt,
+and background work keeps running. Other changes need a new process: the
+working directory, MCP servers or launch context, sandbox, other harness
+options, turning thinking off or ultracode on, going
 back to the CLI's default model or effort after launching with one, and
 entering bypass mode on a process launched without it. While background work
 runs, such a turn fails with `RuntimeError::RestartWouldStopBackgroundWork`
