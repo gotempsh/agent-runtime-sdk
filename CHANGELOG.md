@@ -16,6 +16,10 @@ Versioning and Keep a Changelog conventions.
 
 ### Changed
 
+- A retained Claude process switches Fast mode (`harness_options.fast_mode`)
+  in place, like the model and effort, instead of being replaced. A turn that
+  only changes Fast mode is no longer refused with
+  `RestartWouldStopBackgroundWork` while background work runs.
 - **Breaking:** `ProviderProcessRetention` has a new field,
   `held_task_quiet_timeout: Option<Duration>`. A retained turn that has answered
   and is held open only by background work that reports nothing now completes

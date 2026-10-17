@@ -11,7 +11,7 @@
 //! refuses while a `refuse-settings` file exists.
 #![cfg(all(unix, feature = "claude"))]
 
-use std::{fs, os::unix::fs::PermissionsExt, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, fs, os::unix::fs::PermissionsExt, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use temps_agent_runtime::{
@@ -298,7 +298,10 @@ impl Fixture {
                 let request = &v["request"];
                 let value = match request["subtype"].as_str() {
                     Some("set_model") => request["model"].to_string(),
-                    Some("apply_flag_settings") => request["settings"]["effortLevel"].to_string(),
+                    Some("apply_flag_settings") if request["settings"]["fastMode"].is_null() => {
+                        request["settings"]["effortLevel"].to_string()
+                    }
+                    Some("apply_flag_settings") => request["settings"]["fastMode"].to_string(),
                     _ => request["mode"].to_string(),
                 };
                 format!(
@@ -680,6 +683,38 @@ async fn switching_model_effort_and_permission_keeps_background_work() {
 }
 
 #[tokio::test]
+async fn switching_fast_mode_keeps_background_work() {
+    let f = Fixture::new(true).await;
+    park_with_background_work(&f).await;
+
+    let mut input = Fixture::input("two", "second");
+    input.harness_options = Some(BTreeMap::from([("fast_mode".into(), "true".into())]));
+    let next = f
+        .start_input(input)
+        .await
+        .expect("Fast mode switches in the live process");
+    f.wait_for_prompt("second").await;
+    assert_eq!(f.logged("bg-finished"), 0, "the subagent is still running");
+    f.release("bg-release");
+    let (events, result) = next.finish().await;
+    assert!(result.unwrap().text.contains("reply:second"));
+    assert!(task_activity(
+        &events,
+        "bg-1",
+        AgentTaskActivityKind::Completed
+    ));
+    assert!(
+        f.settings()
+            .iter()
+            .any(|setting| setting == "apply_flag_settings true"),
+        "{:?}",
+        f.settings()
+    );
+    assert_eq!(f.spawns(), 1, "{:?}", f.events());
+    f.dispose().await;
+}
+
+#[tokio::test]
 async fn a_change_that_needs_a_new_process_waits_for_background_work() {
     let f = Fixture::new(true).await;
     park_with_background_work(&f).await;
@@ -753,6 +788,8 @@ async fn a_refused_switch_keeps_background_work() {
         f.settings()[1..],
         [
             "set_model null",
+            "apply_flag_settings null",
+            // Fast mode too: after a refused switch its live value is unknown.
             "apply_flag_settings null",
             r#"set_permission_mode "manual""#,
         ]
