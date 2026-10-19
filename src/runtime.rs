@@ -230,6 +230,17 @@ fn retained_fingerprint_command(provider: Provider, mut command: CommandSpec) ->
         while let Some(argument) = arguments.next() {
             if argument == "--resume" || CLAUDE_LIVE_FLAGS.iter().any(|flag| argument == *flag) {
                 let _ = arguments.next();
+            } else if argument == "--settings" {
+                // Fast mode travels in this JSON and switches in place; what
+                // else it holds (ultracode) still decides on a new process.
+                match arguments.next() {
+                    Some(value) => {
+                        if let Some(rest) = without_live_settings(&value) {
+                            filtered.extend(["--settings".into(), rest]);
+                        }
+                    }
+                    None => filtered.push(argument),
+                }
             } else if argument != CLAUDE_BYPASS_FLAG {
                 filtered.push(argument);
             }
@@ -238,6 +249,23 @@ fn retained_fingerprint_command(provider: Provider, mut command: CommandSpec) ->
     }
     command
 }
+
+/// The `--settings` JSON without the keys a live process switches in place
+/// (`fastMode`), or `None` when nothing else is left. Anything that is not a
+/// JSON object is kept as it is.
+fn without_live_settings(value: &std::ffi::OsStr) -> Option<std::ffi::OsString> {
+    let Some(serde_json::Value::Object(mut settings)) = value
+        .to_str()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+    else {
+        return Some(value.to_owned());
+    };
+    settings.remove(CLAUDE_FAST_MODE_SETTING);
+    (!settings.is_empty()).then(|| serde_json::Value::Object(settings).to_string().into())
+}
+
+/// The setting key Claude Code reads Fast mode from.
+const CLAUDE_FAST_MODE_SETTING: &str = "fastMode";
 
 /// Claude flags whose settings a live process can switch between turns.
 const CLAUDE_LIVE_FLAGS: [&str; 3] = ["--model", "--effort", "--permission-mode"];
@@ -250,13 +278,15 @@ const CLAUDE_SETTINGS_SWITCH_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_SWITCH_UNSOLICITED_FRAMES: usize = 64;
 
 /// The Claude settings a retained process can switch in place between turns:
-/// model (`set_model`), effort (`apply_flag_settings`) and permission mode
-/// (`set_permission_mode`). Changing anything else needs a new process.
+/// model (`set_model`), effort and Fast mode (`apply_flag_settings`) and
+/// permission mode (`set_permission_mode`). Changing anything else needs a new
+/// process.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct ClaudeLiveSettings {
     model: Option<String>,
     effort: Option<String>,
     permission_mode: Option<String>,
+    fast_mode: Option<bool>,
 }
 
 impl ClaudeLiveSettings {
@@ -276,6 +306,11 @@ impl ClaudeLiveSettings {
                 Some("--model") => settings.model = value(&mut arguments),
                 Some("--effort") => settings.effort = value(&mut arguments),
                 Some("--permission-mode") => settings.permission_mode = value(&mut arguments),
+                Some("--settings") => {
+                    settings.fast_mode = value(&mut arguments)
+                        .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
+                        .and_then(|json| json.get(CLAUDE_FAST_MODE_SETTING)?.as_bool());
+                }
                 Some(CLAUDE_BYPASS_FLAG) => bypass_allowed = true,
                 _ => {}
             }
@@ -333,6 +368,18 @@ impl ClaudeProcessSettings {
             requests.push(serde_json::json!({
                 "subtype": "apply_flag_settings",
                 "settings": {"effortLevel": wanted.effort},
+            }));
+        }
+        if current
+            .as_ref()
+            .is_none_or(|current| current.fast_mode != wanted.fast_mode)
+        {
+            if wanted.fast_mode.is_none() && self.launch.fast_mode.is_some() {
+                return Err("the default Fast mode".to_owned());
+            }
+            requests.push(serde_json::json!({
+                "subtype": "apply_flag_settings",
+                "settings": {CLAUDE_FAST_MODE_SETTING: wanted.fast_mode},
             }));
         }
         if changed(|settings| &settings.permission_mode) {
@@ -4433,6 +4480,7 @@ impl AgentRuntime {
                 let mut options = request.harness_options.clone();
                 if claude_live.is_some() {
                     options.remove("permission_mode");
+                    options.remove("fast_mode");
                 }
                 options
             },
@@ -6959,6 +7007,7 @@ mod tests {
             model: model.map(str::to_owned),
             effort: effort.map(str::to_owned),
             permission_mode: Some(mode.to_owned()),
+            fast_mode: None,
         }
     }
 
@@ -7044,7 +7093,87 @@ mod tests {
             settings
                 .switch_to(&live(None, None, "bypassPermissions"))
                 .map(|requests| requests.len()),
-            Ok(3)
+            Ok(4)
+        );
+    }
+
+    #[test]
+    fn claude_fast_mode_switches_in_place_and_does_not_decide_on_a_new_process() {
+        let command = |args: &[&str]| {
+            let mut spec = CommandSpec::new("claude");
+            spec.args = claude_args(args);
+            retained_fingerprint_command(Provider::Claude, spec).args
+        };
+        let plain = command(&["--print"]);
+        assert_eq!(
+            command(&["--print", "--settings", r#"{"fastMode":true}"#]),
+            plain
+        );
+        assert_eq!(
+            command(&["--print", "--settings", r#"{"fastMode":false}"#]),
+            plain
+        );
+        // What else the JSON holds still decides.
+        assert_ne!(
+            command(&[
+                "--print",
+                "--settings",
+                r#"{"ultracode":true,"fastMode":true}"#
+            ]),
+            plain
+        );
+        assert_eq!(
+            command(&[
+                "--print",
+                "--settings",
+                r#"{"ultracode":true,"fastMode":true}"#
+            ]),
+            command(&["--print", "--settings", r#"{"ultracode":true}"#])
+        );
+
+        let (settings, _) = ClaudeLiveSettings::from_args(&claude_args(&[
+            "--settings",
+            r#"{"ultracode":true,"fastMode":true}"#,
+        ]));
+        assert_eq!(settings.fast_mode, Some(true));
+        let process = claude_process_settings(&["--settings", r#"{"fastMode":false}"#]);
+        let fast = |on| ClaudeLiveSettings {
+            fast_mode: Some(on),
+            ..live(None, None, "manual")
+        };
+        process.set_current(Some(fast(false)));
+        assert_eq!(process.switch_to(&fast(false)), Ok(Vec::new()));
+        assert_eq!(
+            process.switch_to(&fast(true)),
+            Ok(vec![serde_json::json!({
+                "subtype": "apply_flag_settings",
+                "settings": {"fastMode": true},
+            })])
+        );
+        // After a failed switch the live Fast mode is unknown, so it is reset
+        // even when the next turn does not mention it.
+        let unlaunched = claude_process_settings(&["--print"]);
+        unlaunched.set_current(None);
+        assert_eq!(
+            unlaunched.switch_to(&live(None, None, "manual")),
+            Ok(vec![
+                serde_json::json!({"subtype": "set_model", "model": null}),
+                serde_json::json!({"subtype": "apply_flag_settings",
+                    "settings": {"effortLevel": null}}),
+                serde_json::json!({"subtype": "apply_flag_settings",
+                    "settings": {"fastMode": null}}),
+                serde_json::json!({"subtype": "set_permission_mode", "mode": "manual"}),
+            ])
+        );
+        // A launch with Fast mode set cannot be put back to Claude's default.
+        assert_eq!(
+            process.switch_to(&live(None, None, "manual")),
+            Err("the default Fast mode".to_owned())
+        );
+        process.set_current(None);
+        assert_eq!(
+            process.switch_to(&live(None, None, "manual")),
+            Err("the default Fast mode".to_owned())
         );
     }
 
