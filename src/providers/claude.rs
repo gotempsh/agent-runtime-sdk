@@ -1794,6 +1794,7 @@ impl AgentAdapter for Claude {
                         .filter(|message| !message.trim().is_empty())
                         .or_else(|| value.pointer("/error/message").and_then(Value::as_str))
                         .or_else(|| value.get("error").and_then(Value::as_str))
+                        .map(str::to_owned)
                         // Claude's streaming JSON result can omit `result`
                         // and put the actionable failure only in `errors`.
                         .or_else(|| {
@@ -1801,14 +1802,10 @@ impl AgentAdapter for Claude {
                                 .get("errors")
                                 .and_then(Value::as_array)
                                 .and_then(|errors| {
-                                    errors
-                                        .iter()
-                                        .filter_map(Value::as_str)
-                                        .find(|message| !message.trim().is_empty())
+                                    result_errors_message(errors.iter().filter_map(Value::as_str))
                                 })
                         })
-                        .unwrap_or("Claude reported an error")
-                        .to_string();
+                        .unwrap_or_else(|| "Claude reported an error".to_owned());
                     let provider_code = value
                         .get("subtype")
                         .or_else(|| value.pointer("/error/type"))
@@ -3236,6 +3233,54 @@ fn bounded_note(reason: &str) -> String {
         text.push('…');
         text
     }
+}
+
+/// Prefix of the line Claude Code puts first in a failed result's `errors`
+/// when an exchange ends without a reply it counts as finished:
+/// `[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=null`.
+/// It is Claude's own debug record, not an explanation.
+const CLAUDE_EDE_DIAGNOSTIC: &str = "[ede_diagnostic]";
+
+/// What a failed result's `errors` should say: the first real error, or, when
+/// Claude's debug line is all there is, what it means in words (the line
+/// itself kept at the end for debugging).
+fn result_errors_message<'a>(errors: impl Iterator<Item = &'a str>) -> Option<String> {
+    let mut diagnostic = None;
+    for error in errors.map(str::trim).filter(|error| !error.is_empty()) {
+        match error.strip_prefix(CLAUDE_EDE_DIAGNOSTIC) {
+            Some(rest) => {
+                diagnostic.get_or_insert(rest.trim());
+            }
+            None => return Some(error.to_owned()),
+        }
+    }
+    diagnostic.map(explain_ede_diagnostic)
+}
+
+/// Claude ended an exchange whose last message was not a finished reply
+/// (`result_type`: the last message's type; `last_content_type`: what the
+/// last assistant message held; `stop_reason`: why the model stopped).
+fn explain_ede_diagnostic(fields: &str) -> String {
+    let field = |name: &str| {
+        fields
+            .split_whitespace()
+            .find_map(|pair| pair.strip_prefix(name)?.strip_prefix('='))
+    };
+    let what = match (field("result_type"), field("last_content_type")) {
+        (Some("user"), _) => {
+            "Claude stopped without answering the last message it received (a tool \
+             result, a background task's update, or a message sent while it worked)."
+        }
+        (Some("assistant"), Some("tool_use")) => {
+            "Claude stopped after asking to use a tool, before the tool ran."
+        }
+        (Some("undefined"), _) => "Claude stopped before it produced anything.",
+        _ => "Claude ended the turn without finishing its reply.",
+    };
+    format!(
+        "{what} Anything it wrote before that is complete; send a message to continue. \
+         (Claude reported: {fields})"
+    )
 }
 
 #[cfg(test)]
@@ -5963,6 +6008,69 @@ setTimeout(() => {
             failure.provider_code.as_deref(),
             Some("claude::error_during_execution")
         );
+    }
+
+    fn failure_of(line: &str) -> crate::adapter::ProviderTerminalFailure {
+        let mut state = AdapterState::default();
+        Claude::default()
+            .parse_line(line, &mut state)
+            .expect("Claude result parses");
+        state.terminal_failure.expect("terminal failure")
+    }
+
+    /// Claude Code 2.1.304 ended a turn this way after a reply that was
+    /// complete; the user saw only its debug line as the error.
+    #[test]
+    fn claudes_ede_debug_line_is_explained_instead_of_shown_as_the_error() {
+        let failure = failure_of(
+            r#"{"type":"result","subtype":"error_during_execution","is_error":true,"errors":["[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=null"]}"#,
+        );
+        assert!(
+            failure
+                .diagnostic
+                .starts_with("Claude stopped without answering the last message it received"),
+            "{}",
+            failure.diagnostic
+        );
+        assert!(failure.diagnostic.contains("send a message to continue"));
+        // The raw line stays at the end for whoever debugs it.
+        assert!(failure.diagnostic.ends_with(
+            "(Claude reported: result_type=user last_content_type=n/a stop_reason=null)"
+        ));
+        assert!(!failure.diagnostic.contains("[ede_diagnostic]"));
+        assert_eq!(failure.kind, crate::ProviderProcessErrorKind::Unknown);
+        assert_eq!(
+            failure.provider_code.as_deref(),
+            Some("claude::error_during_execution")
+        );
+    }
+
+    #[test]
+    fn a_real_error_after_claudes_debug_line_is_the_one_shown() {
+        let failure = failure_of(
+            r#"{"type":"result","subtype":"error_during_execution","is_error":true,"errors":["[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=null","","API Error: 529 Overloaded"]}"#,
+        );
+        assert_eq!(failure.diagnostic, "API Error: 529 Overloaded");
+    }
+
+    #[test]
+    fn each_kind_of_unfinished_exchange_is_named() {
+        let explained = |fields: &str| explain_ede_diagnostic(fields);
+        assert!(
+            explained("result_type=assistant last_content_type=tool_use stop_reason=tool_use")
+                .starts_with("Claude stopped after asking to use a tool")
+        );
+        assert!(
+            explained("result_type=undefined last_content_type=n/a stop_reason=null")
+                .starts_with("Claude stopped before it produced anything.")
+        );
+        assert!(
+            explained("result_type=assistant last_content_type=none stop_reason=max_tokens")
+                .starts_with("Claude ended the turn without finishing its reply.")
+        );
+        // An unexpected shape is still explained, never dropped.
+        assert!(explained("something new").ends_with("(Claude reported: something new)"));
+        assert_eq!(result_errors_message(["", "  "].into_iter()), None);
     }
 
     #[test]
