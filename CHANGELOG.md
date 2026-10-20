@@ -205,7 +205,7 @@ Versioning and Keep a Changelog conventions.
   stop_reason=null`) as the failure. The diagnostic now names what happened,
   for example that Claude stopped without answering the last message it
   received, keeps that line at the end, and a real error listed after it is
-  shown instead.
+  shown instead. It makes no claim that earlier output was finished.
 
 - Cancelling a turn no longer waits for a provider that has stopped reading
   its stdin. A provider busy inside a tool call can leave its pipe full, and

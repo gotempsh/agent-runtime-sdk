@@ -3278,8 +3278,9 @@ fn explain_ede_diagnostic(fields: &str) -> String {
         _ => "Claude ended the turn without finishing its reply.",
     };
     format!(
-        "{what} Anything it wrote before that is complete; send a message to continue. \
-         (Claude reported: {fields})"
+        // Nothing here says whether earlier output was finished (a reply cut off
+        // at `max_tokens` ends this way too), so it makes no such claim.
+        "{what} Send a message to continue. (Claude reported: {fields})"
     )
 }
 
@@ -6032,7 +6033,9 @@ setTimeout(() => {
             "{}",
             failure.diagnostic
         );
-        assert!(failure.diagnostic.contains("send a message to continue"));
+        assert!(failure.diagnostic.contains("Send a message to continue."));
+        // It cannot know whether earlier output was finished, so it never says so.
+        assert!(!failure.diagnostic.contains("complete"), "{}", failure.diagnostic);
         // The raw line stays at the end for whoever debugs it.
         assert!(failure.diagnostic.ends_with(
             "(Claude reported: result_type=user last_content_type=n/a stop_reason=null)"
