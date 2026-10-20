@@ -6035,7 +6035,11 @@ setTimeout(() => {
         );
         assert!(failure.diagnostic.contains("Send a message to continue."));
         // It cannot know whether earlier output was finished, so it never says so.
-        assert!(!failure.diagnostic.contains("complete"), "{}", failure.diagnostic);
+        assert!(
+            !failure.diagnostic.contains("complete"),
+            "{}",
+            failure.diagnostic
+        );
         // The raw line stays at the end for whoever debugs it.
         assert!(failure.diagnostic.ends_with(
             "(Claude reported: result_type=user last_content_type=n/a stop_reason=null)"
