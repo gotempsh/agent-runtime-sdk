@@ -200,6 +200,13 @@ Versioning and Keep a Changelog conventions.
 
 ### Fixed
 
+- A Claude turn that Claude Code ended without a finished reply no longer shows
+  its debug line (`[ede_diagnostic] result_type=user last_content_type=n/a
+  stop_reason=null`) as the failure. The diagnostic now names what happened,
+  for example that Claude stopped without answering the last message it
+  received, keeps that line at the end, and a real error listed after it is
+  shown instead. It makes no claim that earlier output was finished.
+
 - Cancelling a turn no longer waits for a provider that has stopped reading
   its stdin. A provider busy inside a tool call can leave its pipe full, and
   the adapter-encoded interrupt (`turn/interrupt` for the Codex app-server)
