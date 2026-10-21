@@ -198,18 +198,32 @@ few seconds after the work drains if Claude stays silent.
 Without process retention every turn is its own process, so overlap is still
 `RuntimeBusy` and background subagents end with the turn that started them.
 
-A turn may change the model, effort, Fast mode (`harness_options.fast_mode`)
-or permission mode: the retained Claude process switches them in place
-(`set_model`, `apply_flag_settings`, `set_permission_mode`) before the prompt,
-and background work keeps running. Other changes need a new process: the
-working directory, MCP servers or launch context, sandbox, other harness
-options, turning thinking off or ultracode on, going
+A turn may change the model, effort, Fast mode (`harness_options.fast_mode`),
+ultracode (reasoning `ultracode`, on or off) or permission mode: the retained
+Claude process switches them in place (`set_model`, `apply_flag_settings`,
+`set_permission_mode`) before the prompt, and background work keeps running.
+So a turn on another effort after a workflow started under ultracode does not
+stop the workflow. Leaving ultracode on a process launched with it sets
+`ultracode: false`, because clearing the setting would keep the launch value;
+on a process launched without it, the setting is cleared, which restores the
+user's own. Other changes need a new process: the working directory, MCP
+servers or launch context, sandbox, other harness options, turning thinking
+off, going
 back to the CLI's default model or effort after launching with one, and
 entering bypass mode on a process launched without it. While background work
 runs, such a turn fails with `RuntimeError::RestartWouldStopBackgroundWork`
 (`RuntimeBusy`, `RequiresUserAction`, prompt not sent), naming the work it
 would stop; nothing is stopped. Send it again once the work finishes, or stop
 the work first. A process that refuses a switch is handled the same way.
+
+Set `TurnInput::keep_background_work` (or `TurnRequest::keep_background_work`)
+to send such a turn anyway when only its model, reasoning or auto-compaction
+policy needs the new process: it runs on the values the process already has,
+reports what it kept as `TurnEvent::SettingsDeferred { change, tasks }`, and
+the next turn after the work finishes gets the new process. Changes to what
+the agent can reach (working directory, MCP servers or launch context,
+sandbox, permission mode, other harness options) are never deferred and are
+still refused. A remote host that predates the flag ignores it and refuses.
 
 To check the hand-off against an installed Claude CLI, run
 `cargo run --example claude_background_handoff_smoke -- haiku`. It launches a

@@ -208,6 +208,10 @@ pub struct ProtocolTurnInput {
     /// must redact the full frame.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_session_title: Option<String>,
+    /// See [`crate::TurnRequest::keep_background_work`]. A host that predates
+    /// it ignores it and refuses as before.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub keep_background_work: bool,
 }
 
 impl fmt::Debug for ProtocolTurnInput {
@@ -242,6 +246,7 @@ impl fmt::Debug for ProtocolTurnInput {
                 "request_session_title_bytes",
                 &self.request_session_title.as_ref().map(String::len),
             )
+            .field("keep_background_work", &self.keep_background_work)
             .finish_non_exhaustive()
     }
 }
@@ -779,6 +784,7 @@ mod tests {
                     attachments: vec![TurnAttachment::new("uploads/report.pdf")],
                     interaction_policy: InteractionPolicy::RequireHandler,
                     request_session_title: None,
+                    keep_background_work: false,
                 },
             },
         }

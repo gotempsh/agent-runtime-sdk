@@ -937,6 +937,7 @@ fn protocol_turn_input(input: ProtocolTurnInput) -> Result<TurnInput, RuntimeFai
     turn.attachments = input.attachments;
     turn.interaction_policy = input.interaction_policy;
     turn.request_session_title = input.request_session_title;
+    turn.keep_background_work = input.keep_background_work;
     Ok(turn)
 }
 
@@ -1160,6 +1161,7 @@ mod tests {
                     attachments: Vec::new(),
                     interaction_policy: InteractionPolicy::Deny,
                     request_session_title: None,
+                    keep_background_work: false,
                 },
             },
         }

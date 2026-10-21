@@ -207,6 +207,8 @@ pub struct TurnInput {
     pub attachments: Vec<TurnAttachment>,
     /// How provider approvals and questions must be handled.
     pub interaction_policy: InteractionPolicy,
+    /// See [`TurnRequest::keep_background_work`].
+    pub keep_background_work: bool,
     /// See [`TurnRequest::request_session_title`].
     pub request_session_title: Option<String>,
 }
@@ -232,6 +234,7 @@ impl TurnInput {
             environment: BTreeMap::new(),
             attachments: Vec::new(),
             interaction_policy: InteractionPolicy::Deny,
+            keep_background_work: false,
             request_session_title: None,
         }
     }
@@ -261,6 +264,7 @@ impl fmt::Debug for TurnInput {
             )
             .field("attachments", &self.attachments)
             .field("interaction_policy", &self.interaction_policy)
+            .field("keep_background_work", &self.keep_background_work)
             .finish_non_exhaustive()
     }
 }
@@ -1672,6 +1676,7 @@ impl RuntimeEntry {
             sandbox: self.spec.sandbox.clone(),
             required_sandbox_capabilities: self.spec.required_sandbox_capabilities,
             continuation: input.invocation_kind == RuntimeInvocationKind::Continuation,
+            keep_background_work: input.keep_background_work,
             request_session_title: input.request_session_title.clone(),
         }
     }

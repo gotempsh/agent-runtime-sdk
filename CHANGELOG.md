@@ -14,8 +14,24 @@ Versioning and Keep a Changelog conventions.
   session through its loopback port, including a port forwarded to the SDK
   host for an SSH target.
 
+### Added
+
+- `TurnInput::keep_background_work` / `TurnRequest::keep_background_work`:
+  instead of `RestartWouldStopBackgroundWork`, a turn whose model, reasoning
+  or auto-compaction policy would need a new process runs on the values the
+  retained process already has and reports them as the new
+  `TurnEvent::SettingsDeferred { change, tasks }`. Changes to the working
+  directory, launch context, sandbox, permission mode or other harness options
+  are still refused. Carried over the remote host protocol as an optional
+  field.
+
 ### Changed
 
+- A retained Claude process switches ultracode (reasoning `ultracode`) on and
+  off in place with `apply_flag_settings`, like effort and Fast mode, instead
+  of being replaced. A turn on another effort after a workflow started under
+  ultracode is no longer refused with `RestartWouldStopBackgroundWork`, and the
+  workflow keeps running.
 - A retained Claude process switches Fast mode (`harness_options.fast_mode`)
   in place, like the model and effort, instead of being replaced. A turn that
   only changes Fast mode is no longer refused with
