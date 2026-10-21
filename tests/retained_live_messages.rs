@@ -866,6 +866,44 @@ async fn keep_background_work_defers_what_needs_a_new_process() {
 }
 
 #[tokio::test]
+async fn keep_background_work_defers_going_back_to_the_default_model_and_effort() {
+    let f = Fixture::new(true).await;
+    // Launched with a model and effort, so Claude cannot switch back to its
+    // defaults in place.
+    let mut input = Fixture::input("one", "spawn-bg");
+    input.model = Some("first-model".into());
+    input.reasoning = Some("high".into());
+    let turn = f.start_input(input).await.unwrap();
+    f.wait_for_log("bg-start").await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    drop(turn);
+
+    let mut input = Fixture::input("two", "second");
+    input.keep_background_work = true;
+    let next = f
+        .start_input(input)
+        .await
+        .expect("the turn runs on the model and effort the process has");
+    f.wait_for_prompt("second").await;
+    assert_eq!(f.logged("bg-finished"), 0, "the subagent is still running");
+    f.release("bg-release");
+    let (events, result) = next.finish().await;
+    assert!(result.unwrap().text.contains("reply:second"));
+    let deferred = settings_deferred(&events);
+    assert_eq!(deferred.len(), 1, "{events:?}");
+    // The first setting it could not switch to.
+    assert_eq!(deferred[0].0, "the default model");
+    assert_eq!(
+        f.settings().len(),
+        0,
+        "nothing was switched: {:?}",
+        f.settings()
+    );
+    assert_eq!(f.spawns(), 1, "{:?}", f.events());
+    f.dispose().await;
+}
+
+#[tokio::test]
 async fn keep_background_work_never_defers_what_the_agent_can_reach() {
     let f = Fixture::new(true).await;
     park_with_background_work(&f).await;

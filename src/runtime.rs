@@ -462,10 +462,16 @@ fn describe_restart(old: &RetainedCodexFingerprint, new: &RetainedCodexFingerpri
 ///
 /// The launch command also carries these settings, so it is left out here and
 /// checked when the returned turn claims the process.
+///
+/// A Claude fingerprint leaves out the model and effort, which switch in
+/// place, so for Claude they come from `claude`: the process's settings and
+/// the ones this turn wants. Unknown live settings (after a failed switch)
+/// leave nothing to fall back to.
 fn with_retained_turn_settings(
     request: &TurnRequest,
     running: &RetainedCodexFingerprint,
     wanted: &RetainedCodexFingerprint,
+    claude: Option<(&ClaudeProcessSettings, &ClaudeLiveSettings)>,
 ) -> Option<TurnRequest> {
     let deferrable_cleared = |fingerprint: &RetainedCodexFingerprint| RetainedCodexFingerprint {
         command: CommandSpec::new(""),
@@ -477,24 +483,38 @@ fn with_retained_turn_settings(
     if deferrable_cleared(running) != deferrable_cleared(wanted) {
         return None;
     }
-    // A Claude fingerprint records reasoning only when it is "off", so a
-    // process that is not off cannot say which effort it runs.
-    if request.provider == Provider::Claude
-        && running.reasoning.is_none()
-        && wanted.reasoning.is_some()
-    {
-        return None;
-    }
     let mut kept = request.clone();
-    // A Claude fingerprint leaves out the model, which switches in place, so
-    // only what differs is taken from the process.
-    if running.model != wanted.model {
-        kept.model.clone_from(&running.model);
-    }
-    if running.reasoning != wanted.reasoning {
-        kept.reasoning.clone_from(&running.reasoning);
-    }
     kept.auto_compaction = running.auto_compaction;
+    if request.provider != Provider::Claude {
+        if running.model != wanted.model {
+            kept.model.clone_from(&running.model);
+        }
+        if running.reasoning != wanted.reasoning {
+            kept.reasoning.clone_from(&running.reasoning);
+        }
+        return Some(kept);
+    }
+    let (process, wanted_live) = claude?;
+    let current = process
+        .current
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()?;
+    // What Claude cannot switch in place: back to the default model or effort
+    // after launching with one, and turning thinking off or back on.
+    if wanted_live.model.is_none() && process.launch.model.is_some() {
+        kept.model.clone_from(&current.model);
+    }
+    let thinking_changed = running.reasoning != wanted.reasoning;
+    if thinking_changed || (wanted_live.effort.is_none() && process.launch.effort.is_some()) {
+        kept.reasoning = if running.reasoning.as_deref() == Some("off") {
+            Some("off".to_owned())
+        } else if current.ultracode == Some(true) {
+            Some("ultracode".to_owned())
+        } else {
+            current.effort.clone()
+        };
+    }
     Some(kept)
 }
 
@@ -4601,6 +4621,9 @@ impl AgentRuntime {
                                             request,
                                             &process.fingerprint,
                                             &fingerprint,
+                                            process.claude_settings.as_ref().zip(
+                                                claude_live.as_ref().map(|(wanted, _)| wanted),
+                                            ),
                                         )
                                     })
                                     .flatten();
@@ -7389,9 +7412,13 @@ mod tests {
         wanted.auto_compaction = crate::AutoCompactionPolicy::Automatic;
         wanted.keep_background_work = true;
 
-        let kept =
-            with_retained_turn_settings(&wanted, &fingerprint(&running), &fingerprint(&wanted))
-                .expect("thinking and compaction are deferred");
+        let kept = with_retained_turn_settings(
+            &wanted,
+            &fingerprint(&running),
+            &fingerprint(&wanted),
+            None,
+        )
+        .expect("thinking and compaction are deferred");
         assert_eq!(kept.prompt, "second");
         assert_eq!(kept.model.as_deref(), Some("gpt-5"));
         assert_eq!(kept.reasoning.as_deref(), Some("high"));
@@ -7406,7 +7433,8 @@ mod tests {
         assert!(with_retained_turn_settings(
             &stricter,
             &fingerprint(&running),
-            &fingerprint(&stricter)
+            &fingerprint(&stricter),
+            None,
         )
         .is_none());
         let mut elsewhere = wanted.clone();
@@ -7414,19 +7442,72 @@ mod tests {
         assert!(with_retained_turn_settings(
             &elsewhere,
             &fingerprint(&running),
-            &fingerprint(&elsewhere)
+            &fingerprint(&elsewhere),
+            None,
         )
         .is_none());
 
-        // A Claude process that is not "off" does not record its effort, so
-        // turning thinking off cannot fall back to it.
+        // Claude's fingerprint leaves out the model and effort: they come from
+        // the process's live settings.
+        let process = claude_process_settings(&[
+            "--permission-mode",
+            "manual",
+            "--model",
+            "opus",
+            "--effort",
+            "high",
+        ]);
         let mut claude = TurnRequest::new(Provider::Claude, ".", "second");
-        claude.reasoning = Some("off".into());
-        let mut claude_running = fingerprint(&claude);
-        claude_running.reasoning = None;
-        assert!(
-            with_retained_turn_settings(&claude, &claude_running, &fingerprint(&claude)).is_none()
-        );
+        claude.model = None;
+        claude.reasoning = None;
+        let defaults = live(None, None, "manual");
+        let kept = with_retained_turn_settings(
+            &claude,
+            &fingerprint(&claude),
+            &fingerprint(&claude),
+            Some((&process, &defaults)),
+        )
+        .expect("back to the defaults waits for the work");
+        assert_eq!(kept.model.as_deref(), Some("opus"));
+        assert_eq!(kept.reasoning.as_deref(), Some("high"));
+        // A switch the process can make is left alone.
+        let mut sonnet = claude.clone();
+        sonnet.model = Some("sonnet".into());
+        let kept = with_retained_turn_settings(
+            &sonnet,
+            &fingerprint(&sonnet),
+            &fingerprint(&sonnet),
+            Some((&process, &live(Some("sonnet"), None, "manual"))),
+        )
+        .unwrap();
+        assert_eq!(kept.model.as_deref(), Some("sonnet"));
+        assert_eq!(kept.reasoning.as_deref(), Some("high"));
+        // Turning thinking off keeps the process's effort, ultracode included.
+        let mut off = claude.clone();
+        off.reasoning = Some("off".into());
+        let mut not_off = fingerprint(&off);
+        not_off.reasoning = None;
+        process.set_current(Some(ClaudeLiveSettings {
+            ultracode: Some(true),
+            ..live(Some("opus"), Some("xhigh"), "manual")
+        }));
+        let kept = with_retained_turn_settings(
+            &off,
+            &not_off,
+            &fingerprint(&off),
+            Some((&process, &live(Some("opus"), None, "manual"))),
+        )
+        .unwrap();
+        assert_eq!(kept.reasoning.as_deref(), Some("ultracode"));
+        // After a failed switch the live settings are unknown.
+        process.set_current(None);
+        assert!(with_retained_turn_settings(
+            &claude,
+            &fingerprint(&claude),
+            &fingerprint(&claude),
+            Some((&process, &defaults)),
+        )
+        .is_none());
     }
 
     #[test]

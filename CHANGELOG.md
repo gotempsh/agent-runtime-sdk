@@ -18,8 +18,9 @@ Versioning and Keep a Changelog conventions.
 
 - `TurnInput::keep_background_work` / `TurnRequest::keep_background_work`:
   instead of `RestartWouldStopBackgroundWork`, a turn whose model, reasoning
-  or auto-compaction policy would need a new process runs on the values the
-  retained process already has and reports them as the new
+  or auto-compaction policy would need a new process (for Claude, going back
+  to the default model or effort, or turning thinking off) runs on the values
+  the retained process already has and reports them as the new
   `TurnEvent::SettingsDeferred { change, tasks }`. Changes to the working
   directory, launch context, sandbox, permission mode or other harness options
   are still refused. Carried over the remote host protocol as an optional

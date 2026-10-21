@@ -218,7 +218,9 @@ the work first. A process that refuses a switch is handled the same way.
 
 Set `TurnInput::keep_background_work` (or `TurnRequest::keep_background_work`)
 to send such a turn anyway when only its model, reasoning or auto-compaction
-policy needs the new process: it runs on the values the process already has,
+policy needs the new process (for Claude: going back to the CLI's default
+model or effort, or turning thinking off or on): it runs on the values the
+process already has,
 reports what it kept as `TurnEvent::SettingsDeferred { change, tasks }`, and
 the next turn after the work finishes gets the new process. Changes to what
 the agent can reach (working directory, MCP servers or launch context,
