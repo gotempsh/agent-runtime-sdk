@@ -904,6 +904,40 @@ async fn keep_background_work_defers_going_back_to_the_default_model_and_effort(
 }
 
 #[tokio::test]
+async fn keep_background_work_never_runs_a_turn_with_looser_permissions() {
+    let f = Fixture::new(true).await;
+    let mut input = Fixture::input("one", "spawn-bg");
+    input.model = Some("first-model".into());
+    let turn = f.start_input(input).await.unwrap();
+    f.wait_for_log("bg-start").await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    drop(turn);
+
+    // Going back to the default model could wait for the work, but bypass
+    // mode on a process launched without it cannot: the turn is refused with
+    // what it asked for first, and runs on nothing.
+    let mut input = Fixture::input("two", "second");
+    input.permission_mode = Some(PermissionMode::FullAccess);
+    input.keep_background_work = true;
+    let (events, result) = f.start_input(input).await.unwrap().finish().await;
+    let error = result.expect_err("bypass mode needs a new process");
+    assert_eq!(error.kind, RuntimeFailureKind::RuntimeBusy);
+    assert!(
+        error.message.contains("the default model") && error.message.contains("subagent bg-1"),
+        "{}",
+        error.message
+    );
+    assert_eq!(settings_deferred(&events).len(), 0, "{events:?}");
+    assert!(f.events().iter().all(|v| v["prompt"] != "second"));
+    assert_eq!(f.settings().len(), 0, "{:?}", f.settings());
+    assert_eq!(f.spawns(), 1);
+
+    f.release("bg-release");
+    f.wait_for_log("bg-finished").await;
+    f.dispose().await;
+}
+
+#[tokio::test]
 async fn keep_background_work_never_defers_what_the_agent_can_reach() {
     let f = Fixture::new(true).await;
     park_with_background_work(&f).await;

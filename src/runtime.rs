@@ -518,6 +518,21 @@ fn with_retained_turn_settings(
     Some(kept)
 }
 
+/// Whether a retained process is usable and still runs background work, the
+/// only reason a turn keeps its settings (`TurnRequest::keep_background_work`).
+fn parked_with_background_work(adapter: &dyn AgentAdapter, process: &RetainedCodexProcess) -> bool {
+    process.usable.load(Ordering::Acquire) && retained_background_tasks(adapter, process).is_some()
+}
+
+/// The turn as it was asked for, run when keeping the process's settings no
+/// longer keeps any background work. It does not fall back again, so a
+/// process that keeps changing cannot send a turn back and forth.
+fn as_asked(request: &TurnRequest) -> TurnRequest {
+    let mut asked = request.clone();
+    asked.keep_background_work = false;
+    asked
+}
+
 /// The background work a retained process still runs for a parked turn,
 /// described for the caller; `None` when replacing it would stop nothing.
 fn retained_background_tasks(
@@ -4458,9 +4473,9 @@ impl AgentRuntime {
         interactions: &dyn InteractionHandler,
         trace: &StartupTrace,
         // Set when this is a turn re-run on the settings its process already
-        // has (see `TurnRequest::keep_background_work`): the refusal the
-        // first run would have returned, as `(change, tasks)`.
-        deferred: Option<(String, Vec<String>)>,
+        // has (see `TurnRequest::keep_background_work`): the turn as asked,
+        // and the refusal it would have met, as `(turn, change, tasks)`.
+        deferred: Option<(&TurnRequest, String, Vec<String>)>,
     ) -> Result<TurnResult> {
         let provider = request.provider;
         let initial_process = supervisor
@@ -4470,6 +4485,27 @@ impl AgentRuntime {
             .await
             .get(runtime_id)
             .cloned();
+        // The work this re-run keeps the settings for may have ended, or its
+        // process gone, since the first run: a new process stops nothing now,
+        // so the turn runs as asked.
+        if let Some((asked, ..)) = &deferred {
+            if !initial_process
+                .as_deref()
+                .is_some_and(|process| parked_with_background_work(adapter.as_ref(), process))
+            {
+                return Box::pin(self.run_retained_codex_process(
+                    supervisor,
+                    runtime_id,
+                    adapter,
+                    &as_asked(asked),
+                    events,
+                    interactions,
+                    trace,
+                    None,
+                ))
+                .await;
+            }
+        }
         // Checked before anything is prepared: a continuation never starts,
         // replaces or prompts a process.
         if request.continuation
@@ -4510,7 +4546,10 @@ impl AgentRuntime {
         for (name, value) in &request.environment {
             spec.environment.insert(name.into(), value.expose().into());
         }
-        trace.record(StartupStage::CommandPrepared);
+        // A re-run's stages were already recorded by the run before it.
+        if deferred.is_none() {
+            trace.record(StartupStage::CommandPrepared);
+        }
         if let Some(sandbox) = &request.sandbox {
             let context = SandboxContext {
                 provider,
@@ -4520,7 +4559,9 @@ impl AgentRuntime {
                 _ = request.cancellation.cancelled() => return Err(RuntimeError::Cancelled { provider }),
                 prepared = sandbox.prepare(context, spec) => prepared?,
             };
-            trace.record(StartupStage::SandboxPrepared);
+            if deferred.is_none() {
+                trace.record(StartupStage::SandboxPrepared);
+            }
         }
         let capabilities = self.transport.capabilities();
         if provider != Provider::OpenCode
@@ -4586,66 +4627,96 @@ impl AgentRuntime {
         // policy, when only those would replace a process that still runs
         // background work.
         let mut kept_turn = None;
+        // A re-run whose reason to keep the settings went while it prepared.
+        let mut run_as_asked = false;
         let previous = {
             let mut processes = supervisor.inner.processes.lock().await;
-            match processes.get(runtime_id) {
-                Some(process) if process.usable.load(Ordering::Acquire) => {
-                    // A continuation resumes the parked process as it is;
-                    // this turn's settings apply from the next prompt on.
-                    let reuse = if request.continuation {
-                        Ok(Vec::new())
-                    } else if process.fingerprint == fingerprint {
-                        match (&process.claude_settings, &claude_live) {
-                            (Some(settings), Some((wanted, _))) => settings.switch_to(wanted),
-                            _ => Ok(Vec::new()),
-                        }
-                    } else {
-                        Err(describe_restart(&process.fingerprint, &fingerprint))
-                    };
-                    match reuse {
-                        Ok(requests) => {
-                            settings_switch = (!requests.is_empty()).then_some(requests);
-                            None
-                        }
-                        // Never stop background work nobody asked to stop.
-                        Err(change) => {
-                            if let Some(tasks) =
-                                retained_background_tasks(adapter.as_ref(), process)
-                            {
-                                // A re-run that still does not match reports
-                                // what the turn itself asked for.
-                                let (change, tasks) = deferred.clone().unwrap_or((change, tasks));
-                                let kept = (request.keep_background_work && deferred.is_none())
-                                    .then(|| {
-                                        with_retained_turn_settings(
-                                            request,
-                                            &process.fingerprint,
-                                            &fingerprint,
-                                            process.claude_settings.as_ref().zip(
-                                                claude_live.as_ref().map(|(wanted, _)| wanted),
-                                            ),
-                                        )
-                                    })
-                                    .flatten();
-                                let Some(kept) = kept else {
-                                    return Err(RuntimeError::RestartWouldStopBackgroundWork {
-                                        provider,
-                                        change,
-                                        tasks,
-                                    });
-                                };
-                                kept_turn = Some((kept, change, tasks));
+            if deferred.is_some()
+                && !processes
+                    .get(runtime_id)
+                    .is_some_and(|process| parked_with_background_work(adapter.as_ref(), process))
+            {
+                run_as_asked = true;
+                None
+            } else {
+                match processes.get(runtime_id) {
+                    Some(process) if process.usable.load(Ordering::Acquire) => {
+                        // A continuation resumes the parked process as it is;
+                        // this turn's settings apply from the next prompt on.
+                        let reuse = if request.continuation {
+                            Ok(Vec::new())
+                        } else if process.fingerprint == fingerprint {
+                            match (&process.claude_settings, &claude_live) {
+                                (Some(settings), Some((wanted, _))) => settings.switch_to(wanted),
+                                _ => Ok(Vec::new()),
+                            }
+                        } else {
+                            Err(describe_restart(&process.fingerprint, &fingerprint))
+                        };
+                        match reuse {
+                            Ok(requests) => {
+                                settings_switch = (!requests.is_empty()).then_some(requests);
                                 None
-                            } else {
-                                processes.remove(runtime_id)
+                            }
+                            // Never stop background work nobody asked to stop.
+                            Err(change) => {
+                                if let Some(tasks) =
+                                    retained_background_tasks(adapter.as_ref(), process)
+                                {
+                                    // A re-run that still does not match reports
+                                    // what the turn itself asked for.
+                                    let (change, tasks) = deferred
+                                        .as_ref()
+                                        .map_or((change, tasks), |(_, change, tasks)| {
+                                            (change.clone(), tasks.clone())
+                                        });
+                                    let kept = (request.keep_background_work && deferred.is_none())
+                                        .then(|| {
+                                            with_retained_turn_settings(
+                                                request,
+                                                &process.fingerprint,
+                                                &fingerprint,
+                                                process.claude_settings.as_ref().zip(
+                                                    claude_live.as_ref().map(|(wanted, _)| wanted),
+                                                ),
+                                            )
+                                        })
+                                        .flatten();
+                                    let Some(kept) = kept else {
+                                        return Err(RuntimeError::RestartWouldStopBackgroundWork {
+                                            provider,
+                                            change,
+                                            tasks,
+                                        });
+                                    };
+                                    kept_turn = Some((kept, change, tasks));
+                                    None
+                                } else {
+                                    processes.remove(runtime_id)
+                                }
                             }
                         }
                     }
+                    Some(_) => processes.remove(runtime_id),
+                    None => None,
                 }
-                Some(_) => processes.remove(runtime_id),
-                None => None,
             }
         };
+        if run_as_asked {
+            if let Some((asked, ..)) = &deferred {
+                return Box::pin(self.run_retained_codex_process(
+                    supervisor,
+                    runtime_id,
+                    adapter,
+                    &as_asked(asked),
+                    events,
+                    interactions,
+                    trace,
+                    None,
+                ))
+                .await;
+            }
+        }
         if let Some((kept, change, tasks)) = kept_turn {
             return Box::pin(self.run_retained_codex_process(
                 supervisor,
@@ -4655,15 +4726,9 @@ impl AgentRuntime {
                 events,
                 interactions,
                 trace,
-                Some((change, tasks)),
+                Some((request, change, tasks)),
             ))
             .await;
-        }
-        // The re-run claims the process as it is: say what it kept.
-        if let Some((change, tasks)) = deferred {
-            events
-                .emit(TurnEvent::SettingsDeferred { change, tasks })
-                .await?;
         }
         let mut available_permit = reserved_permit;
         if let Some(previous) = previous {
@@ -5014,8 +5079,29 @@ impl AgentRuntime {
             return Err(RuntimeError::NothingToContinue { provider });
         }
         let retained = if let Some(existing) = existing {
+            // The re-run has its process as it is: say what waits, and for what.
+            if let Some((_, change, tasks)) = deferred {
+                events
+                    .emit(TurnEvent::SettingsDeferred { change, tasks })
+                    .await?;
+            }
             existing
         } else {
+            // The kept process went (it failed its check, or was retired), and
+            // its work with it: a new one stops nothing, so it starts as asked.
+            if let Some((asked, ..)) = &deferred {
+                return Box::pin(self.run_retained_codex_process(
+                    supervisor,
+                    runtime_id,
+                    adapter,
+                    &as_asked(asked),
+                    events,
+                    interactions,
+                    trace,
+                    None,
+                ))
+                .await;
+            }
             if available_permit.is_none() {
                 if let Some(initial) = &initial_process {
                     available_permit = initial.permit.lock().await.take();

@@ -208,7 +208,7 @@ stop the workflow. Leaving ultracode on a process launched with it sets
 on a process launched without it, the setting is cleared, which restores the
 user's own. Other changes need a new process: the working directory, MCP
 servers or launch context, sandbox, other harness options, turning thinking
-off, going
+off or back on, going
 back to the CLI's default model or effort after launching with one, and
 entering bypass mode on a process launched without it. While background work
 runs, such a turn fails with `RuntimeError::RestartWouldStopBackgroundWork`
@@ -219,10 +219,12 @@ the work first. A process that refuses a switch is handled the same way.
 Set `TurnInput::keep_background_work` (or `TurnRequest::keep_background_work`)
 to send such a turn anyway when only its model, reasoning or auto-compaction
 policy needs the new process (for Claude: going back to the CLI's default
-model or effort, or turning thinking off or on): it runs on the values the
-process already has,
-reports what it kept as `TurnEvent::SettingsDeferred { change, tasks }`, and
-the next turn after the work finishes gets the new process. Changes to what
+model or effort, or turning thinking off or on): it keeps the process's
+values for just those (anything the process can switch in place is still
+switched), reports what it kept as `TurnEvent::SettingsDeferred { change, tasks }`, and
+the next turn after the work finishes gets the new process. If the work has
+ended, or the process has gone, by the time the turn claims it, the turn runs
+as asked instead. Changes to what
 the agent can reach (working directory, MCP servers or launch context,
 sandbox, permission mode, other harness options) are never deferred and are
 still refused. A remote host that predates the flag ignores it and refuses.

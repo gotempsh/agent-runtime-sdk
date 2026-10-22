@@ -381,10 +381,13 @@ pub struct TurnRequest {
     /// anything else fails with [`crate::RuntimeError::NothingToContinue`]
     /// before writing to the provider.
     pub continuation: bool,
-    /// Run the turn on the settings a retained process already has, instead
-    /// of failing with [`crate::RuntimeError::RestartWouldStopBackgroundWork`],
-    /// when only its model, reasoning or auto-compaction policy would need a
-    /// new process and the current one still runs background work.
+    /// Keep a retained process's model, reasoning or auto-compaction policy
+    /// for this turn, instead of failing with
+    /// [`crate::RuntimeError::RestartWouldStopBackgroundWork`], when only those
+    /// would need a new process and the current one still runs background
+    /// work. Anything the process can switch in place is still switched, and
+    /// if the work has ended (or the process gone) by the time the turn claims
+    /// it, the turn runs as asked.
     ///
     /// The turn reports what it kept as [`TurnEvent::SettingsDeferred`]; the
     /// new settings apply on a later turn, once the work has finished. Any
@@ -1218,11 +1221,12 @@ pub enum TurnEvent {
         /// Human-readable diagnostic.
         message: String,
     },
-    /// The turn runs on the model, reasoning and auto-compaction policy its
-    /// retained process already has, because applying its own would need a new process that would stop
-    /// background work still running (see
-    /// [`TurnRequest::keep_background_work`]). They apply on a later turn,
-    /// once that work has finished.
+    /// The turn kept its retained process's model, reasoning or
+    /// auto-compaction policy, because applying its own would need a new
+    /// process that would stop background work still running (see
+    /// [`TurnRequest::keep_background_work`]). Emitted once the process is
+    /// claimed; the settings apply on a later turn, once that work has
+    /// finished.
     SettingsDeferred {
         /// What about the turn's settings was not applied, such as "a
         /// different model".
