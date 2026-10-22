@@ -4704,6 +4704,7 @@ impl AgentRuntime {
         };
         if run_as_asked {
             if let Some((asked, ..)) = &deferred {
+                drop(reserved_permit);
                 return Box::pin(self.run_retained_codex_process(
                     supervisor,
                     runtime_id,
@@ -4718,6 +4719,7 @@ impl AgentRuntime {
             }
         }
         if let Some((kept, change, tasks)) = kept_turn {
+            drop(reserved_permit);
             return Box::pin(self.run_retained_codex_process(
                 supervisor,
                 runtime_id,
@@ -5079,17 +5081,13 @@ impl AgentRuntime {
             return Err(RuntimeError::NothingToContinue { provider });
         }
         let retained = if let Some(existing) = existing {
-            // The re-run has its process as it is: say what waits, and for what.
-            if let Some((_, change, tasks)) = deferred {
-                events
-                    .emit(TurnEvent::SettingsDeferred { change, tasks })
-                    .await?;
-            }
             existing
         } else {
             // The kept process went (it failed its check, or was retired), and
             // its work with it: a new one stops nothing, so it starts as asked.
             if let Some((asked, ..)) = &deferred {
+                // Its capacity goes back to the pool for that run to take.
+                drop(available_permit);
                 return Box::pin(self.run_retained_codex_process(
                     supervisor,
                     runtime_id,
@@ -5261,6 +5259,14 @@ impl AgentRuntime {
             runtime_id: runtime_id.clone(),
             process: Arc::clone(&retained),
         };
+        // A re-run reaching here has its kept process (a new one runs as
+        // asked): say what waits, and for what. Cleanup is armed, so a
+        // failure to tell the caller ends the turn like any other failure.
+        if let Some((_, change, tasks)) = deferred {
+            events
+                .emit(TurnEvent::SettingsDeferred { change, tasks })
+                .await?;
+        }
         let mut io_guard = retained.io.lock().await;
         let io = io_guard.as_mut().ok_or_else(|| RuntimeError::Protocol {
             provider,
