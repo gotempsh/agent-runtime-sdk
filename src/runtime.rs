@@ -231,8 +231,8 @@ fn retained_fingerprint_command(provider: Provider, mut command: CommandSpec) ->
             if argument == "--resume" || CLAUDE_LIVE_FLAGS.iter().any(|flag| argument == *flag) {
                 let _ = arguments.next();
             } else if argument == "--settings" {
-                // Fast mode travels in this JSON and switches in place; what
-                // else it holds (ultracode) still decides on a new process.
+                // Fast mode and ultracode travel in this JSON and switch in
+                // place; anything else it holds still decides on a new process.
                 match arguments.next() {
                     Some(value) => {
                         if let Some(rest) = without_live_settings(&value) {
@@ -251,7 +251,7 @@ fn retained_fingerprint_command(provider: Provider, mut command: CommandSpec) ->
 }
 
 /// The `--settings` JSON without the keys a live process switches in place
-/// (`fastMode`), or `None` when nothing else is left. Anything that is not a
+/// (`fastMode`, `ultracode`), or `None` when nothing else is left. Anything that is not a
 /// JSON object is kept as it is.
 fn without_live_settings(value: &std::ffi::OsStr) -> Option<std::ffi::OsString> {
     let Some(serde_json::Value::Object(mut settings)) = value
@@ -261,11 +261,15 @@ fn without_live_settings(value: &std::ffi::OsStr) -> Option<std::ffi::OsString> 
         return Some(value.to_owned());
     };
     settings.remove(CLAUDE_FAST_MODE_SETTING);
+    settings.remove(CLAUDE_ULTRACODE_SETTING);
     (!settings.is_empty()).then(|| serde_json::Value::Object(settings).to_string().into())
 }
 
 /// The setting key Claude Code reads Fast mode from.
 const CLAUDE_FAST_MODE_SETTING: &str = "fastMode";
+/// The setting key Claude Code reads ultracode (standing workflow
+/// orchestration) from.
+const CLAUDE_ULTRACODE_SETTING: &str = "ultracode";
 
 /// Claude flags whose settings a live process can switch between turns.
 const CLAUDE_LIVE_FLAGS: [&str; 3] = ["--model", "--effort", "--permission-mode"];
@@ -278,8 +282,8 @@ const CLAUDE_SETTINGS_SWITCH_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_SWITCH_UNSOLICITED_FRAMES: usize = 64;
 
 /// The Claude settings a retained process can switch in place between turns:
-/// model (`set_model`), effort and Fast mode (`apply_flag_settings`) and
-/// permission mode (`set_permission_mode`). Changing anything else needs a new
+/// model (`set_model`), effort, Fast mode and ultracode (`apply_flag_settings`)
+/// and permission mode (`set_permission_mode`). Changing anything else needs a new
 /// process.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct ClaudeLiveSettings {
@@ -287,6 +291,7 @@ struct ClaudeLiveSettings {
     effort: Option<String>,
     permission_mode: Option<String>,
     fast_mode: Option<bool>,
+    ultracode: Option<bool>,
 }
 
 impl ClaudeLiveSettings {
@@ -307,9 +312,11 @@ impl ClaudeLiveSettings {
                 Some("--effort") => settings.effort = value(&mut arguments),
                 Some("--permission-mode") => settings.permission_mode = value(&mut arguments),
                 Some("--settings") => {
-                    settings.fast_mode = value(&mut arguments)
-                        .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
-                        .and_then(|json| json.get(CLAUDE_FAST_MODE_SETTING)?.as_bool());
+                    let json = value(&mut arguments)
+                        .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok());
+                    let flag = |key: &str| json.as_ref()?.get(key)?.as_bool();
+                    settings.fast_mode = flag(CLAUDE_FAST_MODE_SETTING);
+                    settings.ultracode = flag(CLAUDE_ULTRACODE_SETTING);
                 }
                 Some(CLAUDE_BYPASS_FLAG) => bypass_allowed = true,
                 _ => {}
@@ -382,6 +389,23 @@ impl ClaudeProcessSettings {
                 "settings": {CLAUDE_FAST_MODE_SETTING: wanted.fast_mode},
             }));
         }
+        if current
+            .as_ref()
+            .is_none_or(|current| current.ultracode != wanted.ultracode)
+        {
+            // Clearing the setting does not undo a value the launch set, so
+            // such a launch is turned off explicitly. Otherwise clearing it
+            // restores what a launch without it has (the user's own setting).
+            let ultracode = match (wanted.ultracode, self.launch.ultracode) {
+                (Some(on), _) => serde_json::Value::Bool(on),
+                (None, Some(_)) => serde_json::Value::Bool(false),
+                (None, None) => serde_json::Value::Null,
+            };
+            requests.push(serde_json::json!({
+                "subtype": "apply_flag_settings",
+                "settings": {CLAUDE_ULTRACODE_SETTING: ultracode},
+            }));
+        }
         if changed(|settings| &settings.permission_mode) {
             match wanted.permission_mode.as_deref() {
                 Some("bypassPermissions") if !self.bypass_allowed => {
@@ -430,6 +454,83 @@ fn describe_restart(old: &RetainedCodexFingerprint, new: &RetainedCodexFingerpri
         changes.push("a different launch command");
     }
     changes.join(", ")
+}
+
+/// `request` on the model, reasoning and auto-compaction policy a retained
+/// process already runs, or `None` when something else differs: everything
+/// else decides what the agent can reach, so it is never deferred.
+///
+/// The launch command also carries these settings, so it is left out here and
+/// checked when the returned turn claims the process.
+///
+/// A Claude fingerprint leaves out the model and effort, which switch in
+/// place, so for Claude they come from `claude`: the process's settings and
+/// the ones this turn wants. Unknown live settings (after a failed switch)
+/// leave nothing to fall back to.
+fn with_retained_turn_settings(
+    request: &TurnRequest,
+    running: &RetainedCodexFingerprint,
+    wanted: &RetainedCodexFingerprint,
+    claude: Option<(&ClaudeProcessSettings, &ClaudeLiveSettings)>,
+) -> Option<TurnRequest> {
+    let deferrable_cleared = |fingerprint: &RetainedCodexFingerprint| RetainedCodexFingerprint {
+        command: CommandSpec::new(""),
+        model: None,
+        reasoning: None,
+        auto_compaction: crate::AutoCompactionPolicy::default(),
+        ..fingerprint.clone()
+    };
+    if deferrable_cleared(running) != deferrable_cleared(wanted) {
+        return None;
+    }
+    let mut kept = request.clone();
+    kept.auto_compaction = running.auto_compaction;
+    if request.provider != Provider::Claude {
+        if running.model != wanted.model {
+            kept.model.clone_from(&running.model);
+        }
+        if running.reasoning != wanted.reasoning {
+            kept.reasoning.clone_from(&running.reasoning);
+        }
+        return Some(kept);
+    }
+    let (process, wanted_live) = claude?;
+    let current = process
+        .current
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()?;
+    // What Claude cannot switch in place: back to the default model or effort
+    // after launching with one, and turning thinking off or back on.
+    if wanted_live.model.is_none() && process.launch.model.is_some() {
+        kept.model.clone_from(&current.model);
+    }
+    let thinking_changed = running.reasoning != wanted.reasoning;
+    if thinking_changed || (wanted_live.effort.is_none() && process.launch.effort.is_some()) {
+        kept.reasoning = if running.reasoning.as_deref() == Some("off") {
+            Some("off".to_owned())
+        } else if current.ultracode == Some(true) {
+            Some("ultracode".to_owned())
+        } else {
+            current.effort.clone()
+        };
+    }
+    Some(kept)
+}
+
+/// Whether a retained process is usable and still runs background work, the
+/// only reason a turn keeps its settings (`TurnRequest::keep_background_work`).
+fn parked_with_background_work(adapter: &dyn AgentAdapter, process: &RetainedCodexProcess) -> bool {
+    process.usable.load(Ordering::Acquire) && retained_background_tasks(adapter, process).is_some()
+}
+
+/// The turn as it was asked for, run when keeping the process's settings no
+/// longer keeps any background work. It does not fall back again, so a
+/// process that keeps changing cannot send a turn back and forth.
+fn as_asked(request: &TurnRequest) -> TurnRequest {
+    let mut asked = request.clone();
+    asked.keep_background_work = false;
+    asked
 }
 
 /// The background work a retained process still runs for a parked turn,
@@ -4031,6 +4132,7 @@ impl AgentRuntime {
                     events,
                     interactions.unwrap_or(&DenyAll),
                     trace,
+                    None,
                 )
                 .await
             } else {
@@ -4370,6 +4472,10 @@ impl AgentRuntime {
         events: &dyn EventSink,
         interactions: &dyn InteractionHandler,
         trace: &StartupTrace,
+        // Set when this is a turn re-run on the settings its process already
+        // has (see `TurnRequest::keep_background_work`): the turn as asked,
+        // and the refusal it would have met, as `(turn, change, tasks)`.
+        deferred: Option<(&TurnRequest, String, Vec<String>)>,
     ) -> Result<TurnResult> {
         let provider = request.provider;
         let initial_process = supervisor
@@ -4379,6 +4485,27 @@ impl AgentRuntime {
             .await
             .get(runtime_id)
             .cloned();
+        // The work this re-run keeps the settings for may have ended, or its
+        // process gone, since the first run: a new process stops nothing now,
+        // so the turn runs as asked.
+        if let Some((asked, ..)) = &deferred {
+            if !initial_process
+                .as_deref()
+                .is_some_and(|process| parked_with_background_work(adapter.as_ref(), process))
+            {
+                return Box::pin(self.run_retained_codex_process(
+                    supervisor,
+                    runtime_id,
+                    adapter,
+                    &as_asked(asked),
+                    events,
+                    interactions,
+                    trace,
+                    None,
+                ))
+                .await;
+            }
+        }
         // Checked before anything is prepared: a continuation never starts,
         // replaces or prompts a process.
         if request.continuation
@@ -4419,7 +4546,10 @@ impl AgentRuntime {
         for (name, value) in &request.environment {
             spec.environment.insert(name.into(), value.expose().into());
         }
-        trace.record(StartupStage::CommandPrepared);
+        // A re-run's stages were already recorded by the run before it.
+        if deferred.is_none() {
+            trace.record(StartupStage::CommandPrepared);
+        }
         if let Some(sandbox) = &request.sandbox {
             let context = SandboxContext {
                 provider,
@@ -4429,7 +4559,9 @@ impl AgentRuntime {
                 _ = request.cancellation.cancelled() => return Err(RuntimeError::Cancelled { provider }),
                 prepared = sandbox.prepare(context, spec) => prepared?,
             };
-            trace.record(StartupStage::SandboxPrepared);
+            if deferred.is_none() {
+                trace.record(StartupStage::SandboxPrepared);
+            }
         }
         let capabilities = self.transport.capabilities();
         if provider != Provider::OpenCode
@@ -4450,8 +4582,9 @@ impl AgentRuntime {
                 message: format!("retained {provider} requires complete process-tree termination"),
             });
         }
-        // A Claude process switches model, effort and permission mode in
-        // place, so they are left out of what decides on a new process.
+        // A Claude process switches model, effort, Fast mode, ultracode and
+        // permission mode in place, so they are left out of what decides on a
+        // new process.
         let claude_live =
             (provider == Provider::Claude).then(|| ClaudeLiveSettings::from_args(&spec.args));
         let fingerprint = RetainedCodexFingerprint {
@@ -4462,12 +4595,12 @@ impl AgentRuntime {
             } else {
                 request.model.clone()
             },
-            // Turning thinking off, or ultracode on, still needs a new one.
+            // Turning thinking off still needs a new one.
             reasoning: if claude_live.is_some() {
                 request
                     .reasoning
                     .clone()
-                    .filter(|reasoning| matches!(reasoning.as_str(), "off" | "ultracode"))
+                    .filter(|reasoning| reasoning == "off")
             } else {
                 request.reasoning.clone()
             },
@@ -4490,46 +4623,115 @@ impl AgentRuntime {
         };
 
         let mut settings_switch = None;
+        // This turn on the process's own model, reasoning and auto-compaction
+        // policy, when only those would replace a process that still runs
+        // background work.
+        let mut kept_turn = None;
+        // A re-run whose reason to keep the settings went while it prepared.
+        let mut run_as_asked = false;
         let previous = {
             let mut processes = supervisor.inner.processes.lock().await;
-            match processes.get(runtime_id) {
-                Some(process) if process.usable.load(Ordering::Acquire) => {
-                    // A continuation resumes the parked process as it is;
-                    // this turn's settings apply from the next prompt on.
-                    let reuse = if request.continuation {
-                        Ok(Vec::new())
-                    } else if process.fingerprint == fingerprint {
-                        match (&process.claude_settings, &claude_live) {
-                            (Some(settings), Some((wanted, _))) => settings.switch_to(wanted),
-                            _ => Ok(Vec::new()),
-                        }
-                    } else {
-                        Err(describe_restart(&process.fingerprint, &fingerprint))
-                    };
-                    match reuse {
-                        Ok(requests) => {
-                            settings_switch = (!requests.is_empty()).then_some(requests);
-                            None
-                        }
-                        // Never stop background work nobody asked to stop.
-                        Err(change) => {
-                            if let Some(tasks) =
-                                retained_background_tasks(adapter.as_ref(), process)
-                            {
-                                return Err(RuntimeError::RestartWouldStopBackgroundWork {
-                                    provider,
-                                    change,
-                                    tasks,
-                                });
+            if deferred.is_some()
+                && !processes
+                    .get(runtime_id)
+                    .is_some_and(|process| parked_with_background_work(adapter.as_ref(), process))
+            {
+                run_as_asked = true;
+                None
+            } else {
+                match processes.get(runtime_id) {
+                    Some(process) if process.usable.load(Ordering::Acquire) => {
+                        // A continuation resumes the parked process as it is;
+                        // this turn's settings apply from the next prompt on.
+                        let reuse = if request.continuation {
+                            Ok(Vec::new())
+                        } else if process.fingerprint == fingerprint {
+                            match (&process.claude_settings, &claude_live) {
+                                (Some(settings), Some((wanted, _))) => settings.switch_to(wanted),
+                                _ => Ok(Vec::new()),
                             }
-                            processes.remove(runtime_id)
+                        } else {
+                            Err(describe_restart(&process.fingerprint, &fingerprint))
+                        };
+                        match reuse {
+                            Ok(requests) => {
+                                settings_switch = (!requests.is_empty()).then_some(requests);
+                                None
+                            }
+                            // Never stop background work nobody asked to stop.
+                            Err(change) => {
+                                if let Some(tasks) =
+                                    retained_background_tasks(adapter.as_ref(), process)
+                                {
+                                    // A re-run that still does not match reports
+                                    // what the turn itself asked for.
+                                    let (change, tasks) = deferred
+                                        .as_ref()
+                                        .map_or((change, tasks), |(_, change, tasks)| {
+                                            (change.clone(), tasks.clone())
+                                        });
+                                    let kept = (request.keep_background_work && deferred.is_none())
+                                        .then(|| {
+                                            with_retained_turn_settings(
+                                                request,
+                                                &process.fingerprint,
+                                                &fingerprint,
+                                                process.claude_settings.as_ref().zip(
+                                                    claude_live.as_ref().map(|(wanted, _)| wanted),
+                                                ),
+                                            )
+                                        })
+                                        .flatten();
+                                    let Some(kept) = kept else {
+                                        return Err(RuntimeError::RestartWouldStopBackgroundWork {
+                                            provider,
+                                            change,
+                                            tasks,
+                                        });
+                                    };
+                                    kept_turn = Some((kept, change, tasks));
+                                    None
+                                } else {
+                                    processes.remove(runtime_id)
+                                }
+                            }
                         }
                     }
+                    Some(_) => processes.remove(runtime_id),
+                    None => None,
                 }
-                Some(_) => processes.remove(runtime_id),
-                None => None,
             }
         };
+        if run_as_asked {
+            if let Some((asked, ..)) = &deferred {
+                drop(reserved_permit);
+                return Box::pin(self.run_retained_codex_process(
+                    supervisor,
+                    runtime_id,
+                    adapter,
+                    &as_asked(asked),
+                    events,
+                    interactions,
+                    trace,
+                    None,
+                ))
+                .await;
+            }
+        }
+        if let Some((kept, change, tasks)) = kept_turn {
+            drop(reserved_permit);
+            return Box::pin(self.run_retained_codex_process(
+                supervisor,
+                runtime_id,
+                adapter,
+                &kept,
+                events,
+                interactions,
+                trace,
+                Some((request, change, tasks)),
+            ))
+            .await;
+        }
         let mut available_permit = reserved_permit;
         if let Some(previous) = previous {
             // Transfer the slot before teardown. This makes a configuration
@@ -4580,7 +4782,7 @@ impl AgentRuntime {
                         .emit(TurnEvent::ProviderProcessStatus {
                             status: crate::ProviderProcessStatus::Checking,
                             message: "Switching the retained Claude process to this turn's \
-                                      model, effort and permission mode."
+                                      model, effort, Fast mode, ultracode and permission mode."
                                 .to_string(),
                         })
                         .await?;
@@ -4881,6 +5083,23 @@ impl AgentRuntime {
         let retained = if let Some(existing) = existing {
             existing
         } else {
+            // The kept process went (it failed its check, or was retired), and
+            // its work with it: a new one stops nothing, so it starts as asked.
+            if let Some((asked, ..)) = &deferred {
+                // Its capacity goes back to the pool for that run to take.
+                drop(available_permit);
+                return Box::pin(self.run_retained_codex_process(
+                    supervisor,
+                    runtime_id,
+                    adapter,
+                    &as_asked(asked),
+                    events,
+                    interactions,
+                    trace,
+                    None,
+                ))
+                .await;
+            }
             if available_permit.is_none() {
                 if let Some(initial) = &initial_process {
                     available_permit = initial.permit.lock().await.take();
@@ -5040,6 +5259,14 @@ impl AgentRuntime {
             runtime_id: runtime_id.clone(),
             process: Arc::clone(&retained),
         };
+        // A re-run reaching here has its kept process (a new one runs as
+        // asked): say what waits, and for what. Cleanup is armed, so a
+        // failure to tell the caller ends the turn like any other failure.
+        if let Some((_, change, tasks)) = deferred {
+            events
+                .emit(TurnEvent::SettingsDeferred { change, tasks })
+                .await?;
+        }
         let mut io_guard = retained.io.lock().await;
         let io = io_guard.as_mut().ok_or_else(|| RuntimeError::Protocol {
             provider,
@@ -7008,6 +7235,7 @@ mod tests {
             effort: effort.map(str::to_owned),
             permission_mode: Some(mode.to_owned()),
             fast_mode: None,
+            ultracode: None,
         }
     }
 
@@ -7093,7 +7321,7 @@ mod tests {
             settings
                 .switch_to(&live(None, None, "bypassPermissions"))
                 .map(|requests| requests.len()),
-            Ok(4)
+            Ok(5)
         );
     }
 
@@ -7118,7 +7346,7 @@ mod tests {
             command(&[
                 "--print",
                 "--settings",
-                r#"{"ultracode":true,"fastMode":true}"#
+                r#"{"ultracode":true,"fastMode":true,"model":"x"}"#
             ]),
             plain
         );
@@ -7126,9 +7354,9 @@ mod tests {
             command(&[
                 "--print",
                 "--settings",
-                r#"{"ultracode":true,"fastMode":true}"#
+                r#"{"ultracode":true,"fastMode":true,"model":"x"}"#
             ]),
-            command(&["--print", "--settings", r#"{"ultracode":true}"#])
+            command(&["--print", "--settings", r#"{"model":"x"}"#])
         );
 
         let (settings, _) = ClaudeLiveSettings::from_args(&claude_args(&[
@@ -7162,6 +7390,8 @@ mod tests {
                     "settings": {"effortLevel": null}}),
                 serde_json::json!({"subtype": "apply_flag_settings",
                     "settings": {"fastMode": null}}),
+                serde_json::json!({"subtype": "apply_flag_settings",
+                    "settings": {"ultracode": null}}),
                 serde_json::json!({"subtype": "set_permission_mode", "mode": "manual"}),
             ])
         );
@@ -7175,6 +7405,201 @@ mod tests {
             process.switch_to(&live(None, None, "manual")),
             Err("the default Fast mode".to_owned())
         );
+    }
+
+    #[test]
+    fn claude_ultracode_switches_in_place_and_does_not_decide_on_a_new_process() {
+        let command = |args: &[&str]| {
+            let mut spec = CommandSpec::new("claude");
+            spec.args = claude_args(args);
+            retained_fingerprint_command(Provider::Claude, spec).args
+        };
+        assert_eq!(
+            command(&[
+                "--print",
+                "--effort",
+                "xhigh",
+                "--settings",
+                r#"{"ultracode":true}"#
+            ]),
+            command(&["--print", "--effort", "high"])
+        );
+
+        let ultra = |on: Option<bool>, effort| ClaudeLiveSettings {
+            ultracode: on,
+            ..live(None, Some(effort), "manual")
+        };
+        let flag = |value: serde_json::Value| {
+            serde_json::json!({"subtype": "apply_flag_settings",
+                "settings": {"ultracode": value}})
+        };
+        let effort = |level: &str| {
+            serde_json::json!({"subtype": "apply_flag_settings",
+                "settings": {"effortLevel": level}})
+        };
+        let launched = claude_process_settings(&[
+            "--permission-mode",
+            "manual",
+            "--effort",
+            "xhigh",
+            "--settings",
+            r#"{"ultracode":true}"#,
+        ]);
+        assert_eq!(launched.launch.ultracode, Some(true));
+        assert_eq!(
+            launched.switch_to(&ultra(Some(true), "xhigh")),
+            Ok(Vec::new())
+        );
+        // Clearing the setting would keep the launch's value, so leaving
+        // ultracode turns it off explicitly.
+        assert_eq!(
+            launched.switch_to(&ultra(None, "high")),
+            Ok(vec![effort("high"), flag(serde_json::json!(false))])
+        );
+        launched.set_current(Some(ultra(None, "high")));
+        assert_eq!(
+            launched.switch_to(&ultra(Some(true), "xhigh")),
+            Ok(vec![effort("xhigh"), flag(serde_json::json!(true))])
+        );
+
+        // Launched without it, leaving ultracode clears the applied value,
+        // which restores what such a launch has.
+        let plain = claude_process_settings(&["--permission-mode", "manual", "--effort", "high"]);
+        assert_eq!(
+            plain.switch_to(&ultra(Some(true), "xhigh")),
+            Ok(vec![effort("xhigh"), flag(serde_json::json!(true))])
+        );
+        plain.set_current(Some(ultra(Some(true), "xhigh")));
+        assert_eq!(
+            plain.switch_to(&ultra(None, "high")),
+            Ok(vec![effort("high"), flag(serde_json::Value::Null)])
+        );
+        // After a failed switch it is unknown, so it is sent again.
+        launched.set_current(None);
+        assert!(launched
+            .switch_to(&ultra(None, "high"))
+            .unwrap()
+            .contains(&flag(serde_json::json!(false))));
+    }
+
+    #[test]
+    fn only_model_reasoning_and_compaction_are_deferred_to_keep_background_work() {
+        let fingerprint = |request: &TurnRequest| RetainedCodexFingerprint {
+            command: CommandSpec::new("codex"),
+            working_directory: request.working_directory.clone(),
+            model: request.model.clone(),
+            reasoning: request.reasoning.clone(),
+            permission_mode: request.permission_mode.clone(),
+            harness_options: request.harness_options.clone(),
+            launch_context: request.launch_context.clone(),
+            auto_compaction: request.auto_compaction,
+            required_sandbox_capabilities: request.required_sandbox_capabilities,
+        };
+        let mut running = TurnRequest::new(Provider::Codex, ".", "first");
+        running.model = Some("gpt-5".into());
+        running.reasoning = Some("high".into());
+        let mut wanted = TurnRequest::new(Provider::Codex, ".", "second");
+        wanted.model = Some("gpt-5-mini".into());
+        wanted.reasoning = Some("low".into());
+        wanted.auto_compaction = crate::AutoCompactionPolicy::Automatic;
+        wanted.keep_background_work = true;
+
+        let kept = with_retained_turn_settings(
+            &wanted,
+            &fingerprint(&running),
+            &fingerprint(&wanted),
+            None,
+        )
+        .expect("thinking and compaction are deferred");
+        assert_eq!(kept.prompt, "second");
+        assert_eq!(kept.model.as_deref(), Some("gpt-5"));
+        assert_eq!(kept.reasoning.as_deref(), Some("high"));
+        assert_eq!(
+            kept.auto_compaction,
+            crate::AutoCompactionPolicy::ProviderDefault
+        );
+
+        // Anything that decides what the agent can reach is never deferred.
+        let mut stricter = wanted.clone();
+        stricter.permission_mode = crate::PermissionMode::Plan;
+        assert!(with_retained_turn_settings(
+            &stricter,
+            &fingerprint(&running),
+            &fingerprint(&stricter),
+            None,
+        )
+        .is_none());
+        let mut elsewhere = wanted.clone();
+        elsewhere.working_directory = "/elsewhere".into();
+        assert!(with_retained_turn_settings(
+            &elsewhere,
+            &fingerprint(&running),
+            &fingerprint(&elsewhere),
+            None,
+        )
+        .is_none());
+
+        // Claude's fingerprint leaves out the model and effort: they come from
+        // the process's live settings.
+        let process = claude_process_settings(&[
+            "--permission-mode",
+            "manual",
+            "--model",
+            "opus",
+            "--effort",
+            "high",
+        ]);
+        let mut claude = TurnRequest::new(Provider::Claude, ".", "second");
+        claude.model = None;
+        claude.reasoning = None;
+        let defaults = live(None, None, "manual");
+        let kept = with_retained_turn_settings(
+            &claude,
+            &fingerprint(&claude),
+            &fingerprint(&claude),
+            Some((&process, &defaults)),
+        )
+        .expect("back to the defaults waits for the work");
+        assert_eq!(kept.model.as_deref(), Some("opus"));
+        assert_eq!(kept.reasoning.as_deref(), Some("high"));
+        // A switch the process can make is left alone.
+        let mut sonnet = claude.clone();
+        sonnet.model = Some("sonnet".into());
+        let kept = with_retained_turn_settings(
+            &sonnet,
+            &fingerprint(&sonnet),
+            &fingerprint(&sonnet),
+            Some((&process, &live(Some("sonnet"), None, "manual"))),
+        )
+        .unwrap();
+        assert_eq!(kept.model.as_deref(), Some("sonnet"));
+        assert_eq!(kept.reasoning.as_deref(), Some("high"));
+        // Turning thinking off keeps the process's effort, ultracode included.
+        let mut off = claude.clone();
+        off.reasoning = Some("off".into());
+        let mut not_off = fingerprint(&off);
+        not_off.reasoning = None;
+        process.set_current(Some(ClaudeLiveSettings {
+            ultracode: Some(true),
+            ..live(Some("opus"), Some("xhigh"), "manual")
+        }));
+        let kept = with_retained_turn_settings(
+            &off,
+            &not_off,
+            &fingerprint(&off),
+            Some((&process, &live(Some("opus"), None, "manual"))),
+        )
+        .unwrap();
+        assert_eq!(kept.reasoning.as_deref(), Some("ultracode"));
+        // After a failed switch the live settings are unknown.
+        process.set_current(None);
+        assert!(with_retained_turn_settings(
+            &claude,
+            &fingerprint(&claude),
+            &fingerprint(&claude),
+            Some((&process, &defaults)),
+        )
+        .is_none());
     }
 
     #[test]
