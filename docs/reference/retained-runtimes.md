@@ -109,6 +109,16 @@ short grace for Claude's answer, then expires after the idle timeout. Adapters o
 `AgentAdapter::retained_interrupt_settled` and `retained_background_work`. An
 interrupt that is not confirmed within three seconds retires the process.
 
+`AgentRuntime::parked_background_tasks` lists the background tasks a parked
+process still runs. If that process ends anyway (it exits or is killed, it
+writes output the runtime cannot read, or a turn resuming a different
+provider session replaces it), its tasks end with it and the provider never
+reports them again. `AgentRuntime::subscribe_parked_process_ends` announces
+each such end as a `ParkedProcessEnded` with the runtime, the task ids and a
+`ParkedProcessEndReason` (`describe()` gives it in words), so an application
+can settle those tasks and tell whoever waits on them. Disposing a runtime is
+not announced: the caller asked for it.
+
 Use `RuntimeHandle::configuration_impact` before presenting a live setting
 change. The compatibility driver applies per-turn model, reasoning, permission,
 harness, launch-context, environment, and timeout changes live. Provider,

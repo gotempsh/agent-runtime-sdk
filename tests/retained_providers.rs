@@ -9,8 +9,8 @@ use temps_agent_runtime::{
         CompactionInput, InProcessRuntimeClient, RuntimeClient, RuntimeEvent, RuntimeHandle,
         RuntimeInvocationKind, RuntimeSpec, TurnHandle, TurnInput,
     },
-    AgentRuntime, AgentTaskActivityKind, PermissionMode, Provider, ProviderProcessRetention,
-    TurnEvent, TurnResult,
+    AgentRuntime, AgentTaskActivityKind, ParkedProcessEndReason, ParkedProcessEnded,
+    PermissionMode, Provider, ProviderProcessRetention, TurnEvent, TurnResult,
 };
 use tokio::task::JoinHandle;
 
@@ -64,6 +64,13 @@ def shell(follow_up):
   emit({'type':'system','subtype':'init','session_id':'fixture-session'})
   emit({'type':'assistant','parent_tool_use_id':None,'message':{'content':[{'type':'text','text':'SHELL-FOLLOWUP'}]}})
   result('SHELL-FOLLOWUP')
+def garbled_shell():
+ # A background shell whose process then writes something that is not a
+ # stream-JSON record while parked.
+ log('shell-start')
+ while not os.path.exists(RELEASE):time.sleep(.02)
+ with LOCK:print('this is not stream-json',flush=True)
+ log('garbled')
 def two_shells():
  # Tests end silently on RELEASE (Claude does not answer), while the dev
  # server keeps running until RELEASE+'-2'.
@@ -115,6 +122,12 @@ for line in sys.stdin:
    emit({'type':'system','subtype':'task_started','task_id':'sh-dev','tool_use_id':'toolu_d','description':'Run dev server','task_type':'local_bash','is_backgrounded':True})
    result('STARTED-BOTH')
    thread=threading.Thread(target=two_shells,daemon=True)
+   BACKGROUND.append(thread);thread.start()
+   continue
+  if prompt=='spawn-shell-garbled':
+   emit({'type':'system','subtype':'task_started','task_id':'sh-1','tool_use_id':'toolu_sh','description':'Run dev server','task_type':'local_bash','is_backgrounded':True})
+   result('SERVING')
+   thread=threading.Thread(target=garbled_shell,daemon=True)
    BACKGROUND.append(thread);thread.start()
    continue
   if prompt=='spawn-shell':
@@ -724,6 +737,93 @@ async fn claude_background_shell_does_not_hold_its_turn() {
         "the shell survived the new turn"
     );
     f.dispose().await;
+}
+
+/// The next announced end of a parked process, within a bound.
+async fn next_parked_end(
+    ends: &mut tokio::sync::broadcast::Receiver<ParkedProcessEnded>,
+) -> ParkedProcessEnded {
+    tokio::time::timeout(Duration::from_secs(10), ends.recv())
+        .await
+        .expect("the parked process's end must be announced")
+        .unwrap()
+}
+
+#[tokio::test]
+async fn claude_a_parked_process_that_exits_announces_the_work_it_took_with_it() {
+    let f = Fixture::new(true, Duration::from_secs(30)).await;
+    let mut ends = f.runtime.subscribe_parked_process_ends();
+    assert_eq!(f.turn("one", "spawn-shell").await.unwrap().text, "SERVING");
+    f.wait_for_log("shell-start").await;
+    let runtime_id = RuntimeId::new("claude-native").unwrap();
+    assert_eq!(
+        f.runtime.parked_background_tasks(&runtime_id).await,
+        vec!["sh-1".to_string()]
+    );
+
+    // The process dies while parked (killed, out of memory): the shell dies
+    // with it, and Claude will never report that.
+    let pid = f.spawns()[0];
+    let killed = std::process::Command::new("kill")
+        .args(["-9", &pid.to_string()])
+        .status()
+        .unwrap();
+    assert!(killed.success());
+    let ended = next_parked_end(&mut ends).await;
+    assert_eq!(
+        ended,
+        ParkedProcessEnded {
+            runtime_id: runtime_id.clone(),
+            task_ids: vec!["sh-1".to_string()],
+            reason: ParkedProcessEndReason::Exited,
+        }
+    );
+    assert_eq!(
+        f.runtime.parked_background_tasks(&runtime_id).await.len(),
+        0,
+        "nothing is parked any more"
+    );
+    assert_eq!(f.logged("shell-finished"), 0);
+
+    // The next turn starts a new process.
+    assert_eq!(f.turn("two", "second").await.unwrap().text, "reply:second");
+    assert_eq!(f.spawns().len(), 2, "{:?}", f.events());
+    f.dispose().await;
+}
+
+#[tokio::test]
+async fn claude_a_parked_process_retired_for_unreadable_output_announces_its_work() {
+    let f = Fixture::new(true, Duration::from_secs(30)).await;
+    let mut ends = f.runtime.subscribe_parked_process_ends();
+    assert_eq!(
+        f.turn("one", "spawn-shell-garbled").await.unwrap().text,
+        "SERVING"
+    );
+    f.wait_for_log("shell-start").await;
+    f.release_background();
+    let ended = next_parked_end(&mut ends).await;
+    assert_eq!(ended.task_ids, vec!["sh-1".to_string()]);
+    assert_eq!(ended.reason, ParkedProcessEndReason::UnreadableOutput);
+    assert_eq!(
+        ended.reason.describe(),
+        "the agent's process wrote output that could not be read"
+    );
+    f.dispose().await;
+}
+
+#[tokio::test]
+async fn claude_disposing_a_parked_process_is_not_announced() {
+    let f = Fixture::new(true, Duration::from_secs(30)).await;
+    let mut ends = f.runtime.subscribe_parked_process_ends();
+    assert_eq!(f.turn("one", "spawn-shell").await.unwrap().text, "SERVING");
+    f.wait_for_log("shell-start").await;
+    // The caller asked for this, so it already knows the work stopped.
+    f.dispose().await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(matches!(
+        ends.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
 }
 
 #[tokio::test]

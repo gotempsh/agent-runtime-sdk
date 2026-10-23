@@ -167,10 +167,55 @@ struct CodexProcessSupervisorInner {
     processes: AsyncMutex<HashMap<crate::lifecycle::RuntimeId, Arc<RetainedCodexProcess>>>,
     /// Runtimes whose parked process started answering background work.
     follow_ups: tokio::sync::broadcast::Sender<crate::lifecycle::RuntimeId>,
+    /// Parked processes that ended with background work still running.
+    parked_ends: tokio::sync::broadcast::Sender<ParkedProcessEnded>,
 }
 
 /// Announcements a slow subscriber may fall behind by before missing some.
 const FOLLOW_UP_ANNOUNCEMENTS: usize = 64;
+
+/// A parked process that ended while background work it started was still
+/// running, taking that work with it.
+///
+/// Announced by [`AgentRuntime::subscribe_parked_process_ends`]. Nobody asked
+/// for this: [`crate::retained::RuntimeClient::dispose`] and a configuration
+/// change the caller requested are not announced, and a process retires on
+/// its own only once its background work has finished. The provider never
+/// reports these tasks' end, so this is the only notice that they stopped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParkedProcessEnded {
+    /// The runtime whose parked process ended.
+    pub runtime_id: crate::lifecycle::RuntimeId,
+    /// Provider ids of the background tasks it was still running, as
+    /// [`AgentRuntime::parked_background_tasks`] reported them.
+    pub task_ids: Vec<String>,
+    /// Why the process ended.
+    pub reason: ParkedProcessEndReason,
+}
+
+/// Why a parked process ended with its background work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ParkedProcessEndReason {
+    /// The provider process exited, or closed its output or input.
+    Exited,
+    /// The process wrote output the runtime could not read, so it was retired.
+    UnreadableOutput,
+    /// A turn resumed a different provider session, which replaced it.
+    Replaced,
+}
+
+impl ParkedProcessEndReason {
+    /// The reason in words, for a message about the stopped tasks.
+    #[must_use]
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::Exited => "the agent's process exited",
+            Self::UnreadableOutput => "the agent's process wrote output that could not be read",
+            Self::Replaced => "a turn resumed a different session in a new process",
+        }
+    }
+}
 
 impl CodexProcessSupervisor {
     fn new(config: ProviderProcessRetention) -> Self {
@@ -180,6 +225,7 @@ impl CodexProcessSupervisor {
                 permits: Arc::new(Semaphore::new(config.max_processes)),
                 processes: AsyncMutex::new(HashMap::new()),
                 follow_ups: tokio::sync::broadcast::channel(FOLLOW_UP_ANNOUNCEMENTS).0,
+                parked_ends: tokio::sync::broadcast::channel(FOLLOW_UP_ANNOUNCEMENTS).0,
             }),
         }
     }
@@ -190,6 +236,25 @@ impl CodexProcessSupervisor {
             process.terminate().await?;
         }
         Ok(())
+    }
+
+    /// Tell subscribers that `runtime_id`'s parked process ended with
+    /// `task_ids` still running. Nothing to tell without tasks.
+    fn announce_parked_end(
+        &self,
+        runtime_id: &crate::lifecycle::RuntimeId,
+        task_ids: Vec<String>,
+        reason: ParkedProcessEndReason,
+    ) {
+        if task_ids.is_empty() {
+            return;
+        }
+        // No subscriber is fine: nobody is tracking these tasks.
+        let _ = self.inner.parked_ends.send(ParkedProcessEnded {
+            runtime_id: runtime_id.clone(),
+            task_ids,
+            reason,
+        });
     }
 
     async fn remove_if_same(
@@ -617,7 +682,10 @@ async fn switch_claude_settings(
                     return Err(error.chars().take(200).collect());
                 }
             } else if process.handoff.pending() {
-                if !park_frame(adapter, &process.handoff, provider, io, &line).await {
+                if park_frame(adapter, &process.handoff, provider, io, &line)
+                    .await
+                    .is_err()
+                {
                     return Err("background output could not be read".to_owned());
                 }
             } else if unsolicited.len() < MAX_SWITCH_UNSOLICITED_FRAMES {
@@ -1127,6 +1195,18 @@ impl RetainedCodexProcess {
             .is_some_and(|state| answered_while_parked || adapter.retained_follow_up_pending(state))
     }
 
+    /// Background tasks this process still runs while parked, as `adapter`
+    /// tracks them. Empty unless it is parked with background work.
+    fn parked_task_ids(&self, adapter: &dyn AgentAdapter) -> Vec<String> {
+        self.handoff
+            .inherited
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|state| adapter.retained_background_task_ids(state))
+            .unwrap_or_default()
+    }
+
     /// Mark the process unusable unless a turn claimed it after `generation`.
     ///
     /// Returns whether the caller now owns terminating it.
@@ -1489,24 +1569,32 @@ async fn supervise_parked_retained_process(
     let mut idle_since: Option<tokio::time::Instant> = None;
     let mut last_frame = tokio::time::Instant::now();
     let mut announced = false;
-    loop {
-        let healthy = {
+    // Why the process failed, when it did; `None` once its work is done.
+    let failure = loop {
+        let read = {
             let mut io = retained.io.lock().await;
             if !current(&retained) {
                 return;
             }
             let Some(io) = io.as_mut() else { return };
             match read_idle_retained_line(&mut io.reader, max_event_line_bytes).await {
-                None => true,
+                None => Ok(()),
                 Some(Ok(Some(line))) => {
                     last_frame = tokio::time::Instant::now();
                     park_frame(adapter.as_ref(), &retained.handoff, provider, io, &line).await
                 }
-                Some(Ok(None) | Err(_)) => false,
+                Some(Ok(None)) => Err(ParkedProcessEndReason::Exited),
+                Some(Err(error)) => Err(match error.kind() {
+                    // An oversized or never-completed frame.
+                    std::io::ErrorKind::InvalidData | std::io::ErrorKind::TimedOut => {
+                        ParkedProcessEndReason::UnreadableOutput
+                    }
+                    _ => ParkedProcessEndReason::Exited,
+                }),
             }
         };
-        if !healthy {
-            break;
+        if let Err(reason) = read {
+            break Some(reason);
         }
         if !announced
             && retained
@@ -1536,38 +1624,44 @@ async fn supervise_parked_retained_process(
             .elapsed()
             >= idle_timeout
         {
-            break;
+            break None;
         }
-    }
+    };
     // Output nobody claimed is dropped with the process; the provider's own
     // session transcript still records the conversation.
     if retained.retire_if_unclaimed(generation).await {
+        // Read before terminating: the tasks the process was still running
+        // end with it, and nothing else will ever report that.
+        let stopped = failure.map(|reason| (retained.parked_task_ids(adapter.as_ref()), reason));
         supervisor.remove_if_same(&runtime_id, &retained).await;
         let _ = retained.terminate().await;
+        if let Some((task_ids, reason)) = stopped {
+            supervisor.announce_parked_end(&runtime_id, task_ids, reason);
+        }
     }
 }
 
 /// Parse and buffer one frame read from a parked process.
 ///
-/// Returns `false` when the process must be retired.
+/// Returns why the process must be retired, when it must.
 async fn park_frame(
     adapter: &dyn AgentAdapter,
     handoff: &RetainedHandoff,
     provider: Provider,
     io: &mut RetainedCodexIo,
     line: &str,
-) -> bool {
+) -> std::result::Result<(), ParkedProcessEndReason> {
     let (output, follow_up) = {
         let mut inherited = handoff
             .inherited
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(state) = inherited.as_mut() else {
-            return false;
+            return Err(ParkedProcessEndReason::UnreadableOutput);
         };
         match adapter.parse_line(line, state) {
             Ok(output) => (output, adapter.retained_follow_up_pending(state)),
-            Err(_) => return false,
+            Err(_) => return Err(ParkedProcessEndReason::UnreadableOutput),
         }
     };
     let mut writes = output.writes;
@@ -1588,7 +1682,7 @@ async fn park_frame(
                     "Too many requests are waiting for the next turn",
                 ) {
                     Ok(response) => writes.extend(response),
-                    Err(_) => return false,
+                    Err(_) => return Err(ParkedProcessEndReason::UnreadableOutput),
                 }
                 declined = true;
             }
@@ -1599,10 +1693,10 @@ async fn park_frame(
         .await
         .is_err()
     {
-        return false;
+        return Err(ParkedProcessEndReason::Exited);
     }
     write_optional_frames(Some(&mut io.stdin), &output.optional_writes).await;
-    true
+    Ok(())
 }
 
 /// Whether `event` announces an approval or question awaiting an answer.
@@ -2513,6 +2607,24 @@ impl AgentRuntime {
     ) -> tokio::sync::broadcast::Receiver<crate::lifecycle::RuntimeId> {
         match &self.codex_process_retention {
             Some(supervisor) => supervisor.inner.follow_ups.subscribe(),
+            None => tokio::sync::broadcast::channel(1).1,
+        }
+    }
+
+    /// Announces parked processes that ended while background work they
+    /// started was still running, with that work's task ids and why.
+    ///
+    /// A retained turn can end while its background shells keep running in
+    /// the parked process ([`Self::parked_background_tasks`]). If that
+    /// process then exits (it crashed or was killed) or has to be retired,
+    /// the shells end with it and the provider never reports them again:
+    /// subscribe to settle those tasks and tell whoever waits on them.
+    /// Without process retention nothing is ever announced.
+    pub fn subscribe_parked_process_ends(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<ParkedProcessEnded> {
+        match &self.codex_process_retention {
+            Some(supervisor) => supervisor.inner.parked_ends.subscribe(),
             None => tokio::sync::broadcast::channel(1).1,
         }
     }
@@ -4756,7 +4868,13 @@ impl AgentRuntime {
                 if available_permit.is_none() {
                     available_permit = candidate.permit.lock().await.take();
                 }
+                let stopped = candidate.parked_task_ids(adapter.as_ref());
                 candidate.terminate().await?;
+                supervisor.announce_parked_end(
+                    runtime_id,
+                    stopped,
+                    ParkedProcessEndReason::Replaced,
+                );
                 existing = None;
             }
         }

@@ -16,6 +16,14 @@ Versioning and Keep a Changelog conventions.
 
 ### Added
 
+- `AgentRuntime::subscribe_parked_process_ends`: announces a parked retained
+  process that ended while background work it started was still running (it
+  exited or was killed, it wrote output the runtime could not read, or a turn
+  resuming a different session replaced it) as `ParkedProcessEnded {
+  runtime_id, task_ids, reason }`. Before, those tasks ended silently: the
+  provider never reports them, so an application kept showing them as running
+  and an agent waiting on one never heard back. Disposing a runtime is not
+  announced.
 - `TurnInput::keep_background_work` / `TurnRequest::keep_background_work`:
   instead of `RestartWouldStopBackgroundWork`, a turn whose model, reasoning
   or auto-compaction policy would need a new process (for Claude, going back
