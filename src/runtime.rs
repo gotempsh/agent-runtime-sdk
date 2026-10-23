@@ -1227,6 +1227,17 @@ impl RetainedCodexProcess {
         adapter: &dyn AgentAdapter,
     ) -> Option<Vec<String>> {
         let io = self.io.lock().await;
+        self.retire_parked(io.as_ref(), generation, adapter)
+    }
+
+    /// [`Self::retire_parked_if_unclaimed`] for a caller already holding
+    /// the process's I/O, `io`.
+    fn retire_parked(
+        &self,
+        io: Option<&RetainedCodexIo>,
+        generation: u64,
+        adapter: &dyn AgentAdapter,
+    ) -> Option<Vec<String>> {
         if io.is_none() || self.generation.load(Ordering::Acquire) != generation {
             return None;
         }
@@ -1586,15 +1597,16 @@ async fn supervise_parked_retained_process(
     let mut idle_since: Option<tokio::time::Instant> = None;
     let mut last_frame = tokio::time::Instant::now();
     let mut announced = false;
-    // Why the process failed, when it did; `None` once its work is done.
+    // Why the process failed, with the tasks it took along, when it did;
+    // `None` once its work is done.
     let failure = loop {
         let read = {
-            let mut io = retained.io.lock().await;
+            let mut guard = retained.io.lock().await;
             if !current(&retained) {
                 return;
             }
-            let Some(io) = io.as_mut() else { return };
-            match read_idle_retained_line(&mut io.reader, max_event_line_bytes).await {
+            let Some(io) = guard.as_mut() else { return };
+            let read = match read_idle_retained_line(&mut io.reader, max_event_line_bytes).await {
                 None => Ok(()),
                 Some(Ok(Some(line))) => {
                     last_frame = tokio::time::Instant::now();
@@ -1608,10 +1620,16 @@ async fn supervise_parked_retained_process(
                     }
                     _ => ParkedProcessEndReason::Exited,
                 }),
-            }
+            };
+            // Retired before its I/O is let go: a turn waiting to claim the
+            // failed process starts a new one instead of inheriting its tasks.
+            read.map_err(|reason| {
+                let task_ids = retained.retire_parked(guard.as_ref(), generation, adapter.as_ref());
+                (reason, task_ids)
+            })
         };
-        if let Err(reason) = read {
-            break Some(reason);
+        if let Err(failed) = read {
+            break Some(failed);
         }
         if !announced
             && retained
@@ -1646,17 +1664,26 @@ async fn supervise_parked_retained_process(
     };
     // Output nobody claimed is dropped with the process; the provider's own
     // session transcript still records the conversation.
+    let stopped = match failure {
+        Some((reason, Some(task_ids))) => Some((reason, task_ids)),
+        Some((_, None)) => return,
+        None => {
+            if retained
+                .retire_parked_if_unclaimed(generation, adapter.as_ref())
+                .await
+                .is_none()
+            {
+                return;
+            }
+            None
+        }
+    };
+    supervisor.remove_if_same(&runtime_id, &retained).await;
+    let _ = retained.terminate().await;
     // The tasks the process was still running end with it, and nothing else
     // will ever report that.
-    if let Some(task_ids) = retained
-        .retire_parked_if_unclaimed(generation, adapter.as_ref())
-        .await
-    {
-        supervisor.remove_if_same(&runtime_id, &retained).await;
-        let _ = retained.terminate().await;
-        if let Some(reason) = failure {
-            supervisor.announce_parked_end(&runtime_id, task_ids, reason);
-        }
+    if let Some((reason, task_ids)) = stopped {
+        supervisor.announce_parked_end(&runtime_id, task_ids, reason);
     }
 }
 
@@ -9729,5 +9756,61 @@ mod tests {
         assert_eq!(retained.retire_parked_if_unclaimed(0, &adapter).await, None);
         replacement.await.unwrap().unwrap();
         assert_eq!(retained.take_parked_task_ids(&adapter), ["sh-1"]);
+    }
+
+    #[cfg(feature = "claude")]
+    #[tokio::test]
+    async fn a_parked_process_that_exits_is_retired_before_a_waiting_turn_claims_it() {
+        let (_, retained) = parked_claude_process();
+        let supervisor = CodexProcessSupervisor::new(ProviderProcessRetention {
+            max_processes: 1,
+            idle_timeout: Duration::from_secs(30),
+            initialization_timeout: Duration::from_secs(10),
+            active_inactivity_timeout: None,
+            held_task_quiet_timeout: None,
+        });
+        let runtime_id = crate::lifecycle::RuntimeId::new("parked").unwrap();
+        supervisor
+            .inner
+            .processes
+            .lock()
+            .await
+            .insert(runtime_id.clone(), Arc::clone(&retained));
+        let mut ends = supervisor.inner.parked_ends.subscribe();
+
+        // The process's output is already closed. Its supervisor queues for
+        // the I/O first and a turn claiming the process queues behind it;
+        // the lock hands over in that order.
+        let io = retained.io.lock().await;
+        let parked = tokio::spawn(supervise_parked_retained_process(
+            Arc::new(crate::providers::Claude::default()),
+            supervisor.clone(),
+            runtime_id.clone(),
+            Arc::clone(&retained),
+            0,
+            Provider::Claude,
+            Duration::from_secs(30),
+            1024,
+        ));
+        tokio::task::yield_now().await;
+        let claim = {
+            let retained = Arc::clone(&retained);
+            tokio::spawn(async move { retained.claim().await })
+        };
+        tokio::task::yield_now().await;
+        drop(io);
+
+        // The supervisor retired the process before letting go of its I/O,
+        // so the turn starts a new process rather than inheriting a dead one.
+        assert_eq!(claim.await.unwrap(), None);
+        parked.await.unwrap();
+        assert_eq!(
+            ends.try_recv().unwrap(),
+            ParkedProcessEnded {
+                runtime_id,
+                task_ids: vec!["sh-1".to_owned()],
+                reason: ParkedProcessEndReason::Exited,
+            }
+        );
     }
 }
