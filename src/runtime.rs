@@ -181,7 +181,13 @@ const FOLLOW_UP_ANNOUNCEMENTS: usize = 64;
 /// for this: [`crate::retained::RuntimeClient::dispose`] and a configuration
 /// change the caller requested are not announced, and a process retires on
 /// its own only once its background work has finished. The provider never
-/// reports these tasks' end, so this is the only notice that they stopped.
+/// reports these tasks' end, so while the process is parked this is the only
+/// notice that they stopped.
+///
+/// Only a parked process is announced. Once a turn claims the process, its
+/// tasks are that turn's: if the process has died the turn fails, and
+/// [`AgentRuntime::parked_background_tasks`] read after it no longer lists
+/// them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParkedProcessEnded {
     /// The runtime whose parked process ended.
@@ -2665,7 +2671,9 @@ impl AgentRuntime {
     /// process then exits (it crashed or was killed) or has to be retired,
     /// the shells end with it and the provider never reports them again:
     /// subscribe to settle those tasks and tell whoever waits on them.
-    /// Without process retention nothing is ever announced.
+    /// A process a turn has claimed is not announced: compare
+    /// [`Self::parked_background_tasks`] after that turn instead. Without
+    /// process retention nothing is ever announced.
     pub fn subscribe_parked_process_ends(
         &self,
     ) -> tokio::sync::broadcast::Receiver<ParkedProcessEnded> {

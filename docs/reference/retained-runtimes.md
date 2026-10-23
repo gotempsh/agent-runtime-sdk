@@ -118,8 +118,11 @@ each such end as a `ParkedProcessEnded` with the runtime, the task ids and a
 `ParkedProcessEndReason` (`describe()` gives it in words), so an application
 can settle those tasks and tell whoever waits on them. An end is announced
 once, by whichever happened first: a process that exits just as a turn
-replaces it is announced as one or the other, never both. Disposing a runtime
-is not announced: the caller asked for it.
+replaces it is announced as one or the other, never both. Only a parked
+process is announced: once a turn has claimed it, its tasks are that turn's,
+so a turn that fails because the process died reports it, and
+`parked_background_tasks` read after that turn no longer lists them. Disposing
+a runtime is not announced: the caller asked for it.
 
 Use `RuntimeHandle::configuration_impact` before presenting a live setting
 change. The compatibility driver applies per-turn model, reasoning, permission,
