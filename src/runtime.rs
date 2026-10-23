@@ -2677,8 +2677,12 @@ impl AgentRuntime {
     ///
     /// A subscriber more than 64 announcements behind receives
     /// [`tokio::sync::broadcast::error::RecvError::Lagged`] with how many it
-    /// missed; it then rereads [`Self::parked_background_tasks`] for the
-    /// runtimes it tracks to settle what ended meanwhile.
+    /// missed. To catch up it rereads [`Self::parked_background_tasks`] for
+    /// each runtime it tracks that is not running a turn, and settles the
+    /// tasks no longer listed. A running turn owns its process's tasks, so
+    /// the list stays empty until that turn ends: compare then, as after any
+    /// turn. An announcement for a task it already settled this way can
+    /// still arrive, so settling a task twice must be harmless.
     pub fn subscribe_parked_process_ends(
         &self,
     ) -> tokio::sync::broadcast::Receiver<ParkedProcessEnded> {
