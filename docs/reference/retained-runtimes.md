@@ -116,8 +116,10 @@ provider session replaces it), its tasks end with it and the provider never
 reports them again. `AgentRuntime::subscribe_parked_process_ends` announces
 each such end as a `ParkedProcessEnded` with the runtime, the task ids and a
 `ParkedProcessEndReason` (`describe()` gives it in words), so an application
-can settle those tasks and tell whoever waits on them. Disposing a runtime is
-not announced: the caller asked for it.
+can settle those tasks and tell whoever waits on them. An end is announced
+once, by whichever happened first: a process that exits just as a turn
+replaces it is announced as one or the other, never both. Disposing a runtime
+is not announced: the caller asked for it.
 
 Use `RuntimeHandle::configuration_impact` before presenting a live setting
 change. The compatibility driver applies per-turn model, reasoning, permission,
