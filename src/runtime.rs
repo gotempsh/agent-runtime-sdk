@@ -9758,10 +9758,11 @@ mod tests {
         assert_eq!(retained.take_parked_task_ids(&adapter), ["sh-1"]);
     }
 
+    /// A pool holding `retained`, parked as runtime `parked`.
     #[cfg(feature = "claude")]
-    #[tokio::test]
-    async fn a_parked_process_that_exits_is_retired_before_a_waiting_turn_claims_it() {
-        let (_, retained) = parked_claude_process();
+    async fn pool_with(
+        retained: &Arc<RetainedCodexProcess>,
+    ) -> (CodexProcessSupervisor, crate::lifecycle::RuntimeId) {
         let supervisor = CodexProcessSupervisor::new(ProviderProcessRetention {
             max_processes: 1,
             idle_timeout: Duration::from_secs(30),
@@ -9775,23 +9776,41 @@ mod tests {
             .processes
             .lock()
             .await
-            .insert(runtime_id.clone(), Arc::clone(&retained));
+            .insert(runtime_id.clone(), Arc::clone(retained));
+        (supervisor, runtime_id)
+    }
+
+    /// Supervise `retained` while parked, as a turn that yields it does.
+    #[cfg(feature = "claude")]
+    fn supervise_parked(
+        supervisor: &CodexProcessSupervisor,
+        runtime_id: &crate::lifecycle::RuntimeId,
+        retained: &Arc<RetainedCodexProcess>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(supervise_parked_retained_process(
+            Arc::new(crate::providers::Claude::default()),
+            supervisor.clone(),
+            runtime_id.clone(),
+            Arc::clone(retained),
+            0,
+            Provider::Claude,
+            Duration::from_secs(30),
+            1024,
+        ))
+    }
+
+    #[cfg(feature = "claude")]
+    #[tokio::test]
+    async fn a_parked_process_that_exits_is_retired_before_a_waiting_turn_claims_it() {
+        let (_, retained) = parked_claude_process();
+        let (supervisor, runtime_id) = pool_with(&retained).await;
         let mut ends = supervisor.inner.parked_ends.subscribe();
 
         // The process's output is already closed. Its supervisor queues for
         // the I/O first and a turn claiming the process queues behind it;
         // the lock hands over in that order.
         let io = retained.io.lock().await;
-        let parked = tokio::spawn(supervise_parked_retained_process(
-            Arc::new(crate::providers::Claude::default()),
-            supervisor.clone(),
-            runtime_id.clone(),
-            Arc::clone(&retained),
-            0,
-            Provider::Claude,
-            Duration::from_secs(30),
-            1024,
-        ));
+        let parked = supervise_parked(&supervisor, &runtime_id, &retained);
         tokio::task::yield_now().await;
         let claim = {
             let retained = Arc::clone(&retained);
@@ -9812,5 +9831,75 @@ mod tests {
                 reason: ParkedProcessEndReason::Exited,
             }
         );
+        // A turn that found the process in the pool before it was retired,
+        // and replaces it now, has nothing left to announce.
+        retained.terminate().await.unwrap();
+        assert_eq!(
+            retained
+                .take_parked_task_ids(&crate::providers::Claude::default())
+                .len(),
+            0
+        );
+    }
+
+    #[cfg(feature = "claude")]
+    #[tokio::test]
+    async fn a_turn_that_claims_a_parked_process_first_owns_its_tasks() {
+        let (_, retained) = parked_claude_process();
+        let (supervisor, runtime_id) = pool_with(&retained).await;
+        let mut ends = supervisor.inner.parked_ends.subscribe();
+
+        // A turn claiming the process queues for the I/O before its
+        // supervisor does, whose read would find the output closed.
+        let io = retained.io.lock().await;
+        let claim = {
+            let retained = Arc::clone(&retained);
+            tokio::spawn(async move { retained.claim().await })
+        };
+        tokio::task::yield_now().await;
+        let parked = supervise_parked(&supervisor, &runtime_id, &retained);
+        tokio::task::yield_now().await;
+        drop(io);
+
+        // The turn owns the process and its tasks now: if the process is
+        // dead the turn fails, and its tasks are no longer parked.
+        assert_eq!(claim.await.unwrap(), Some(1));
+        parked.await.unwrap();
+        assert!(matches!(
+            ends.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        assert!(retained.handoff.take_inherited().is_some());
+    }
+
+    #[cfg(feature = "claude")]
+    #[tokio::test]
+    async fn a_replacement_that_begins_while_a_supervisor_waits_announces_alone() {
+        let (adapter, retained) = parked_claude_process();
+        let (supervisor, runtime_id) = pool_with(&retained).await;
+        let mut ends = supervisor.inner.parked_ends.subscribe();
+
+        // The supervisor queues for the I/O, whose read would find the
+        // output closed, and a turn resuming another session starts
+        // terminating the process behind it.
+        let io = retained.io.lock().await;
+        let parked = supervise_parked(&supervisor, &runtime_id, &retained);
+        tokio::task::yield_now().await;
+        let replacement = {
+            let retained = Arc::clone(&retained);
+            tokio::spawn(async move { retained.terminate().await })
+        };
+        tokio::task::yield_now().await;
+        drop(io);
+
+        // Terminating moved the generation on before the supervisor read, so
+        // it ends without a word, and the replacement announces the tasks.
+        parked.await.unwrap();
+        replacement.await.unwrap().unwrap();
+        assert!(matches!(
+            ends.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        assert_eq!(retained.take_parked_task_ids(&adapter), ["sh-1"]);
     }
 }
