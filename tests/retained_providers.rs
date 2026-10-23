@@ -7,10 +7,10 @@ use temps_agent_runtime::{
     providers::Claude,
     retained::{
         CompactionInput, InProcessRuntimeClient, RuntimeClient, RuntimeEvent, RuntimeHandle,
-        RuntimeInvocationKind, RuntimeSpec, TurnHandle, TurnInput,
+        RuntimeInvocationKind, RuntimeSpec, RuntimeTurnExecutor, TurnHandle, TurnInput,
     },
-    AgentRuntime, AgentTaskActivityKind, ParkedProcessEndReason, ParkedProcessEnded,
-    PermissionMode, Provider, ProviderProcessRetention, TurnEvent, TurnResult,
+    AgentRuntime, AgentTaskActivityKind, NoopEventSink, ParkedProcessEndReason, ParkedProcessEnded,
+    PermissionMode, Provider, ProviderProcessRetention, TurnEvent, TurnRequest, TurnResult,
 };
 use tokio::task::JoinHandle;
 
@@ -148,7 +148,7 @@ with LOCK:
 ";
 
 struct Fixture {
-    _dir: tempfile::TempDir,
+    dir: tempfile::TempDir,
     log: std::path::PathBuf,
     release: std::path::PathBuf,
     runtime: AgentRuntime,
@@ -239,7 +239,7 @@ impl Fixture {
             .await
             .unwrap();
         Self {
-            _dir: dir,
+            dir,
             log,
             release,
             runtime,
@@ -807,6 +807,40 @@ async fn claude_a_parked_process_retired_for_unreadable_output_announces_its_wor
     assert_eq!(
         ended.reason.describe(),
         "the agent's process wrote output that could not be read"
+    );
+    f.dispose().await;
+}
+
+#[tokio::test]
+async fn claude_a_parked_process_replaced_by_another_session_announces_its_work() {
+    let f = Fixture::new(true, Duration::from_secs(30)).await;
+    let mut ends = f.runtime.subscribe_parked_process_ends();
+    assert_eq!(f.turn("one", "spawn-shell").await.unwrap().text, "SERVING");
+    f.wait_for_log("shell-start").await;
+    let runtime_id = RuntimeId::new("claude-native").unwrap();
+
+    // A turn for this runtime resumes a different provider session: the
+    // parked process cannot serve it, so it is replaced, shell and all.
+    let mut request = TurnRequest::new(Provider::Claude, f.dir.path(), "second");
+    request.session_id = Some("other-session".into());
+    let result = RuntimeTurnExecutor::execute_retained(
+        &f.runtime,
+        &runtime_id,
+        request,
+        &NoopEventSink,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.text, "reply:second");
+    assert_eq!(f.spawns().len(), 2, "{:?}", f.events());
+    assert_eq!(
+        next_parked_end(&mut ends).await,
+        ParkedProcessEnded {
+            runtime_id,
+            task_ids: vec!["sh-1".to_string()],
+            reason: ParkedProcessEndReason::Replaced,
+        }
     );
     f.dispose().await;
 }

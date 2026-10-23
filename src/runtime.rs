@@ -4868,13 +4868,17 @@ impl AgentRuntime {
                 if available_permit.is_none() {
                     available_permit = candidate.permit.lock().await.take();
                 }
-                let stopped = candidate.parked_task_ids(adapter.as_ref());
-                candidate.terminate().await?;
+                let terminated = candidate.terminate().await;
+                // Read only once `terminate` holds the I/O: a frame the parked
+                // supervisor was still parsing may have finished a task.
+                // Removed from the pool, the process's tasks are gone even
+                // when terminating it failed.
                 supervisor.announce_parked_end(
                     runtime_id,
-                    stopped,
+                    candidate.parked_task_ids(adapter.as_ref()),
                     ParkedProcessEndReason::Replaced,
                 );
+                terminated?;
                 existing = None;
             }
         }
