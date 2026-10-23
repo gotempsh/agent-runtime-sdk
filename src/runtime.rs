@@ -167,10 +167,61 @@ struct CodexProcessSupervisorInner {
     processes: AsyncMutex<HashMap<crate::lifecycle::RuntimeId, Arc<RetainedCodexProcess>>>,
     /// Runtimes whose parked process started answering background work.
     follow_ups: tokio::sync::broadcast::Sender<crate::lifecycle::RuntimeId>,
+    /// Parked processes that ended with background work still running.
+    parked_ends: tokio::sync::broadcast::Sender<ParkedProcessEnded>,
 }
 
 /// Announcements a slow subscriber may fall behind by before missing some.
 const FOLLOW_UP_ANNOUNCEMENTS: usize = 64;
+
+/// A parked process that ended while background work it started was still
+/// running, taking that work with it.
+///
+/// Announced by [`AgentRuntime::subscribe_parked_process_ends`]. Nobody asked
+/// for this: [`crate::retained::RuntimeClient::dispose`] and a configuration
+/// change the caller requested are not announced, and a process retires on
+/// its own only once its background work has finished. The provider never
+/// reports these tasks' end, so while the process is parked this is the only
+/// notice that they stopped.
+///
+/// Only a parked process is announced. Once a turn claims the process, its
+/// tasks are that turn's: if the process has died the turn fails, and
+/// [`AgentRuntime::parked_background_tasks`] read after it no longer lists
+/// them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParkedProcessEnded {
+    /// The runtime whose parked process ended.
+    pub runtime_id: crate::lifecycle::RuntimeId,
+    /// Provider ids of the background tasks it was still running, as
+    /// [`AgentRuntime::parked_background_tasks`] reported them.
+    pub task_ids: Vec<String>,
+    /// Why the process ended.
+    pub reason: ParkedProcessEndReason,
+}
+
+/// Why a parked process ended with its background work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ParkedProcessEndReason {
+    /// The provider process exited, or closed its output or input.
+    Exited,
+    /// The process wrote output the runtime could not read, so it was retired.
+    UnreadableOutput,
+    /// A turn resumed a different provider session, which replaced it.
+    Replaced,
+}
+
+impl ParkedProcessEndReason {
+    /// The reason in words, for a message about the stopped tasks.
+    #[must_use]
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::Exited => "the agent's process exited",
+            Self::UnreadableOutput => "the agent's process wrote output that could not be read",
+            Self::Replaced => "a turn resumed a different session in a new process",
+        }
+    }
+}
 
 impl CodexProcessSupervisor {
     fn new(config: ProviderProcessRetention) -> Self {
@@ -180,6 +231,7 @@ impl CodexProcessSupervisor {
                 permits: Arc::new(Semaphore::new(config.max_processes)),
                 processes: AsyncMutex::new(HashMap::new()),
                 follow_ups: tokio::sync::broadcast::channel(FOLLOW_UP_ANNOUNCEMENTS).0,
+                parked_ends: tokio::sync::broadcast::channel(FOLLOW_UP_ANNOUNCEMENTS).0,
             }),
         }
     }
@@ -190,6 +242,25 @@ impl CodexProcessSupervisor {
             process.terminate().await?;
         }
         Ok(())
+    }
+
+    /// Tell subscribers that `runtime_id`'s parked process ended with
+    /// `task_ids` still running. Nothing to tell without tasks.
+    fn announce_parked_end(
+        &self,
+        runtime_id: &crate::lifecycle::RuntimeId,
+        task_ids: Vec<String>,
+        reason: ParkedProcessEndReason,
+    ) {
+        if task_ids.is_empty() {
+            return;
+        }
+        // No subscriber is fine: nobody is tracking these tasks.
+        let _ = self.inner.parked_ends.send(ParkedProcessEnded {
+            runtime_id: runtime_id.clone(),
+            task_ids,
+            reason,
+        });
     }
 
     async fn remove_if_same(
@@ -617,7 +688,10 @@ async fn switch_claude_settings(
                     return Err(error.chars().take(200).collect());
                 }
             } else if process.handoff.pending() {
-                if !park_frame(adapter, &process.handoff, provider, io, &line).await {
+                if park_frame(adapter, &process.handoff, provider, io, &line)
+                    .await
+                    .is_err()
+                {
                     return Err("background output could not be read".to_owned());
                 }
             } else if unsolicited.len() < MAX_SWITCH_UNSOLICITED_FRAMES {
@@ -1127,6 +1201,17 @@ impl RetainedCodexProcess {
             .is_some_and(|state| answered_while_parked || adapter.retained_follow_up_pending(state))
     }
 
+    /// Take the background tasks this process still runs while parked, as
+    /// `adapter` tracks them, to announce that they ended with it. Empty
+    /// unless it is parked with background work, or once taken: only the one
+    /// that ends the process announces them.
+    fn take_parked_task_ids(&self, adapter: &dyn AgentAdapter) -> Vec<String> {
+        self.handoff
+            .take_inherited()
+            .map(|state| adapter.retained_background_task_ids(&state))
+            .unwrap_or_default()
+    }
+
     /// Mark the process unusable unless a turn claimed it after `generation`.
     ///
     /// Returns whether the caller now owns terminating it.
@@ -1137,6 +1222,35 @@ impl RetainedCodexProcess {
         }
         self.usable.store(false, Ordering::Release);
         true
+    }
+
+    /// [`Self::retire_if_unclaimed`] for a parked process, taking the tasks
+    /// it still runs ([`Self::take_parked_task_ids`]) when the caller now owns
+    /// terminating it.
+    async fn retire_parked_if_unclaimed(
+        &self,
+        generation: u64,
+        adapter: &dyn AgentAdapter,
+    ) -> Option<Vec<String>> {
+        let io = self.io.lock().await;
+        self.retire_parked(io.as_ref(), generation, adapter)
+    }
+
+    /// [`Self::retire_parked_if_unclaimed`] for a caller already holding
+    /// the process's I/O, `io`.
+    fn retire_parked(
+        &self,
+        io: Option<&RetainedCodexIo>,
+        generation: u64,
+        adapter: &dyn AgentAdapter,
+    ) -> Option<Vec<String>> {
+        if io.is_none() || self.generation.load(Ordering::Acquire) != generation {
+            return None;
+        }
+        self.usable.store(false, Ordering::Release);
+        // Under the I/O lock, so a turn replacing the process meanwhile
+        // terminates it only after this, and finds no tasks to announce.
+        Some(self.take_parked_task_ids(adapter))
     }
 
     async fn terminate(&self) -> Result<()> {
@@ -1489,24 +1603,39 @@ async fn supervise_parked_retained_process(
     let mut idle_since: Option<tokio::time::Instant> = None;
     let mut last_frame = tokio::time::Instant::now();
     let mut announced = false;
-    loop {
-        let healthy = {
-            let mut io = retained.io.lock().await;
+    // Why the process failed, with the tasks it took along, when it did;
+    // `None` once its work is done.
+    let failure = loop {
+        let read = {
+            let mut guard = retained.io.lock().await;
             if !current(&retained) {
                 return;
             }
-            let Some(io) = io.as_mut() else { return };
-            match read_idle_retained_line(&mut io.reader, max_event_line_bytes).await {
-                None => true,
+            let Some(io) = guard.as_mut() else { return };
+            let read = match read_idle_retained_line(&mut io.reader, max_event_line_bytes).await {
+                None => Ok(()),
                 Some(Ok(Some(line))) => {
                     last_frame = tokio::time::Instant::now();
                     park_frame(adapter.as_ref(), &retained.handoff, provider, io, &line).await
                 }
-                Some(Ok(None) | Err(_)) => false,
-            }
+                Some(Ok(None)) => Err(ParkedProcessEndReason::Exited),
+                Some(Err(error)) => Err(match error.kind() {
+                    // An oversized or never-completed frame.
+                    std::io::ErrorKind::InvalidData | std::io::ErrorKind::TimedOut => {
+                        ParkedProcessEndReason::UnreadableOutput
+                    }
+                    _ => ParkedProcessEndReason::Exited,
+                }),
+            };
+            // Retired before its I/O is let go: a turn waiting to claim the
+            // failed process starts a new one instead of inheriting its tasks.
+            read.map_err(|reason| {
+                let task_ids = retained.retire_parked(guard.as_ref(), generation, adapter.as_ref());
+                (reason, task_ids)
+            })
         };
-        if !healthy {
-            break;
+        if let Err(failed) = read {
+            break Some(failed);
         }
         if !announced
             && retained
@@ -1536,38 +1665,55 @@ async fn supervise_parked_retained_process(
             .elapsed()
             >= idle_timeout
         {
-            break;
+            break None;
         }
-    }
+    };
     // Output nobody claimed is dropped with the process; the provider's own
     // session transcript still records the conversation.
-    if retained.retire_if_unclaimed(generation).await {
-        supervisor.remove_if_same(&runtime_id, &retained).await;
-        let _ = retained.terminate().await;
+    let stopped = match failure {
+        Some((reason, Some(task_ids))) => Some((reason, task_ids)),
+        Some((_, None)) => return,
+        None => {
+            if retained
+                .retire_parked_if_unclaimed(generation, adapter.as_ref())
+                .await
+                .is_none()
+            {
+                return;
+            }
+            None
+        }
+    };
+    supervisor.remove_if_same(&runtime_id, &retained).await;
+    let _ = retained.terminate().await;
+    // The tasks the process was still running end with it, and nothing else
+    // will ever report that.
+    if let Some((reason, task_ids)) = stopped {
+        supervisor.announce_parked_end(&runtime_id, task_ids, reason);
     }
 }
 
 /// Parse and buffer one frame read from a parked process.
 ///
-/// Returns `false` when the process must be retired.
+/// Returns why the process must be retired, when it must.
 async fn park_frame(
     adapter: &dyn AgentAdapter,
     handoff: &RetainedHandoff,
     provider: Provider,
     io: &mut RetainedCodexIo,
     line: &str,
-) -> bool {
+) -> std::result::Result<(), ParkedProcessEndReason> {
     let (output, follow_up) = {
         let mut inherited = handoff
             .inherited
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(state) = inherited.as_mut() else {
-            return false;
+            return Err(ParkedProcessEndReason::UnreadableOutput);
         };
         match adapter.parse_line(line, state) {
             Ok(output) => (output, adapter.retained_follow_up_pending(state)),
-            Err(_) => return false,
+            Err(_) => return Err(ParkedProcessEndReason::UnreadableOutput),
         }
     };
     let mut writes = output.writes;
@@ -1588,7 +1734,7 @@ async fn park_frame(
                     "Too many requests are waiting for the next turn",
                 ) {
                     Ok(response) => writes.extend(response),
-                    Err(_) => return false,
+                    Err(_) => return Err(ParkedProcessEndReason::UnreadableOutput),
                 }
                 declined = true;
             }
@@ -1599,10 +1745,10 @@ async fn park_frame(
         .await
         .is_err()
     {
-        return false;
+        return Err(ParkedProcessEndReason::Exited);
     }
     write_optional_frames(Some(&mut io.stdin), &output.optional_writes).await;
-    true
+    Ok(())
 }
 
 /// Whether `event` announces an approval or question awaiting an answer.
@@ -2513,6 +2659,35 @@ impl AgentRuntime {
     ) -> tokio::sync::broadcast::Receiver<crate::lifecycle::RuntimeId> {
         match &self.codex_process_retention {
             Some(supervisor) => supervisor.inner.follow_ups.subscribe(),
+            None => tokio::sync::broadcast::channel(1).1,
+        }
+    }
+
+    /// Announces parked processes that ended while background work they
+    /// started was still running, with that work's task ids and why.
+    ///
+    /// A retained turn can end while its background shells keep running in
+    /// the parked process ([`Self::parked_background_tasks`]). If that
+    /// process then exits (it crashed or was killed) or has to be retired,
+    /// the shells end with it and the provider never reports them again:
+    /// subscribe to settle those tasks and tell whoever waits on them.
+    /// A process a turn has claimed is not announced: compare
+    /// [`Self::parked_background_tasks`] after that turn instead. Without
+    /// process retention nothing is ever announced.
+    ///
+    /// A subscriber more than 64 announcements behind receives
+    /// [`tokio::sync::broadcast::error::RecvError::Lagged`] with how many it
+    /// missed. To catch up it rereads [`Self::parked_background_tasks`] for
+    /// each runtime it tracks that is not running a turn, and settles the
+    /// tasks no longer listed. A running turn owns its process's tasks, so
+    /// the list stays empty until that turn ends: compare then, as after any
+    /// turn. An announcement for a task it already settled this way can
+    /// still arrive, so settling a task twice must be harmless.
+    pub fn subscribe_parked_process_ends(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<ParkedProcessEnded> {
+        match &self.codex_process_retention {
+            Some(supervisor) => supervisor.inner.parked_ends.subscribe(),
             None => tokio::sync::broadcast::channel(1).1,
         }
     }
@@ -4756,7 +4931,18 @@ impl AgentRuntime {
                 if available_permit.is_none() {
                     available_permit = candidate.permit.lock().await.take();
                 }
-                candidate.terminate().await?;
+                let terminated = candidate.terminate().await;
+                // Taken only once `terminate` held the I/O: a frame the parked
+                // supervisor was still parsing may have finished a task, and a
+                // supervisor that retired the process first took the tasks to
+                // announce them itself. Removed from the pool, the process's
+                // tasks are gone even when terminating it failed.
+                supervisor.announce_parked_end(
+                    runtime_id,
+                    candidate.take_parked_task_ids(adapter.as_ref()),
+                    ParkedProcessEndReason::Replaced,
+                );
+                terminated?;
                 existing = None;
             }
         }
@@ -9462,5 +9648,358 @@ mod tests {
             }
             panic!("provider grandchild {pid} survived cancellation");
         }
+    }
+
+    /// A parked Claude process on fake streams, its output already closed,
+    /// still running background shell `sh-1`, and the adapter tracking it.
+    #[cfg(feature = "claude")]
+    fn parked_claude_process() -> (crate::providers::Claude, Arc<RetainedCodexProcess>) {
+        parked_claude_process_reading(Box::new(tokio::io::empty()))
+    }
+
+    /// [`parked_claude_process`] whose output is read from `output`.
+    #[cfg(feature = "claude")]
+    fn parked_claude_process_reading(
+        output: crate::TransportReader,
+    ) -> (crate::providers::Claude, Arc<RetainedCodexProcess>) {
+        struct Live;
+        #[async_trait::async_trait]
+        impl crate::TransportProcessControl for Live {
+            async fn wait(&mut self) -> crate::TransportResult<crate::TransportExitStatus> {
+                std::future::pending().await
+            }
+            async fn terminate(&mut self) -> crate::TransportResult<()> {
+                Ok(())
+            }
+        }
+        let adapter = crate::providers::Claude::default();
+        let mut state = AdapterState::default();
+        adapter
+            .prepare_turn(
+                &TurnRequest::new(Provider::Claude, ".", "serve it"),
+                &mut state,
+            )
+            .unwrap();
+        adapter.mark_retained_turn(&mut state);
+        adapter
+            .parse_line(
+                r#"{"type":"system","subtype":"task_started","task_id":"sh-1","tool_use_id":"toolu_sh","description":"Run dev server","task_type":"local_bash","is_backgrounded":true}"#,
+                &mut state,
+            )
+            .unwrap();
+        assert_eq!(adapter.retained_background_task_ids(&state), ["sh-1"]);
+        let stream = || -> crate::TransportReader { Box::new(tokio::io::empty()) };
+        let process = crate::TransportProcess::new(
+            crate::TransportProcessHandle {
+                transport: "test".into(),
+                native_id: "parked".into(),
+            },
+            None,
+            None,
+            stream(),
+            stream(),
+            Live,
+        );
+        let request = TurnRequest::new(Provider::Claude, ".", "serve it");
+        let retained = Arc::new(RetainedCodexProcess {
+            provider: Provider::Claude,
+            fingerprint: RetainedCodexFingerprint {
+                command: CommandSpec::new("claude"),
+                working_directory: request.working_directory.clone(),
+                model: None,
+                reasoning: None,
+                permission_mode: request.permission_mode.clone(),
+                harness_options: request.harness_options.clone(),
+                launch_context: request.launch_context.clone(),
+                auto_compaction: request.auto_compaction,
+                required_sandbox_capabilities: request.required_sandbox_capabilities,
+            },
+            claude_settings: None,
+            io: AsyncMutex::new(Some(RetainedCodexIo {
+                process,
+                stdin: FrameWriter::new(Box::new(tokio::io::sink())),
+                reader: BufReader::new(output),
+                stderr_task: tokio::spawn(async { Ok(String::new()) }),
+                stdout_task: None,
+            })),
+            generation: AtomicU64::new(0),
+            usable: AtomicBool::new(true),
+            process_hint: None,
+            session_id: AsyncMutex::new(None),
+            permit: AsyncMutex::new(None),
+            handoff: RetainedHandoff::default(),
+        });
+        *retained
+            .handoff
+            .inherited
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(state);
+        (adapter, retained)
+    }
+
+    #[cfg(feature = "claude")]
+    #[tokio::test]
+    async fn a_parked_process_retired_first_leaves_a_replacement_nothing_to_announce() {
+        let (adapter, retained) = parked_claude_process();
+        // The parked supervisor saw the process fail and retires it...
+        assert_eq!(
+            retained.retire_parked_if_unclaimed(0, &adapter).await,
+            Some(vec!["sh-1".to_owned()])
+        );
+        // ...while a turn resuming another session replaces it.
+        retained.terminate().await.unwrap();
+        assert_eq!(retained.take_parked_task_ids(&adapter).len(), 0);
+    }
+
+    #[cfg(feature = "claude")]
+    #[tokio::test]
+    async fn a_parked_process_replaced_first_is_not_retired_by_its_supervisor() {
+        let (adapter, retained) = parked_claude_process();
+        // A turn resuming another session replaces the process...
+        retained.terminate().await.unwrap();
+        assert_eq!(retained.take_parked_task_ids(&adapter), ["sh-1"]);
+        // ...while its parked supervisor sees it fail.
+        assert_eq!(retained.retire_parked_if_unclaimed(0, &adapter).await, None);
+    }
+
+    #[cfg(feature = "claude")]
+    #[tokio::test]
+    async fn a_parked_process_a_replacement_began_terminating_is_left_to_it() {
+        let (adapter, retained) = parked_claude_process();
+        // The supervisor holds the I/O, about to retire the process, when a
+        // replacing turn starts terminating it.
+        let io = retained.io.lock().await;
+        let replacement = {
+            let retained = Arc::clone(&retained);
+            tokio::spawn(async move { retained.terminate().await })
+        };
+        tokio::task::yield_now().await;
+        assert!(!replacement.is_finished());
+        drop(io);
+        // The replacement bumped the generation first: the supervisor no
+        // longer owns the process, and the replacement announces its tasks.
+        assert_eq!(retained.retire_parked_if_unclaimed(0, &adapter).await, None);
+        replacement.await.unwrap().unwrap();
+        assert_eq!(retained.take_parked_task_ids(&adapter), ["sh-1"]);
+    }
+
+    /// A pool holding `retained`, parked as runtime `parked`.
+    #[cfg(feature = "claude")]
+    async fn pool_with(
+        retained: &Arc<RetainedCodexProcess>,
+    ) -> (CodexProcessSupervisor, crate::lifecycle::RuntimeId) {
+        let supervisor = CodexProcessSupervisor::new(ProviderProcessRetention {
+            max_processes: 1,
+            idle_timeout: Duration::from_secs(30),
+            initialization_timeout: Duration::from_secs(10),
+            active_inactivity_timeout: None,
+            held_task_quiet_timeout: None,
+        });
+        let runtime_id = crate::lifecycle::RuntimeId::new("parked").unwrap();
+        supervisor
+            .inner
+            .processes
+            .lock()
+            .await
+            .insert(runtime_id.clone(), Arc::clone(retained));
+        (supervisor, runtime_id)
+    }
+
+    /// Supervise `retained` while parked, as a turn that yields it does.
+    #[cfg(feature = "claude")]
+    fn supervise_parked(
+        supervisor: &CodexProcessSupervisor,
+        runtime_id: &crate::lifecycle::RuntimeId,
+        retained: &Arc<RetainedCodexProcess>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(supervise_parked_retained_process(
+            Arc::new(crate::providers::Claude::default()),
+            supervisor.clone(),
+            runtime_id.clone(),
+            Arc::clone(retained),
+            0,
+            Provider::Claude,
+            Duration::from_secs(30),
+            1024,
+        ))
+    }
+
+    #[cfg(feature = "claude")]
+    #[tokio::test]
+    async fn a_parked_process_that_exits_is_retired_before_a_waiting_turn_claims_it() {
+        let (_, retained) = parked_claude_process();
+        let (supervisor, runtime_id) = pool_with(&retained).await;
+        let mut ends = supervisor.inner.parked_ends.subscribe();
+
+        // The process's output is already closed. Its supervisor queues for
+        // the I/O first and a turn claiming the process queues behind it;
+        // the lock hands over in that order.
+        let io = retained.io.lock().await;
+        let parked = supervise_parked(&supervisor, &runtime_id, &retained);
+        tokio::task::yield_now().await;
+        let claim = {
+            let retained = Arc::clone(&retained);
+            tokio::spawn(async move { retained.claim().await })
+        };
+        tokio::task::yield_now().await;
+        drop(io);
+
+        // The supervisor retired the process before letting go of its I/O,
+        // so the turn starts a new process rather than inheriting a dead one.
+        assert_eq!(claim.await.unwrap(), None);
+        parked.await.unwrap();
+        assert_eq!(
+            ends.try_recv().unwrap(),
+            ParkedProcessEnded {
+                runtime_id,
+                task_ids: vec!["sh-1".to_owned()],
+                reason: ParkedProcessEndReason::Exited,
+            }
+        );
+        // A turn that found the process in the pool before it was retired,
+        // and replaces it now, has nothing left to announce.
+        retained.terminate().await.unwrap();
+        assert_eq!(
+            retained
+                .take_parked_task_ids(&crate::providers::Claude::default())
+                .len(),
+            0
+        );
+    }
+
+    #[cfg(feature = "claude")]
+    #[tokio::test]
+    async fn a_turn_that_claims_a_parked_process_first_owns_its_tasks() {
+        let (_, retained) = parked_claude_process();
+        let (supervisor, runtime_id) = pool_with(&retained).await;
+        let mut ends = supervisor.inner.parked_ends.subscribe();
+
+        // A turn claiming the process queues for the I/O before its
+        // supervisor does, whose read would find the output closed.
+        let io = retained.io.lock().await;
+        let claim = {
+            let retained = Arc::clone(&retained);
+            tokio::spawn(async move { retained.claim().await })
+        };
+        tokio::task::yield_now().await;
+        let parked = supervise_parked(&supervisor, &runtime_id, &retained);
+        tokio::task::yield_now().await;
+        drop(io);
+
+        // The turn owns the process and its tasks now: if the process is
+        // dead the turn fails, and its tasks are no longer parked.
+        assert_eq!(claim.await.unwrap(), Some(1));
+        parked.await.unwrap();
+        assert!(matches!(
+            ends.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        assert!(retained.handoff.take_inherited().is_some());
+    }
+
+    #[cfg(feature = "claude")]
+    #[tokio::test]
+    async fn a_replacement_that_begins_while_a_supervisor_waits_announces_alone() {
+        let (adapter, retained) = parked_claude_process();
+        let (supervisor, runtime_id) = pool_with(&retained).await;
+        let mut ends = supervisor.inner.parked_ends.subscribe();
+
+        // The supervisor queues for the I/O, whose read would find the
+        // output closed, and a turn resuming another session starts
+        // terminating the process behind it.
+        let io = retained.io.lock().await;
+        let parked = supervise_parked(&supervisor, &runtime_id, &retained);
+        tokio::task::yield_now().await;
+        let replacement = {
+            let retained = Arc::clone(&retained);
+            tokio::spawn(async move { retained.terminate().await })
+        };
+        tokio::task::yield_now().await;
+        drop(io);
+
+        // Terminating moved the generation on before the supervisor read, so
+        // it ends without a word, and the replacement announces the tasks.
+        parked.await.unwrap();
+        replacement.await.unwrap().unwrap();
+        assert!(matches!(
+            ends.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        assert_eq!(retained.take_parked_task_ids(&adapter), ["sh-1"]);
+    }
+
+    #[cfg(feature = "claude")]
+    #[tokio::test(start_paused = true)]
+    async fn a_parked_process_outlives_its_idle_timeout_while_a_task_is_listed() {
+        let (mut provider_output, output) = tokio::io::duplex(4096);
+        let (_, retained) = parked_claude_process_reading(Box::new(output));
+        let (supervisor, runtime_id) = pool_with(&retained).await;
+        let mut ends = supervisor.inner.parked_ends.subscribe();
+        let parked = tokio::spawn(supervise_parked_retained_process(
+            Arc::new(crate::providers::Claude::default()),
+            supervisor.clone(),
+            runtime_id.clone(),
+            Arc::clone(&retained),
+            0,
+            Provider::Claude,
+            Duration::from_secs(1),
+            1024,
+        ));
+
+        // Far past the idle timeout, the silent shell is still listed, so
+        // the process is not retired on its own.
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        assert!(!parked.is_finished());
+        assert!(retained.usable.load(Ordering::Acquire));
+
+        // Once the shell has ended, the process retires at its idle timeout,
+        // and nothing is announced: no work went with it.
+        tokio::io::AsyncWriteExt::write_all(
+            &mut provider_output,
+            b"{\"type\":\"system\",\"subtype\":\"task_notification\",\"task_id\":\"sh-1\",\"status\":\"completed\",\"summary\":\"server exited\"}\n",
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(60), parked)
+            .await
+            .expect("the idle process must retire")
+            .unwrap();
+        assert!(!retained.usable.load(Ordering::Acquire));
+        assert_eq!(supervisor.inner.processes.lock().await.len(), 0);
+        assert!(matches!(
+            ends.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn a_subscriber_that_falls_behind_is_told_how_many_ends_it_missed() {
+        let supervisor = CodexProcessSupervisor::new(ProviderProcessRetention {
+            max_processes: 1,
+            idle_timeout: Duration::from_secs(30),
+            initialization_timeout: Duration::from_secs(10),
+            active_inactivity_timeout: None,
+            held_task_quiet_timeout: None,
+        });
+        let mut ends = supervisor.inner.parked_ends.subscribe();
+        let runtime_id = crate::lifecycle::RuntimeId::new("parked").unwrap();
+        for _ in 0..=FOLLOW_UP_ANNOUNCEMENTS {
+            supervisor.announce_parked_end(
+                &runtime_id,
+                vec!["sh-1".to_owned()],
+                ParkedProcessEndReason::Exited,
+            );
+        }
+        // Nothing to announce without tasks.
+        supervisor.announce_parked_end(&runtime_id, Vec::new(), ParkedProcessEndReason::Exited);
+        assert!(matches!(
+            ends.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(1))
+        ));
+        let mut received = 0;
+        while ends.try_recv().is_ok() {
+            received += 1;
+        }
+        assert_eq!(received, FOLLOW_UP_ANNOUNCEMENTS);
     }
 }
