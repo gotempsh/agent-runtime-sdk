@@ -71,6 +71,11 @@ def garbled_shell():
  while not os.path.exists(RELEASE):time.sleep(.02)
  with LOCK:print('this is not stream-json',flush=True)
  log('garbled')
+def exiting_shell():
+ # A background shell whose process exits on RELEASE, taking it along.
+ log('shell-start')
+ while not os.path.exists(RELEASE):time.sleep(.001)
+ os._exit(3)
 def split_frame():
  # On RELEASE the tests finish, and in the same write a frame announcing
  # that lint finished begins, then stalls before its end until RELEASE+'-2'.
@@ -134,6 +139,12 @@ for line in sys.stdin:
    emit({'type':'system','subtype':'task_started','task_id':'sh-dev','tool_use_id':'toolu_d','description':'Run dev server','task_type':'local_bash','is_backgrounded':True})
    result('STARTED-BOTH')
    thread=threading.Thread(target=two_shells,daemon=True)
+   BACKGROUND.append(thread);thread.start()
+   continue
+  if prompt=='spawn-shell-exit':
+   emit({'type':'system','subtype':'task_started','task_id':'sh-1','tool_use_id':'toolu_sh','description':'Run dev server','task_type':'local_bash','is_backgrounded':True})
+   result('SERVING')
+   thread=threading.Thread(target=exiting_shell,daemon=True)
    BACKGROUND.append(thread);thread.start()
    continue
   if prompt=='spawn-three-shells':
@@ -863,6 +874,80 @@ async fn claude_a_parked_process_replaced_by_another_session_announces_its_work(
         }
     );
     f.dispose().await;
+}
+
+// Worker threads let the parked supervisor run while the replacing turn is
+// between finding the process and terminating it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn claude_a_parked_process_exiting_as_it_is_replaced_is_announced_once() {
+    // Which of the two ends the process cannot be chosen from here, so run
+    // the race many times with the exit and the replacement staggered, and
+    // hold every run to one announcement.
+    let mut reasons = Vec::new();
+    for run in 0..30_u64 {
+        let f = Fixture::new(true, Duration::from_secs(30)).await;
+        let mut ends = f.runtime.subscribe_parked_process_ends();
+        assert_eq!(
+            f.turn("one", "spawn-shell-exit").await.unwrap().text,
+            "SERVING"
+        );
+        f.wait_for_log("shell-start").await;
+        let runtime_id = RuntimeId::new("claude-native").unwrap();
+
+        let stagger = Duration::from_millis(run / 2 % 8);
+        let exit_first = run % 2 == 0;
+        if exit_first {
+            f.release_background();
+            tokio::time::sleep(stagger).await;
+        }
+        let runtime = f.runtime.clone();
+        let replacement_id = runtime_id.clone();
+        let mut request = TurnRequest::new(Provider::Claude, f.dir.path(), "second");
+        request.session_id = Some("other-session".into());
+        let replacement = tokio::spawn(async move {
+            RuntimeTurnExecutor::execute_retained(
+                &runtime,
+                &replacement_id,
+                request,
+                &NoopEventSink,
+                None,
+            )
+            .await
+        });
+        if !exit_first {
+            tokio::time::sleep(stagger).await;
+            f.release_background();
+        }
+
+        let result = tokio::time::timeout(Duration::from_secs(15), replacement)
+            .await
+            .expect("the replacement must be bounded")
+            .unwrap()
+            .unwrap_or_else(|error| panic!("run {run}: the replacement failed: {error}"));
+        assert_eq!(result.text, "reply:second", "run {run}");
+        assert_eq!(f.spawns().len(), 2, "run {run}: {:?}", f.events());
+        let ended = next_parked_end(&mut ends).await;
+        assert_eq!(ended.runtime_id, runtime_id, "run {run}");
+        assert_eq!(ended.task_ids, ["sh-1"], "run {run}");
+        assert!(
+            matches!(
+                ended.reason,
+                ParkedProcessEndReason::Exited | ParkedProcessEndReason::Replaced
+            ),
+            "run {run}: {ended:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            matches!(
+                ends.try_recv(),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            ),
+            "run {run}: the end was announced twice"
+        );
+        reasons.push(ended.reason);
+        f.dispose().await;
+    }
+    eprintln!("ends announced: {reasons:?}");
 }
 
 /// Sorted ids of the background tasks `f`'s parked process still runs.
