@@ -71,6 +71,18 @@ def garbled_shell():
  while not os.path.exists(RELEASE):time.sleep(.02)
  with LOCK:print('this is not stream-json',flush=True)
  log('garbled')
+def split_frame():
+ # On RELEASE the tests finish, and in the same write a frame announcing
+ # that lint finished begins, then stalls before its end until RELEASE+'-2'.
+ log('shell-start')
+ while not os.path.exists(RELEASE):time.sleep(.02)
+ tests=json.dumps({'type':'system','subtype':'task_notification','task_id':'sh-tests','status':'completed','summary':'tests passed'})
+ lint=json.dumps({'type':'system','subtype':'task_notification','task_id':'sh-lint','status':'completed','summary':'lint passed'})
+ with LOCK:sys.stdout.write(tests+'\n'+lint[:20]);sys.stdout.flush()
+ log('frame-begun')
+ while not os.path.exists(RELEASE+'-2'):time.sleep(.02)
+ with LOCK:print(lint[20:],flush=True)
+ log('frame-finished')
 def two_shells():
  # Tests end silently on RELEASE (Claude does not answer), while the dev
  # server keeps running until RELEASE+'-2'.
@@ -122,6 +134,14 @@ for line in sys.stdin:
    emit({'type':'system','subtype':'task_started','task_id':'sh-dev','tool_use_id':'toolu_d','description':'Run dev server','task_type':'local_bash','is_backgrounded':True})
    result('STARTED-BOTH')
    thread=threading.Thread(target=two_shells,daemon=True)
+   BACKGROUND.append(thread);thread.start()
+   continue
+  if prompt=='spawn-three-shells':
+   emit({'type':'system','subtype':'task_started','task_id':'sh-tests','tool_use_id':'toolu_t','description':'Run tests','task_type':'local_bash','is_backgrounded':True})
+   emit({'type':'system','subtype':'task_started','task_id':'sh-lint','tool_use_id':'toolu_l','description':'Run lint','task_type':'local_bash','is_backgrounded':True})
+   emit({'type':'system','subtype':'task_started','task_id':'sh-dev','tool_use_id':'toolu_d','description':'Run dev server','task_type':'local_bash','is_backgrounded':True})
+   result('STARTED-ALL')
+   thread=threading.Thread(target=split_frame,daemon=True)
    BACKGROUND.append(thread);thread.start()
    continue
   if prompt=='spawn-shell-garbled':
@@ -842,6 +862,94 @@ async fn claude_a_parked_process_replaced_by_another_session_announces_its_work(
             reason: ParkedProcessEndReason::Replaced,
         }
     );
+    f.dispose().await;
+}
+
+/// Sorted ids of the background tasks `f`'s parked process still runs.
+async fn parked_tasks(f: &Fixture) -> Vec<String> {
+    let mut tasks = f
+        .runtime
+        .parked_background_tasks(&RuntimeId::new("claude-native").unwrap())
+        .await;
+    tasks.sort();
+    tasks
+}
+
+#[tokio::test]
+async fn claude_a_replacement_waits_for_the_frame_a_parked_process_is_writing() {
+    let f = Fixture::new(true, Duration::from_secs(30)).await;
+    let mut ends = f.runtime.subscribe_parked_process_ends();
+    assert_eq!(
+        f.turn("one", "spawn-three-shells").await.unwrap().text,
+        "STARTED-ALL"
+    );
+    f.wait_for_log("shell-start").await;
+    let runtime_id = RuntimeId::new("claude-native").unwrap();
+
+    // The tests finish, and the frame saying lint finished begins in the
+    // same write. Once the parked process has read that the tests finished,
+    // it goes straight on (no await releases it in between) to the begun
+    // frame, and waits there for the rest while holding the process's I/O.
+    f.release_background();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while parked_tasks(&f).await != ["sh-dev", "sh-lint"] {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the parked process must read that the tests finished");
+
+    // A turn resuming another session replaces the process. It takes it
+    // out of the pool, then waits to terminate it until the frame is read.
+    let runtime = f.runtime.clone();
+    let replacement_id = runtime_id.clone();
+    let mut request = TurnRequest::new(Provider::Claude, f.dir.path(), "second");
+    request.session_id = Some("other-session".into());
+    let replacement = tokio::spawn(async move {
+        RuntimeTurnExecutor::execute_retained(
+            &runtime,
+            &replacement_id,
+            request,
+            &NoopEventSink,
+            None,
+        )
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !parked_tasks(&f).await.is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the replacement must take the parked process out of the pool");
+    assert_eq!(f.logged("frame-finished"), 0);
+    assert_eq!(f.spawns().len(), 1, "{:?}", f.events());
+    assert!(!replacement.is_finished());
+
+    // Lint's frame completes: it is read before the process is terminated,
+    // so lint is not reported as stopped by the replacement.
+    fs::write(format!("{}-2", f.release.display()), b"done").unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(15), replacement)
+        .await
+        .expect("the replacement must be bounded")
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.text, "reply:second");
+    assert_eq!(f.spawns().len(), 2, "{:?}", f.events());
+    assert_eq!(
+        next_parked_end(&mut ends).await,
+        ParkedProcessEnded {
+            runtime_id,
+            task_ids: vec!["sh-dev".to_string()],
+            reason: ParkedProcessEndReason::Replaced,
+        }
+    );
+    // The parked process saw its generation pass and ended without a word
+    // of its own, long before the replacement's new process answered.
+    assert!(matches!(
+        ends.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
     f.dispose().await;
 }
 
