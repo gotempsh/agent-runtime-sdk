@@ -1087,13 +1087,30 @@ impl AgentAdapter for Acp {
     }
 
     fn classify_idle_frame(&self, line: &str) -> crate::adapter::IdleFrame {
-        match serde_json::from_str::<Value>(line)
-            .ok()
-            .and_then(|v| v.get("method").and_then(Value::as_str).map(str::to_owned))
-        {
-            Some(method) if method == "session/update" => crate::adapter::IdleFrame::Background,
+        // JSON-RPC notifications, including unknown extension notifications,
+        // are legal between prompts and must not retire a healthy connection.
+        match serde_json::from_str::<Value>(line) {
+            Ok(value) if value.get("method").and_then(Value::as_str).is_some() => {
+                crate::adapter::IdleFrame::Background
+            }
             _ => crate::adapter::IdleFrame::Unexpected,
         }
+    }
+
+    fn idle_frame_writes(&self, line: &str) -> Vec<Vec<u8>> {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            return Vec::new();
+        };
+        let Some(id) = value.get("id").filter(|id| !id.is_null()) else {
+            return Vec::new();
+        };
+        let frame =
+            if value.get("method").and_then(Value::as_str) == Some("session/request_permission") {
+                reply(id, json!({"outcome":{"outcome":"cancelled"}}))
+            } else {
+                reply_error(id, -32601, "No active turn can answer this request")
+            };
+        encode(&frame).into_iter().collect()
     }
 
     fn executable(&self) -> PathBuf {
@@ -2445,6 +2462,23 @@ mod tests {
         json!({"jsonrpc": "2.0", "id": ID_INITIALIZE, "result": {
             "protocolVersion": 1, "agentCapabilities": capabilities, "authMethods": []
         }})
+    }
+
+    #[test]
+    fn idle_notifications_keep_the_connection_and_requests_are_answered_without_approval() {
+        let adapter = Acp::new(agents());
+        let notice = json!({"jsonrpc":"2.0","method":"vendor/activity","params":{}}).to_string();
+        assert_eq!(
+            adapter.classify_idle_frame(&notice),
+            crate::adapter::IdleFrame::Background
+        );
+        assert!(adapter.idle_frame_writes(&notice).is_empty());
+        let permission =
+            json!({"jsonrpc":"2.0","id":"p","method":"session/request_permission","params":{}})
+                .to_string();
+        let replies = adapter.idle_frame_writes(&permission);
+        let reply: Value = serde_json::from_slice(&replies[0]).unwrap();
+        assert_eq!(reply["result"]["outcome"]["outcome"], "cancelled");
     }
 
     #[test]
