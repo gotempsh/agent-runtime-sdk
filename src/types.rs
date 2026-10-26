@@ -381,6 +381,20 @@ pub struct TurnRequest {
     /// anything else fails with [`crate::RuntimeError::NothingToContinue`]
     /// before writing to the provider.
     pub continuation: bool,
+    /// Keep a retained process's model, reasoning or auto-compaction policy
+    /// for this turn, instead of failing with
+    /// [`crate::RuntimeError::RestartWouldStopBackgroundWork`], when only those
+    /// would need a new process and the current one still runs background
+    /// work. Anything the process can switch in place is still switched, and
+    /// if the work has ended (or the process gone) by the time the turn claims
+    /// it, the turn runs as asked.
+    ///
+    /// The turn reports what it kept as [`TurnEvent::SettingsDeferred`]; the
+    /// new settings apply on a later turn, once the work has finished. Any
+    /// other change that needs a new process (permission mode, sandbox,
+    /// working directory, launch context, harness options) is still refused,
+    /// so a turn never runs with looser controls than it asked for.
+    pub keep_background_work: bool,
     /// Ask the harness to title a session that has no title yet, the way its
     /// own interactive client does, from this user-written description of the
     /// task (normally the session's first prompt, without injected context).
@@ -423,6 +437,7 @@ impl fmt::Debug for TurnRequest {
             &self.required_sandbox_capabilities,
         );
         debug.field("continuation", &self.continuation);
+        debug.field("keep_background_work", &self.keep_background_work);
         debug.field(
             "request_session_title_bytes",
             &self.request_session_title.as_ref().map(String::len),
@@ -460,6 +475,7 @@ impl TurnRequest {
             sandbox: None,
             required_sandbox_capabilities: crate::SandboxCapabilities::NONE,
             continuation: false,
+            keep_background_work: false,
             request_session_title: None,
         }
     }
@@ -1204,6 +1220,20 @@ pub enum TurnEvent {
     Warning {
         /// Human-readable diagnostic.
         message: String,
+    },
+    /// The turn kept its retained process's model, reasoning or
+    /// auto-compaction policy, because applying its own would need a new
+    /// process that would stop background work still running (see
+    /// [`TurnRequest::keep_background_work`]). Emitted once the process is
+    /// claimed; the settings apply on a later turn, once that work has
+    /// finished.
+    SettingsDeferred {
+        /// What about the turn's settings was not applied, such as "a
+        /// different model".
+        change: String,
+        /// The background work a new process would have stopped, as the
+        /// provider describes it.
+        tasks: Vec<String>,
     },
     /// Retained provider process lifecycle progress.
     ProviderProcessStatus {

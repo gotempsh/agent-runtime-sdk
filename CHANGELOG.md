@@ -16,6 +16,55 @@ Versioning and Keep a Changelog conventions.
 
 ### Added
 
+- `AgentRuntime::subscribe_parked_process_ends`: announces a parked retained
+  process that ended while background work it started was still running (it
+  exited or was killed, it wrote output the runtime could not read, or a turn
+  resuming a different session replaced it) as `ParkedProcessEnded {
+  runtime_id, task_ids, reason }`. Before, those tasks ended silently: the
+  provider never reports them, so an application kept showing them as running
+  and an agent waiting on one never heard back. Each end is announced once.
+  Disposing a runtime, or a process a turn has already claimed (that turn's
+  result and `parked_background_tasks` report it), is not announced.
+- `TurnInput::keep_background_work` / `TurnRequest::keep_background_work`:
+  instead of `RestartWouldStopBackgroundWork`, a turn whose model, reasoning
+  or auto-compaction policy would need a new process (for Claude, going back
+  to the default model or effort, or turning thinking off or back on) keeps
+  the retained process's values for just those, still switching what the
+  process can switch in place, and reports what it kept as the new
+  `TurnEvent::SettingsDeferred { change, tasks }`. If the work has ended, or
+  the process has gone, by the time the turn claims it, the turn runs as
+  asked instead. Changes to the working
+  directory, launch context, sandbox, permission mode or other harness options
+  are still refused. Carried over the remote host protocol as an optional
+  field.
+
+### Changed
+
+- A retained Claude process switches ultracode (reasoning `ultracode`) on and
+  off in place with `apply_flag_settings`, like effort and Fast mode, instead
+  of being replaced. A turn on another effort after a workflow started under
+  ultracode is no longer refused with `RestartWouldStopBackgroundWork`, and the
+  workflow keeps running.
+- A retained Claude process switches Fast mode (`harness_options.fast_mode`)
+  in place, like the model and effort, instead of being replaced. A turn that
+  only changes Fast mode is no longer refused with
+  `RestartWouldStopBackgroundWork` while background work runs.
+- **Breaking:** `ProviderProcessRetention` has a new field,
+  `held_task_quiet_timeout: Option<Duration>`. A retained turn that has answered
+  and is held open only by background work that reports nothing now completes
+  successfully with a `TurnEvent::Warning` after that period instead of staying
+  open until the inactivity limit. Set `None` for the previous behavior.
+- A reused retained process that has already answered a turn is no longer held
+  to `initialization_timeout`; it is judged by `active_inactivity_timeout`, so a
+  process busy with earlier work is not failed as "starting".
+- `RuntimeError::StartupTimeout`: a process that never answered within
+  `initialization_timeout` now fails with this variant ("did not respond within N
+  seconds of starting") instead of `Timeout` ("turn timed out"), so applications
+  can tell a failed start from a turn that ran too long. Both map to
+  `RuntimeFailureKind::Timeout`.
+
+### Added
+
 - `TurnRequest::request_session_title`, `TurnEvent::SessionTitle` and
   `TurnResult::session_title`: ask the harness to title a session that has
   none yet, from the user's own description of the task, the way its own
@@ -180,6 +229,21 @@ Versioning and Keep a Changelog conventions.
 
 ### Fixed
 
+- A Claude turn that Claude Code ended without a finished reply no longer shows
+  its debug line (`[ede_diagnostic] result_type=user last_content_type=n/a
+  stop_reason=null`) as the failure. The diagnostic now names what happened,
+  for example that Claude stopped without answering the last message it
+  received, keeps that line at the end, and a real error listed after it is
+  shown instead. It makes no claim that earlier output was finished.
+
+- Cancelling a turn no longer waits for a provider that has stopped reading
+  its stdin. A provider busy inside a tool call can leave its pipe full, and
+  the adapter-encoded interrupt (`turn/interrupt` for the Codex app-server)
+  was written without a bound, so cancellation and the process-tree cleanup
+  after it waited until the tool ended on its own. The interrupt write now
+  gives up after 1 second, for one-shot and retained turns alike, and the
+  provider is terminated as it already was when the interrupt was not
+  accepted.
 - A finished turn, probe or metadata query no longer waits for a descendant
   of the provider that kept its stderr open after the process ended, which
   turned a completed ACP turn into a timeout when the agent's terminal grace

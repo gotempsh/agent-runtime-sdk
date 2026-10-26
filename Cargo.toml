@@ -62,7 +62,7 @@ nix = { version = "0.31", features = ["process", "signal"] }
 
 [dev-dependencies]
 tempfile = "3"
-tokio = { version = "1.43", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1.43", features = ["macros", "rt-multi-thread", "test-util"] }
 
 [[example]]
 name = "run_turn"

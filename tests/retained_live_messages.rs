@@ -11,7 +11,7 @@
 //! refuses while a `refuse-settings` file exists.
 #![cfg(all(unix, feature = "claude"))]
 
-use std::{fs, os::unix::fs::PermissionsExt, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, fs, os::unix::fs::PermissionsExt, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use temps_agent_runtime::{
@@ -21,9 +21,9 @@ use temps_agent_runtime::{
         InProcessRuntimeClient, RuntimeClient, RuntimeEvent, RuntimeHandle, RuntimeSpec,
         TurnHandle, TurnInput,
     },
-    AgentRuntime, AgentTaskActivityKind, ApprovalDecision, ApprovalRequest, InteractionHandler,
-    PermissionMode, Provider, ProviderProcessRetention, QuestionAnswer, QuestionRequest, TurnEvent,
-    TurnResult,
+    AgentRuntime, AgentTaskActivityKind, ApprovalDecision, ApprovalRequest, AutoCompactionPolicy,
+    InteractionHandler, LaunchContext, PermissionMode, Provider, ProviderProcessRetention,
+    QuestionAnswer, QuestionRequest, TurnEvent, TurnResult,
 };
 use tokio::task::JoinHandle;
 
@@ -252,6 +252,7 @@ impl Fixture {
                 idle_timeout: Duration::from_secs(30),
                 initialization_timeout: Duration::from_secs(10),
                 active_inactivity_timeout: Some(Duration::from_secs(10)),
+                held_task_quiet_timeout: None,
             });
         }
         let client = InProcessRuntimeClient::new(builder.build().unwrap());
@@ -297,7 +298,12 @@ impl Fixture {
                 let request = &v["request"];
                 let value = match request["subtype"].as_str() {
                     Some("set_model") => request["model"].to_string(),
-                    Some("apply_flag_settings") => request["settings"]["effortLevel"].to_string(),
+                    // Each request carries one setting.
+                    Some("apply_flag_settings") => request["settings"]
+                        .as_object()
+                        .and_then(|settings| settings.values().next())
+                        .map(ToString::to_string)
+                        .unwrap_or_default(),
                     _ => request["mode"].to_string(),
                 };
                 format!(
@@ -679,6 +685,85 @@ async fn switching_model_effort_and_permission_keeps_background_work() {
 }
 
 #[tokio::test]
+async fn switching_fast_mode_keeps_background_work() {
+    let f = Fixture::new(true).await;
+    park_with_background_work(&f).await;
+
+    let mut input = Fixture::input("two", "second");
+    input.harness_options = Some(BTreeMap::from([("fast_mode".into(), "true".into())]));
+    let next = f
+        .start_input(input)
+        .await
+        .expect("Fast mode switches in the live process");
+    f.wait_for_prompt("second").await;
+    assert_eq!(f.logged("bg-finished"), 0, "the subagent is still running");
+    f.release("bg-release");
+    let (events, result) = next.finish().await;
+    assert!(result.unwrap().text.contains("reply:second"));
+    assert!(task_activity(
+        &events,
+        "bg-1",
+        AgentTaskActivityKind::Completed
+    ));
+    assert!(
+        f.settings()
+            .iter()
+            .any(|setting| setting == "apply_flag_settings true"),
+        "{:?}",
+        f.settings()
+    );
+    assert_eq!(f.spawns(), 1, "{:?}", f.events());
+    f.dispose().await;
+}
+
+#[tokio::test]
+async fn leaving_ultracode_keeps_background_work() {
+    let f = Fixture::new(true).await;
+    // A turn on ultracode starts background work (as a workflow would)...
+    let mut input = Fixture::input("one", "spawn-bg");
+    input.reasoning = Some("ultracode".into());
+    let turn = f.start_input(input).await.unwrap();
+    f.wait_for_log("bg-start").await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    drop(turn);
+
+    // ...and the next one, on another effort, switches in place.
+    let mut input = Fixture::input("two", "second");
+    input.reasoning = Some("high".into());
+    let next = f
+        .start_input(input)
+        .await
+        .expect("ultracode switches off in the live process");
+    f.wait_for_prompt("second").await;
+    assert_eq!(f.logged("bg-finished"), 0, "the subagent is still running");
+    f.release("bg-release");
+    let (events, result) = next.finish().await;
+    assert!(result.unwrap().text.contains("reply:second"));
+    assert!(task_activity(
+        &events,
+        "bg-1",
+        AgentTaskActivityKind::Completed
+    ));
+    assert_eq!(
+        f.settings(),
+        [r#"apply_flag_settings "high""#, "apply_flag_settings false"]
+    );
+    assert_eq!(f.spawns(), 1, "{:?}", f.events());
+
+    // Back on ultracode, again in place.
+    let mut input = Fixture::input("three", "third");
+    input.reasoning = Some("ultracode".into());
+    let (_, result) = f.start_input(input).await.unwrap().finish().await;
+    assert_eq!(result.unwrap().text, "reply:third");
+    assert_eq!(
+        f.settings()[2..],
+        [r#"apply_flag_settings "xhigh""#, "apply_flag_settings true"]
+    );
+    assert_eq!(f.spawns(), 1, "{:?}", f.events());
+    f.dispose().await;
+}
+
+#[tokio::test]
 async fn a_change_that_needs_a_new_process_waits_for_background_work() {
     let f = Fixture::new(true).await;
     park_with_background_work(&f).await;
@@ -720,6 +805,169 @@ async fn a_change_that_needs_a_new_process_waits_for_background_work() {
     f.dispose().await;
 }
 
+fn settings_deferred(events: &[TurnEvent]) -> Vec<(String, Vec<String>)> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            TurnEvent::SettingsDeferred { change, tasks } => Some((change.clone(), tasks.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn keep_background_work_defers_what_needs_a_new_process() {
+    let f = Fixture::new(true).await;
+    park_with_background_work(&f).await;
+    let threshold = AutoCompactionPolicy::TokenThreshold { tokens: 200_000 };
+
+    // The new policy needs a new process, which would stop the subagent: the
+    // turn runs on the process as it is and says what it kept.
+    let mut input = Fixture::input("two", "second");
+    input.auto_compaction = Some(threshold);
+    input.keep_background_work = true;
+    let next = f
+        .start_input(input)
+        .await
+        .expect("the turn runs on the settings the process has");
+    f.wait_for_prompt("second").await;
+    assert_eq!(f.logged("bg-finished"), 0, "the subagent is still running");
+    f.release("bg-release");
+    let (events, result) = next.finish().await;
+    assert!(result.unwrap().text.contains("reply:second"));
+    assert!(task_activity(
+        &events,
+        "bg-1",
+        AgentTaskActivityKind::Completed
+    ));
+    let deferred = settings_deferred(&events);
+    assert_eq!(deferred.len(), 1, "{events:?}");
+    assert!(
+        deferred[0].0.contains("auto-compaction"),
+        "{:?}",
+        deferred[0]
+    );
+    assert!(
+        deferred[0].1.iter().any(|task| task.contains("bg-1")),
+        "{:?}",
+        deferred[0]
+    );
+    assert_eq!(f.spawns(), 1, "{:?}", f.events());
+
+    // With the work finished, the same turn gets its new process.
+    let mut input = Fixture::input("three", "third");
+    input.auto_compaction = Some(threshold);
+    input.keep_background_work = true;
+    let (events, result) = f.start_input(input).await.unwrap().finish().await;
+    assert_eq!(result.unwrap().text, "reply:third");
+    assert_eq!(settings_deferred(&events).len(), 0, "{events:?}");
+    assert_eq!(f.spawns(), 2, "{:?}", f.events());
+    f.dispose().await;
+}
+
+#[tokio::test]
+async fn keep_background_work_defers_going_back_to_the_default_model_and_effort() {
+    let f = Fixture::new(true).await;
+    // Launched with a model and effort, so Claude cannot switch back to its
+    // defaults in place.
+    let mut input = Fixture::input("one", "spawn-bg");
+    input.model = Some("first-model".into());
+    input.reasoning = Some("high".into());
+    let turn = f.start_input(input).await.unwrap();
+    f.wait_for_log("bg-start").await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    drop(turn);
+
+    let mut input = Fixture::input("two", "second");
+    input.keep_background_work = true;
+    let next = f
+        .start_input(input)
+        .await
+        .expect("the turn runs on the model and effort the process has");
+    f.wait_for_prompt("second").await;
+    assert_eq!(f.logged("bg-finished"), 0, "the subagent is still running");
+    f.release("bg-release");
+    let (events, result) = next.finish().await;
+    assert!(result.unwrap().text.contains("reply:second"));
+    let deferred = settings_deferred(&events);
+    assert_eq!(deferred.len(), 1, "{events:?}");
+    // The first setting it could not switch to.
+    assert_eq!(deferred[0].0, "the default model");
+    assert_eq!(
+        f.settings().len(),
+        0,
+        "nothing was switched: {:?}",
+        f.settings()
+    );
+    assert_eq!(f.spawns(), 1, "{:?}", f.events());
+    f.dispose().await;
+}
+
+#[tokio::test]
+async fn keep_background_work_never_runs_a_turn_with_looser_permissions() {
+    let f = Fixture::new(true).await;
+    let mut input = Fixture::input("one", "spawn-bg");
+    input.model = Some("first-model".into());
+    let turn = f.start_input(input).await.unwrap();
+    f.wait_for_log("bg-start").await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    drop(turn);
+
+    // Going back to the default model could wait for the work, but bypass
+    // mode on a process launched without it cannot: the turn is refused with
+    // what it asked for first, and runs on nothing.
+    let mut input = Fixture::input("two", "second");
+    input.permission_mode = Some(PermissionMode::FullAccess);
+    input.keep_background_work = true;
+    let (events, result) = f.start_input(input).await.unwrap().finish().await;
+    let error = result.expect_err("bypass mode needs a new process");
+    assert_eq!(error.kind, RuntimeFailureKind::RuntimeBusy);
+    assert!(
+        error.message.contains("the default model") && error.message.contains("subagent bg-1"),
+        "{}",
+        error.message
+    );
+    assert_eq!(settings_deferred(&events).len(), 0, "{events:?}");
+    assert!(f.events().iter().all(|v| v["prompt"] != "second"));
+    assert_eq!(f.settings().len(), 0, "{:?}", f.settings());
+    assert_eq!(f.spawns(), 1);
+
+    f.release("bg-release");
+    f.wait_for_log("bg-finished").await;
+    f.dispose().await;
+}
+
+#[tokio::test]
+async fn keep_background_work_never_defers_what_the_agent_can_reach() {
+    let f = Fixture::new(true).await;
+    park_with_background_work(&f).await;
+
+    // A different launch context (MCP servers, tools, instructions) still
+    // waits for the work, even alongside a change that could be deferred.
+    let mut input = Fixture::input("two", "second");
+    input.launch_context = Some(LaunchContext {
+        system_prompt_append: Some("Only read files.".into()),
+        ..LaunchContext::default()
+    });
+    input.auto_compaction = Some(AutoCompactionPolicy::Automatic);
+    input.keep_background_work = true;
+    let (events, result) = f.start_input(input).await.unwrap().finish().await;
+    let error = result.expect_err("the change would stop background work");
+    assert_eq!(error.kind, RuntimeFailureKind::RuntimeBusy);
+    assert!(
+        error.message.contains("launch context") && error.message.contains("subagent bg-1"),
+        "{}",
+        error.message
+    );
+    assert_eq!(settings_deferred(&events).len(), 0, "{events:?}");
+    assert!(f.events().iter().all(|v| v["prompt"] != "second"));
+    assert_eq!(f.spawns(), 1);
+
+    f.release("bg-release");
+    f.wait_for_log("bg-finished").await;
+    f.dispose().await;
+}
+
 #[tokio::test]
 async fn a_refused_switch_keeps_background_work() {
     let f = Fixture::new(true).await;
@@ -752,6 +1000,10 @@ async fn a_refused_switch_keeps_background_work() {
         f.settings()[1..],
         [
             "set_model null",
+            "apply_flag_settings null",
+            // Fast mode and ultracode too: after a refused switch their live
+            // values are unknown.
+            "apply_flag_settings null",
             "apply_flag_settings null",
             r#"set_permission_mode "manual""#,
         ]

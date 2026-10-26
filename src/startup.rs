@@ -176,7 +176,9 @@ impl StartupTrace {
         let stage = match result {
             Ok(_) => StartupStage::Succeeded,
             Err(RuntimeError::Cancelled { .. }) => StartupStage::Cancelled,
-            Err(RuntimeError::Timeout { .. }) => StartupStage::TimedOut,
+            Err(RuntimeError::Timeout { .. } | RuntimeError::StartupTimeout { .. }) => {
+                StartupStage::TimedOut
+            }
             Err(_) => StartupStage::Failed,
         };
         self.finished = true;

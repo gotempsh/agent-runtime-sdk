@@ -60,6 +60,10 @@ const SANDBOX_RETRY_PROMPT: &str = "The sandbox profile was updated with the app
 /// How long a cancelled provider may keep running after acknowledging an
 /// adapter-encoded interrupt, before the process tree is terminated anyway.
 const INTERRUPT_GRACE: Duration = Duration::from_secs(5);
+/// How long delivering an adapter-encoded interrupt may take. The frame is a
+/// few bytes, so a provider that does not accept it in this time has stopped
+/// reading its stdin (a full pipe while a tool runs) and will not act on it.
+const INTERRUPT_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 /// How long to wait for a terminated provider to be reaped when the turn ran
 /// over adapter-supplied protocol streams. The process is already being
 /// stopped; this only bounds how long the turn waits to observe it.
@@ -85,6 +89,17 @@ pub struct ProviderProcessRetention {
     pub initialization_timeout: Duration,
     /// Optional maximum silence while a submitted turn is active.
     pub active_inactivity_timeout: Option<Duration>,
+    /// Optional maximum silence once a turn has answered and only background
+    /// work (such as Claude subagents) keeps it open.
+    ///
+    /// A background task whose completion is never reported would otherwise
+    /// hold the turn open for as long as `active_inactivity_timeout` allows,
+    /// which an application that waits on background work leaves unbounded.
+    /// When this elapses the turn completes successfully with a
+    /// [`TurnEvent::Warning`] naming the tasks it stopped waiting for. The
+    /// process is parked with that work exactly as after a hand-off, so a task
+    /// that finishes later is still reported as a background follow-up.
+    pub held_task_quiet_timeout: Option<Duration>,
 }
 
 impl ProviderProcessRetention {
@@ -107,6 +122,15 @@ impl ProviderProcessRetention {
         {
             return Err(RuntimeError::InvalidRequest {
                 field: "provider_process_retention.active_inactivity_timeout",
+                message: "must be greater than zero when configured".to_string(),
+            });
+        }
+        if self
+            .held_task_quiet_timeout
+            .is_some_and(|timeout| timeout.is_zero())
+        {
+            return Err(RuntimeError::InvalidRequest {
+                field: "provider_process_retention.held_task_quiet_timeout",
                 message: "must be greater than zero when configured".to_string(),
             });
         }
@@ -143,10 +167,61 @@ struct CodexProcessSupervisorInner {
     processes: AsyncMutex<HashMap<crate::lifecycle::RuntimeId, Arc<RetainedCodexProcess>>>,
     /// Runtimes whose parked process started answering background work.
     follow_ups: tokio::sync::broadcast::Sender<crate::lifecycle::RuntimeId>,
+    /// Parked processes that ended with background work still running.
+    parked_ends: tokio::sync::broadcast::Sender<ParkedProcessEnded>,
 }
 
 /// Announcements a slow subscriber may fall behind by before missing some.
 const FOLLOW_UP_ANNOUNCEMENTS: usize = 64;
+
+/// A parked process that ended while background work it started was still
+/// running, taking that work with it.
+///
+/// Announced by [`AgentRuntime::subscribe_parked_process_ends`]. Nobody asked
+/// for this: [`crate::retained::RuntimeClient::dispose`] and a configuration
+/// change the caller requested are not announced, and a process retires on
+/// its own only once its background work has finished. The provider never
+/// reports these tasks' end, so while the process is parked this is the only
+/// notice that they stopped.
+///
+/// Only a parked process is announced. Once a turn claims the process, its
+/// tasks are that turn's: if the process has died the turn fails, and
+/// [`AgentRuntime::parked_background_tasks`] read after it no longer lists
+/// them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParkedProcessEnded {
+    /// The runtime whose parked process ended.
+    pub runtime_id: crate::lifecycle::RuntimeId,
+    /// Provider ids of the background tasks it was still running, as
+    /// [`AgentRuntime::parked_background_tasks`] reported them.
+    pub task_ids: Vec<String>,
+    /// Why the process ended.
+    pub reason: ParkedProcessEndReason,
+}
+
+/// Why a parked process ended with its background work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ParkedProcessEndReason {
+    /// The provider process exited, or closed its output or input.
+    Exited,
+    /// The process wrote output the runtime could not read, so it was retired.
+    UnreadableOutput,
+    /// A turn resumed a different provider session, which replaced it.
+    Replaced,
+}
+
+impl ParkedProcessEndReason {
+    /// The reason in words, for a message about the stopped tasks.
+    #[must_use]
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::Exited => "the agent's process exited",
+            Self::UnreadableOutput => "the agent's process wrote output that could not be read",
+            Self::Replaced => "a turn resumed a different session in a new process",
+        }
+    }
+}
 
 impl CodexProcessSupervisor {
     fn new(config: ProviderProcessRetention) -> Self {
@@ -156,6 +231,7 @@ impl CodexProcessSupervisor {
                 permits: Arc::new(Semaphore::new(config.max_processes)),
                 processes: AsyncMutex::new(HashMap::new()),
                 follow_ups: tokio::sync::broadcast::channel(FOLLOW_UP_ANNOUNCEMENTS).0,
+                parked_ends: tokio::sync::broadcast::channel(FOLLOW_UP_ANNOUNCEMENTS).0,
             }),
         }
     }
@@ -166,6 +242,25 @@ impl CodexProcessSupervisor {
             process.terminate().await?;
         }
         Ok(())
+    }
+
+    /// Tell subscribers that `runtime_id`'s parked process ended with
+    /// `task_ids` still running. Nothing to tell without tasks.
+    fn announce_parked_end(
+        &self,
+        runtime_id: &crate::lifecycle::RuntimeId,
+        task_ids: Vec<String>,
+        reason: ParkedProcessEndReason,
+    ) {
+        if task_ids.is_empty() {
+            return;
+        }
+        // No subscriber is fine: nobody is tracking these tasks.
+        let _ = self.inner.parked_ends.send(ParkedProcessEnded {
+            runtime_id: runtime_id.clone(),
+            task_ids,
+            reason,
+        });
     }
 
     async fn remove_if_same(
@@ -206,6 +301,17 @@ fn retained_fingerprint_command(provider: Provider, mut command: CommandSpec) ->
         while let Some(argument) = arguments.next() {
             if argument == "--resume" || CLAUDE_LIVE_FLAGS.iter().any(|flag| argument == *flag) {
                 let _ = arguments.next();
+            } else if argument == "--settings" {
+                // Fast mode and ultracode travel in this JSON and switch in
+                // place; anything else it holds still decides on a new process.
+                match arguments.next() {
+                    Some(value) => {
+                        if let Some(rest) = without_live_settings(&value) {
+                            filtered.extend(["--settings".into(), rest]);
+                        }
+                    }
+                    None => filtered.push(argument),
+                }
             } else if argument != CLAUDE_BYPASS_FLAG {
                 filtered.push(argument);
             }
@@ -214,6 +320,27 @@ fn retained_fingerprint_command(provider: Provider, mut command: CommandSpec) ->
     }
     command
 }
+
+/// The `--settings` JSON without the keys a live process switches in place
+/// (`fastMode`, `ultracode`), or `None` when nothing else is left. Anything that is not a
+/// JSON object is kept as it is.
+fn without_live_settings(value: &std::ffi::OsStr) -> Option<std::ffi::OsString> {
+    let Some(serde_json::Value::Object(mut settings)) = value
+        .to_str()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+    else {
+        return Some(value.to_owned());
+    };
+    settings.remove(CLAUDE_FAST_MODE_SETTING);
+    settings.remove(CLAUDE_ULTRACODE_SETTING);
+    (!settings.is_empty()).then(|| serde_json::Value::Object(settings).to_string().into())
+}
+
+/// The setting key Claude Code reads Fast mode from.
+const CLAUDE_FAST_MODE_SETTING: &str = "fastMode";
+/// The setting key Claude Code reads ultracode (standing workflow
+/// orchestration) from.
+const CLAUDE_ULTRACODE_SETTING: &str = "ultracode";
 
 /// Claude flags whose settings a live process can switch between turns.
 const CLAUDE_LIVE_FLAGS: [&str; 3] = ["--model", "--effort", "--permission-mode"];
@@ -226,13 +353,16 @@ const CLAUDE_SETTINGS_SWITCH_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_SWITCH_UNSOLICITED_FRAMES: usize = 64;
 
 /// The Claude settings a retained process can switch in place between turns:
-/// model (`set_model`), effort (`apply_flag_settings`) and permission mode
-/// (`set_permission_mode`). Changing anything else needs a new process.
+/// model (`set_model`), effort, Fast mode and ultracode (`apply_flag_settings`)
+/// and permission mode (`set_permission_mode`). Changing anything else needs a new
+/// process.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct ClaudeLiveSettings {
     model: Option<String>,
     effort: Option<String>,
     permission_mode: Option<String>,
+    fast_mode: Option<bool>,
+    ultracode: Option<bool>,
 }
 
 impl ClaudeLiveSettings {
@@ -252,6 +382,13 @@ impl ClaudeLiveSettings {
                 Some("--model") => settings.model = value(&mut arguments),
                 Some("--effort") => settings.effort = value(&mut arguments),
                 Some("--permission-mode") => settings.permission_mode = value(&mut arguments),
+                Some("--settings") => {
+                    let json = value(&mut arguments)
+                        .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok());
+                    let flag = |key: &str| json.as_ref()?.get(key)?.as_bool();
+                    settings.fast_mode = flag(CLAUDE_FAST_MODE_SETTING);
+                    settings.ultracode = flag(CLAUDE_ULTRACODE_SETTING);
+                }
                 Some(CLAUDE_BYPASS_FLAG) => bypass_allowed = true,
                 _ => {}
             }
@@ -311,6 +448,35 @@ impl ClaudeProcessSettings {
                 "settings": {"effortLevel": wanted.effort},
             }));
         }
+        if current
+            .as_ref()
+            .is_none_or(|current| current.fast_mode != wanted.fast_mode)
+        {
+            if wanted.fast_mode.is_none() && self.launch.fast_mode.is_some() {
+                return Err("the default Fast mode".to_owned());
+            }
+            requests.push(serde_json::json!({
+                "subtype": "apply_flag_settings",
+                "settings": {CLAUDE_FAST_MODE_SETTING: wanted.fast_mode},
+            }));
+        }
+        if current
+            .as_ref()
+            .is_none_or(|current| current.ultracode != wanted.ultracode)
+        {
+            // Clearing the setting does not undo a value the launch set, so
+            // such a launch is turned off explicitly. Otherwise clearing it
+            // restores what a launch without it has (the user's own setting).
+            let ultracode = match (wanted.ultracode, self.launch.ultracode) {
+                (Some(on), _) => serde_json::Value::Bool(on),
+                (None, Some(_)) => serde_json::Value::Bool(false),
+                (None, None) => serde_json::Value::Null,
+            };
+            requests.push(serde_json::json!({
+                "subtype": "apply_flag_settings",
+                "settings": {CLAUDE_ULTRACODE_SETTING: ultracode},
+            }));
+        }
         if changed(|settings| &settings.permission_mode) {
             match wanted.permission_mode.as_deref() {
                 Some("bypassPermissions") if !self.bypass_allowed => {
@@ -359,6 +525,83 @@ fn describe_restart(old: &RetainedCodexFingerprint, new: &RetainedCodexFingerpri
         changes.push("a different launch command");
     }
     changes.join(", ")
+}
+
+/// `request` on the model, reasoning and auto-compaction policy a retained
+/// process already runs, or `None` when something else differs: everything
+/// else decides what the agent can reach, so it is never deferred.
+///
+/// The launch command also carries these settings, so it is left out here and
+/// checked when the returned turn claims the process.
+///
+/// A Claude fingerprint leaves out the model and effort, which switch in
+/// place, so for Claude they come from `claude`: the process's settings and
+/// the ones this turn wants. Unknown live settings (after a failed switch)
+/// leave nothing to fall back to.
+fn with_retained_turn_settings(
+    request: &TurnRequest,
+    running: &RetainedCodexFingerprint,
+    wanted: &RetainedCodexFingerprint,
+    claude: Option<(&ClaudeProcessSettings, &ClaudeLiveSettings)>,
+) -> Option<TurnRequest> {
+    let deferrable_cleared = |fingerprint: &RetainedCodexFingerprint| RetainedCodexFingerprint {
+        command: CommandSpec::new(""),
+        model: None,
+        reasoning: None,
+        auto_compaction: crate::AutoCompactionPolicy::default(),
+        ..fingerprint.clone()
+    };
+    if deferrable_cleared(running) != deferrable_cleared(wanted) {
+        return None;
+    }
+    let mut kept = request.clone();
+    kept.auto_compaction = running.auto_compaction;
+    if request.provider != Provider::Claude {
+        if running.model != wanted.model {
+            kept.model.clone_from(&running.model);
+        }
+        if running.reasoning != wanted.reasoning {
+            kept.reasoning.clone_from(&running.reasoning);
+        }
+        return Some(kept);
+    }
+    let (process, wanted_live) = claude?;
+    let current = process
+        .current
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()?;
+    // What Claude cannot switch in place: back to the default model or effort
+    // after launching with one, and turning thinking off or back on.
+    if wanted_live.model.is_none() && process.launch.model.is_some() {
+        kept.model.clone_from(&current.model);
+    }
+    let thinking_changed = running.reasoning != wanted.reasoning;
+    if thinking_changed || (wanted_live.effort.is_none() && process.launch.effort.is_some()) {
+        kept.reasoning = if running.reasoning.as_deref() == Some("off") {
+            Some("off".to_owned())
+        } else if current.ultracode == Some(true) {
+            Some("ultracode".to_owned())
+        } else {
+            current.effort.clone()
+        };
+    }
+    Some(kept)
+}
+
+/// Whether a retained process is usable and still runs background work, the
+/// only reason a turn keeps its settings (`TurnRequest::keep_background_work`).
+fn parked_with_background_work(adapter: &dyn AgentAdapter, process: &RetainedCodexProcess) -> bool {
+    process.usable.load(Ordering::Acquire) && retained_background_tasks(adapter, process).is_some()
+}
+
+/// The turn as it was asked for, run when keeping the process's settings no
+/// longer keeps any background work. It does not fall back again, so a
+/// process that keeps changing cannot send a turn back and forth.
+fn as_asked(request: &TurnRequest) -> TurnRequest {
+    let mut asked = request.clone();
+    asked.keep_background_work = false;
+    asked
 }
 
 /// The background work a retained process still runs for a parked turn,
@@ -445,7 +688,10 @@ async fn switch_claude_settings(
                     return Err(error.chars().take(200).collect());
                 }
             } else if process.handoff.pending() {
-                if !park_frame(adapter, &process.handoff, provider, io, &line).await {
+                if park_frame(adapter, &process.handoff, provider, io, &line)
+                    .await
+                    .is_err()
+                {
                     return Err("background output could not be read".to_owned());
                 }
             } else if unsolicited.len() < MAX_SWITCH_UNSOLICITED_FRAMES {
@@ -483,6 +729,11 @@ struct RetainedCodexProcess {
 #[derive(Default)]
 struct RetainedHandoff {
     ready: AtomicBool,
+    /// The process has already answered a turn. A reused process is not
+    /// starting up, so its silence is judged by the active limits rather than
+    /// the (short) initialization deadline: it may be busy finishing work an
+    /// earlier turn left behind, or running a long tool for a queued message.
+    initialized: AtomicBool,
     wake: Notify,
     request: Mutex<Option<oneshot::Sender<bool>>>,
     /// Parser state of the turn that yielded, until the next turn claims it.
@@ -950,6 +1201,17 @@ impl RetainedCodexProcess {
             .is_some_and(|state| answered_while_parked || adapter.retained_follow_up_pending(state))
     }
 
+    /// Take the background tasks this process still runs while parked, as
+    /// `adapter` tracks them, to announce that they ended with it. Empty
+    /// unless it is parked with background work, or once taken: only the one
+    /// that ends the process announces them.
+    fn take_parked_task_ids(&self, adapter: &dyn AgentAdapter) -> Vec<String> {
+        self.handoff
+            .take_inherited()
+            .map(|state| adapter.retained_background_task_ids(&state))
+            .unwrap_or_default()
+    }
+
     /// Mark the process unusable unless a turn claimed it after `generation`.
     ///
     /// Returns whether the caller now owns terminating it.
@@ -960,6 +1222,35 @@ impl RetainedCodexProcess {
         }
         self.usable.store(false, Ordering::Release);
         true
+    }
+
+    /// [`Self::retire_if_unclaimed`] for a parked process, taking the tasks
+    /// it still runs ([`Self::take_parked_task_ids`]) when the caller now owns
+    /// terminating it.
+    async fn retire_parked_if_unclaimed(
+        &self,
+        generation: u64,
+        adapter: &dyn AgentAdapter,
+    ) -> Option<Vec<String>> {
+        let io = self.io.lock().await;
+        self.retire_parked(io.as_ref(), generation, adapter)
+    }
+
+    /// [`Self::retire_parked_if_unclaimed`] for a caller already holding
+    /// the process's I/O, `io`.
+    fn retire_parked(
+        &self,
+        io: Option<&RetainedCodexIo>,
+        generation: u64,
+        adapter: &dyn AgentAdapter,
+    ) -> Option<Vec<String>> {
+        if io.is_none() || self.generation.load(Ordering::Acquire) != generation {
+            return None;
+        }
+        self.usable.store(false, Ordering::Release);
+        // Under the I/O lock, so a turn replacing the process meanwhile
+        // terminates it only after this, and finds no tasks to announce.
+        Some(self.take_parked_task_ids(adapter))
     }
 
     async fn terminate(&self) -> Result<()> {
@@ -1312,24 +1603,39 @@ async fn supervise_parked_retained_process(
     let mut idle_since: Option<tokio::time::Instant> = None;
     let mut last_frame = tokio::time::Instant::now();
     let mut announced = false;
-    loop {
-        let healthy = {
-            let mut io = retained.io.lock().await;
+    // Why the process failed, with the tasks it took along, when it did;
+    // `None` once its work is done.
+    let failure = loop {
+        let read = {
+            let mut guard = retained.io.lock().await;
             if !current(&retained) {
                 return;
             }
-            let Some(io) = io.as_mut() else { return };
-            match read_idle_retained_line(&mut io.reader, max_event_line_bytes).await {
-                None => true,
+            let Some(io) = guard.as_mut() else { return };
+            let read = match read_idle_retained_line(&mut io.reader, max_event_line_bytes).await {
+                None => Ok(()),
                 Some(Ok(Some(line))) => {
                     last_frame = tokio::time::Instant::now();
                     park_frame(adapter.as_ref(), &retained.handoff, provider, io, &line).await
                 }
-                Some(Ok(None) | Err(_)) => false,
-            }
+                Some(Ok(None)) => Err(ParkedProcessEndReason::Exited),
+                Some(Err(error)) => Err(match error.kind() {
+                    // An oversized or never-completed frame.
+                    std::io::ErrorKind::InvalidData | std::io::ErrorKind::TimedOut => {
+                        ParkedProcessEndReason::UnreadableOutput
+                    }
+                    _ => ParkedProcessEndReason::Exited,
+                }),
+            };
+            // Retired before its I/O is let go: a turn waiting to claim the
+            // failed process starts a new one instead of inheriting its tasks.
+            read.map_err(|reason| {
+                let task_ids = retained.retire_parked(guard.as_ref(), generation, adapter.as_ref());
+                (reason, task_ids)
+            })
         };
-        if !healthy {
-            break;
+        if let Err(failed) = read {
+            break Some(failed);
         }
         if !announced
             && retained
@@ -1359,38 +1665,55 @@ async fn supervise_parked_retained_process(
             .elapsed()
             >= idle_timeout
         {
-            break;
+            break None;
         }
-    }
+    };
     // Output nobody claimed is dropped with the process; the provider's own
     // session transcript still records the conversation.
-    if retained.retire_if_unclaimed(generation).await {
-        supervisor.remove_if_same(&runtime_id, &retained).await;
-        let _ = retained.terminate().await;
+    let stopped = match failure {
+        Some((reason, Some(task_ids))) => Some((reason, task_ids)),
+        Some((_, None)) => return,
+        None => {
+            if retained
+                .retire_parked_if_unclaimed(generation, adapter.as_ref())
+                .await
+                .is_none()
+            {
+                return;
+            }
+            None
+        }
+    };
+    supervisor.remove_if_same(&runtime_id, &retained).await;
+    let _ = retained.terminate().await;
+    // The tasks the process was still running end with it, and nothing else
+    // will ever report that.
+    if let Some((reason, task_ids)) = stopped {
+        supervisor.announce_parked_end(&runtime_id, task_ids, reason);
     }
 }
 
 /// Parse and buffer one frame read from a parked process.
 ///
-/// Returns `false` when the process must be retired.
+/// Returns why the process must be retired, when it must.
 async fn park_frame(
     adapter: &dyn AgentAdapter,
     handoff: &RetainedHandoff,
     provider: Provider,
     io: &mut RetainedCodexIo,
     line: &str,
-) -> bool {
+) -> std::result::Result<(), ParkedProcessEndReason> {
     let (output, follow_up) = {
         let mut inherited = handoff
             .inherited
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(state) = inherited.as_mut() else {
-            return false;
+            return Err(ParkedProcessEndReason::UnreadableOutput);
         };
         match adapter.parse_line(line, state) {
             Ok(output) => (output, adapter.retained_follow_up_pending(state)),
-            Err(_) => return false,
+            Err(_) => return Err(ParkedProcessEndReason::UnreadableOutput),
         }
     };
     let mut writes = output.writes;
@@ -1411,7 +1734,7 @@ async fn park_frame(
                     "Too many requests are waiting for the next turn",
                 ) {
                     Ok(response) => writes.extend(response),
-                    Err(_) => return false,
+                    Err(_) => return Err(ParkedProcessEndReason::UnreadableOutput),
                 }
                 declined = true;
             }
@@ -1422,10 +1745,10 @@ async fn park_frame(
         .await
         .is_err()
     {
-        return false;
+        return Err(ParkedProcessEndReason::Exited);
     }
     write_optional_frames(Some(&mut io.stdin), &output.optional_writes).await;
-    true
+    Ok(())
 }
 
 /// Whether `event` announces an approval or question awaiting an answer.
@@ -1472,6 +1795,29 @@ async fn write_provider_frames(
             stream,
             source,
         })
+}
+
+/// Deliver an adapter-encoded interrupt, giving up after
+/// [`INTERRUPT_WRITE_TIMEOUT`].
+///
+/// A provider busy inside a tool may stop reading its stdin; an unbounded
+/// write would then hold cancellation (and the process-tree cleanup that
+/// follows it) until the tool ended on its own. Returns whether the frame was
+/// written. After a timeout the writer may hold a partial frame, so callers
+/// stop using it and terminate the provider.
+async fn write_interrupt_frame(
+    provider: Provider,
+    stdin: Option<&mut FrameWriter>,
+    frame: &[u8],
+) -> bool {
+    matches!(
+        tokio::time::timeout(
+            INTERRUPT_WRITE_TIMEOUT,
+            write_provider_frames(provider, stdin, &[frame.to_vec()], "interrupt"),
+        )
+        .await,
+        Ok(Ok(()))
+    )
 }
 
 /// Write [`AdapterOutput::optional_writes`] without ever waiting for them.
@@ -1538,6 +1884,26 @@ async fn finish_retained_turn(
 /// lets outlive the turn (Claude's background shells) keeps the process
 /// parked with the parser state, which a continuation or the next turn
 /// picks up; otherwise the process waits idle for the next turn.
+/// What a turn tells its viewers when it stops waiting for background work
+/// that reported nothing for `quiet`.
+fn held_work_warning(quiet: Duration, work: &[String]) -> String {
+    let minutes = quiet.as_secs().div_ceil(60).max(1);
+    let waited = if quiet.as_secs() < 60 {
+        format!("{} seconds", quiet.as_secs())
+    } else {
+        format!("{minutes} minute{}", if minutes == 1 { "" } else { "s" })
+    };
+    let names = if work.is_empty() {
+        "background work".to_owned()
+    } else {
+        work.join("; ")
+    };
+    format!(
+        "Stopped waiting for {names}: it reported nothing for {waited}. It may still be running; \
+         its result is delivered as a follow-up if it finishes."
+    )
+}
+
 async fn complete_retained_turn(
     adapter: &dyn AgentAdapter,
     request: &TurnRequest,
@@ -1564,14 +1930,7 @@ async fn cancel_running_process(
 ) -> RuntimeError {
     if stdin.is_some() {
         if let Some(frame) = adapter.interrupt_request(state) {
-            let delivered = write_provider_frames(
-                provider,
-                stdin.as_mut(),
-                std::slice::from_ref(&frame),
-                "interrupt",
-            )
-            .await
-            .is_ok();
+            let delivered = write_interrupt_frame(provider, stdin.as_mut(), &frame).await;
             // End-of-input lets a stdio protocol server exit on its own once
             // it has acknowledged the interrupt.
             stdin.take();
@@ -1922,6 +2281,7 @@ impl AgentRuntimeBuilder {
                     idle_timeout: config.idle_timeout,
                     initialization_timeout: Duration::from_secs(30),
                     active_inactivity_timeout: None,
+                    held_task_quiet_timeout: None,
                 })
         });
         Ok(AgentRuntime {
@@ -2299,6 +2659,35 @@ impl AgentRuntime {
     ) -> tokio::sync::broadcast::Receiver<crate::lifecycle::RuntimeId> {
         match &self.codex_process_retention {
             Some(supervisor) => supervisor.inner.follow_ups.subscribe(),
+            None => tokio::sync::broadcast::channel(1).1,
+        }
+    }
+
+    /// Announces parked processes that ended while background work they
+    /// started was still running, with that work's task ids and why.
+    ///
+    /// A retained turn can end while its background shells keep running in
+    /// the parked process ([`Self::parked_background_tasks`]). If that
+    /// process then exits (it crashed or was killed) or has to be retired,
+    /// the shells end with it and the provider never reports them again:
+    /// subscribe to settle those tasks and tell whoever waits on them.
+    /// A process a turn has claimed is not announced: compare
+    /// [`Self::parked_background_tasks`] after that turn instead. Without
+    /// process retention nothing is ever announced.
+    ///
+    /// A subscriber more than 64 announcements behind receives
+    /// [`tokio::sync::broadcast::error::RecvError::Lagged`] with how many it
+    /// missed. To catch up it rereads [`Self::parked_background_tasks`] for
+    /// each runtime it tracks that is not running a turn, and settles the
+    /// tasks no longer listed. A running turn owns its process's tasks, so
+    /// the list stays empty until that turn ends: compare then, as after any
+    /// turn. An announcement for a task it already settled this way can
+    /// still arrive, so settling a task twice must be harmless.
+    pub fn subscribe_parked_process_ends(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<ParkedProcessEnded> {
+        match &self.codex_process_retention {
+            Some(supervisor) => supervisor.inner.parked_ends.subscribe(),
             None => tokio::sync::broadcast::channel(1).1,
         }
     }
@@ -3918,6 +4307,7 @@ impl AgentRuntime {
                     events,
                     interactions.unwrap_or(&DenyAll),
                     trace,
+                    None,
                 )
                 .await
             } else {
@@ -4257,6 +4647,10 @@ impl AgentRuntime {
         events: &dyn EventSink,
         interactions: &dyn InteractionHandler,
         trace: &StartupTrace,
+        // Set when this is a turn re-run on the settings its process already
+        // has (see `TurnRequest::keep_background_work`): the turn as asked,
+        // and the refusal it would have met, as `(turn, change, tasks)`.
+        deferred: Option<(&TurnRequest, String, Vec<String>)>,
     ) -> Result<TurnResult> {
         let provider = request.provider;
         let initial_process = supervisor
@@ -4266,6 +4660,27 @@ impl AgentRuntime {
             .await
             .get(runtime_id)
             .cloned();
+        // The work this re-run keeps the settings for may have ended, or its
+        // process gone, since the first run: a new process stops nothing now,
+        // so the turn runs as asked.
+        if let Some((asked, ..)) = &deferred {
+            if !initial_process
+                .as_deref()
+                .is_some_and(|process| parked_with_background_work(adapter.as_ref(), process))
+            {
+                return Box::pin(self.run_retained_codex_process(
+                    supervisor,
+                    runtime_id,
+                    adapter,
+                    &as_asked(asked),
+                    events,
+                    interactions,
+                    trace,
+                    None,
+                ))
+                .await;
+            }
+        }
         // Checked before anything is prepared: a continuation never starts,
         // replaces or prompts a process.
         if request.continuation
@@ -4306,7 +4721,10 @@ impl AgentRuntime {
         for (name, value) in &request.environment {
             spec.environment.insert(name.into(), value.expose().into());
         }
-        trace.record(StartupStage::CommandPrepared);
+        // A re-run's stages were already recorded by the run before it.
+        if deferred.is_none() {
+            trace.record(StartupStage::CommandPrepared);
+        }
         if let Some(sandbox) = &request.sandbox {
             let context = SandboxContext {
                 provider,
@@ -4316,7 +4734,9 @@ impl AgentRuntime {
                 _ = request.cancellation.cancelled() => return Err(RuntimeError::Cancelled { provider }),
                 prepared = sandbox.prepare(context, spec) => prepared?,
             };
-            trace.record(StartupStage::SandboxPrepared);
+            if deferred.is_none() {
+                trace.record(StartupStage::SandboxPrepared);
+            }
         }
         let capabilities = self.transport.capabilities();
         if provider != Provider::OpenCode
@@ -4337,8 +4757,9 @@ impl AgentRuntime {
                 message: format!("retained {provider} requires complete process-tree termination"),
             });
         }
-        // A Claude process switches model, effort and permission mode in
-        // place, so they are left out of what decides on a new process.
+        // A Claude process switches model, effort, Fast mode, ultracode and
+        // permission mode in place, so they are left out of what decides on a
+        // new process.
         let claude_live =
             (provider == Provider::Claude).then(|| ClaudeLiveSettings::from_args(&spec.args));
         let fingerprint = RetainedCodexFingerprint {
@@ -4349,12 +4770,12 @@ impl AgentRuntime {
             } else {
                 request.model.clone()
             },
-            // Turning thinking off, or ultracode on, still needs a new one.
+            // Turning thinking off still needs a new one.
             reasoning: if claude_live.is_some() {
                 request
                     .reasoning
                     .clone()
-                    .filter(|reasoning| matches!(reasoning.as_str(), "off" | "ultracode"))
+                    .filter(|reasoning| reasoning == "off")
             } else {
                 request.reasoning.clone()
             },
@@ -4367,6 +4788,7 @@ impl AgentRuntime {
                 let mut options = request.harness_options.clone();
                 if claude_live.is_some() {
                     options.remove("permission_mode");
+                    options.remove("fast_mode");
                 }
                 options
             },
@@ -4376,46 +4798,115 @@ impl AgentRuntime {
         };
 
         let mut settings_switch = None;
+        // This turn on the process's own model, reasoning and auto-compaction
+        // policy, when only those would replace a process that still runs
+        // background work.
+        let mut kept_turn = None;
+        // A re-run whose reason to keep the settings went while it prepared.
+        let mut run_as_asked = false;
         let previous = {
             let mut processes = supervisor.inner.processes.lock().await;
-            match processes.get(runtime_id) {
-                Some(process) if process.usable.load(Ordering::Acquire) => {
-                    // A continuation resumes the parked process as it is;
-                    // this turn's settings apply from the next prompt on.
-                    let reuse = if request.continuation {
-                        Ok(Vec::new())
-                    } else if process.fingerprint == fingerprint {
-                        match (&process.claude_settings, &claude_live) {
-                            (Some(settings), Some((wanted, _))) => settings.switch_to(wanted),
-                            _ => Ok(Vec::new()),
-                        }
-                    } else {
-                        Err(describe_restart(&process.fingerprint, &fingerprint))
-                    };
-                    match reuse {
-                        Ok(requests) => {
-                            settings_switch = (!requests.is_empty()).then_some(requests);
-                            None
-                        }
-                        // Never stop background work nobody asked to stop.
-                        Err(change) => {
-                            if let Some(tasks) =
-                                retained_background_tasks(adapter.as_ref(), process)
-                            {
-                                return Err(RuntimeError::RestartWouldStopBackgroundWork {
-                                    provider,
-                                    change,
-                                    tasks,
-                                });
+            if deferred.is_some()
+                && !processes
+                    .get(runtime_id)
+                    .is_some_and(|process| parked_with_background_work(adapter.as_ref(), process))
+            {
+                run_as_asked = true;
+                None
+            } else {
+                match processes.get(runtime_id) {
+                    Some(process) if process.usable.load(Ordering::Acquire) => {
+                        // A continuation resumes the parked process as it is;
+                        // this turn's settings apply from the next prompt on.
+                        let reuse = if request.continuation {
+                            Ok(Vec::new())
+                        } else if process.fingerprint == fingerprint {
+                            match (&process.claude_settings, &claude_live) {
+                                (Some(settings), Some((wanted, _))) => settings.switch_to(wanted),
+                                _ => Ok(Vec::new()),
                             }
-                            processes.remove(runtime_id)
+                        } else {
+                            Err(describe_restart(&process.fingerprint, &fingerprint))
+                        };
+                        match reuse {
+                            Ok(requests) => {
+                                settings_switch = (!requests.is_empty()).then_some(requests);
+                                None
+                            }
+                            // Never stop background work nobody asked to stop.
+                            Err(change) => {
+                                if let Some(tasks) =
+                                    retained_background_tasks(adapter.as_ref(), process)
+                                {
+                                    // A re-run that still does not match reports
+                                    // what the turn itself asked for.
+                                    let (change, tasks) = deferred
+                                        .as_ref()
+                                        .map_or((change, tasks), |(_, change, tasks)| {
+                                            (change.clone(), tasks.clone())
+                                        });
+                                    let kept = (request.keep_background_work && deferred.is_none())
+                                        .then(|| {
+                                            with_retained_turn_settings(
+                                                request,
+                                                &process.fingerprint,
+                                                &fingerprint,
+                                                process.claude_settings.as_ref().zip(
+                                                    claude_live.as_ref().map(|(wanted, _)| wanted),
+                                                ),
+                                            )
+                                        })
+                                        .flatten();
+                                    let Some(kept) = kept else {
+                                        return Err(RuntimeError::RestartWouldStopBackgroundWork {
+                                            provider,
+                                            change,
+                                            tasks,
+                                        });
+                                    };
+                                    kept_turn = Some((kept, change, tasks));
+                                    None
+                                } else {
+                                    processes.remove(runtime_id)
+                                }
+                            }
                         }
                     }
+                    Some(_) => processes.remove(runtime_id),
+                    None => None,
                 }
-                Some(_) => processes.remove(runtime_id),
-                None => None,
             }
         };
+        if run_as_asked {
+            if let Some((asked, ..)) = &deferred {
+                drop(reserved_permit);
+                return Box::pin(self.run_retained_codex_process(
+                    supervisor,
+                    runtime_id,
+                    adapter,
+                    &as_asked(asked),
+                    events,
+                    interactions,
+                    trace,
+                    None,
+                ))
+                .await;
+            }
+        }
+        if let Some((kept, change, tasks)) = kept_turn {
+            drop(reserved_permit);
+            return Box::pin(self.run_retained_codex_process(
+                supervisor,
+                runtime_id,
+                adapter,
+                &kept,
+                events,
+                interactions,
+                trace,
+                Some((request, change, tasks)),
+            ))
+            .await;
+        }
         let mut available_permit = reserved_permit;
         if let Some(previous) = previous {
             // Transfer the slot before teardown. This makes a configuration
@@ -4440,7 +4931,18 @@ impl AgentRuntime {
                 if available_permit.is_none() {
                     available_permit = candidate.permit.lock().await.take();
                 }
-                candidate.terminate().await?;
+                let terminated = candidate.terminate().await;
+                // Taken only once `terminate` held the I/O: a frame the parked
+                // supervisor was still parsing may have finished a task, and a
+                // supervisor that retired the process first took the tasks to
+                // announce them itself. Removed from the pool, the process's
+                // tasks are gone even when terminating it failed.
+                supervisor.announce_parked_end(
+                    runtime_id,
+                    candidate.take_parked_task_ids(adapter.as_ref()),
+                    ParkedProcessEndReason::Replaced,
+                );
+                terminated?;
                 existing = None;
             }
         }
@@ -4466,7 +4968,7 @@ impl AgentRuntime {
                         .emit(TurnEvent::ProviderProcessStatus {
                             status: crate::ProviderProcessStatus::Checking,
                             message: "Switching the retained Claude process to this turn's \
-                                      model, effort and permission mode."
+                                      model, effort, Fast mode, ultracode and permission mode."
                                 .to_string(),
                         })
                         .await?;
@@ -4767,6 +5269,23 @@ impl AgentRuntime {
         let retained = if let Some(existing) = existing {
             existing
         } else {
+            // The kept process went (it failed its check, or was retired), and
+            // its work with it: a new one stops nothing, so it starts as asked.
+            if let Some((asked, ..)) = &deferred {
+                // Its capacity goes back to the pool for that run to take.
+                drop(available_permit);
+                return Box::pin(self.run_retained_codex_process(
+                    supervisor,
+                    runtime_id,
+                    adapter,
+                    &as_asked(asked),
+                    events,
+                    interactions,
+                    trace,
+                    None,
+                ))
+                .await;
+            }
             if available_permit.is_none() {
                 if let Some(initial) = &initial_process {
                     available_permit = initial.permit.lock().await.take();
@@ -4926,6 +5445,14 @@ impl AgentRuntime {
             runtime_id: runtime_id.clone(),
             process: Arc::clone(&retained),
         };
+        // A re-run reaching here has its kept process (a new one runs as
+        // asked): say what waits, and for what. Cleanup is armed, so a
+        // failure to tell the caller ends the turn like any other failure.
+        if let Some((_, change, tasks)) = deferred {
+            events
+                .emit(TurnEvent::SettingsDeferred { change, tasks })
+                .await?;
+        }
         let mut io_guard = retained.io.lock().await;
         let io = io_guard.as_mut().ok_or_else(|| RuntimeError::Protocol {
             provider,
@@ -5239,7 +5766,8 @@ impl AgentRuntime {
         let mut first_output = true;
         // A continuation resumes an exchange already under way, so it is
         // past initialization from its first moment.
-        let mut saw_semantic_activity = request.continuation;
+        let mut saw_semantic_activity =
+            request.continuation || handoff.initialized.load(Ordering::Acquire);
         let mut turn_submitted = provider != Provider::OpenCode;
         let mut last_semantic_activity = tokio::time::Instant::now();
         let mut first_text = true;
@@ -5271,19 +5799,41 @@ impl AgentRuntime {
                     .active_inactivity_timeout
                     .unwrap_or(request.timeout)
             };
+            let starting = !saw_semantic_activity || !turn_submitted;
+            let timed_out = || {
+                if starting {
+                    RuntimeError::StartupTimeout {
+                        provider,
+                        seconds: inactivity_timeout.as_secs(),
+                    }
+                } else {
+                    RuntimeError::Timeout {
+                        provider,
+                        seconds: inactivity_timeout.as_secs(),
+                    }
+                }
+            };
             let deadline = last_semantic_activity + inactivity_timeout;
             let frame = if let Some(line) = prefetched_lines.pop_front() {
                 Some(ProviderFrame::Line(line))
             } else {
                 let handoff_ready = adapter.retained_handoff_ready(&state);
                 handoff.ready.store(handoff_ready, Ordering::Release);
+                // A turn that has answered and is held open only by
+                // background work stops waiting for it after the configured
+                // quiet period (never later than the inactivity deadline).
+                let held_quiet = retention
+                    .held_task_quiet_timeout
+                    .filter(|quiet| handoff_ready && *quiet < inactivity_timeout);
                 // Anchored to semantic activity like the inactivity deadline,
                 // so frames that carry nothing cannot postpone it. While armed
                 // it replaces that deadline: it is the shorter bound on a
                 // turn whose work is already done.
-                let quiet_completion = adapter
-                    .retained_completion_grace(&state)
-                    .map(|grace| last_semantic_activity + grace);
+                let grace = adapter.retained_completion_grace(&state);
+                let held_quiet = held_quiet.filter(|_| grace.is_none());
+                let quiet_completion = grace
+                    .or(held_quiet)
+                    .map(|quiet| last_semantic_activity + quiet);
                 // Wait for the next frame to begin without consuming it, so a
                 // hand-off or a quiet completion never splits a frame that
                 // the process (and the next turn) still owns.
@@ -5301,10 +5851,7 @@ impl AgentRuntime {
                         })?;
                     }
                     _ = tokio::time::sleep_until(deadline), if quiet_completion.is_none() => {
-                        return Err(RuntimeError::Timeout {
-                            provider,
-                            seconds: inactivity_timeout.as_secs(),
-                        });
+                        return Err(timed_out());
                     }
                     () = handoff.wake.notified() => {
                         if handoff.answer(adapter, &state) {
@@ -5321,6 +5868,16 @@ impl AgentRuntime {
                         continue;
                     }
                     () = tokio::time::sleep_until(quiet_completion.unwrap_or(deadline)), if quiet_completion.is_some() => {
+                        if let Some(quiet) = held_quiet {
+                            events
+                                .emit(TurnEvent::Warning {
+                                    message: held_work_warning(
+                                        quiet,
+                                        &adapter.retained_background_summary(&state),
+                                    ),
+                                })
+                                .await?;
+                        }
                         return complete_retained_turn(adapter, request, events, state).await;
                     }
                 }
@@ -5345,10 +5902,7 @@ impl AgentRuntime {
                             return Err(if cancel_seen {
                                 RuntimeError::Cancelled { provider }
                             } else {
-                                RuntimeError::Timeout {
-                                    provider,
-                                    seconds: inactivity_timeout.as_secs(),
-                                }
+                                timed_out()
                             });
                         }
                         _ = request.cancellation.cancelled(), if !cancel_seen => {
@@ -5411,6 +5965,7 @@ impl AgentRuntime {
                     })
                     .await?;
                 process_ready = true;
+                handoff.initialized.store(true, Ordering::Release);
             }
             for event in output.events {
                 if first_text && matches!(&event, TurnEvent::TextDelta { text } if !text.is_empty())
@@ -5564,14 +6119,7 @@ impl AgentRuntime {
         let Some(frame) = adapter.interrupt_request(&state) else {
             return Err(RuntimeError::Cancelled { provider });
         };
-        let delivered = write_provider_frames(
-            provider,
-            Some(&mut io.stdin),
-            std::slice::from_ref(&frame),
-            "interrupt",
-        )
-        .await
-        .is_ok();
+        let delivered = write_interrupt_frame(provider, Some(&mut io.stdin), &frame).await;
         if !delivered || adapter.retained_interrupt_settled(&state).is_none() {
             return Err(RuntimeError::Cancelled { provider });
         }
@@ -6872,6 +7420,8 @@ mod tests {
             model: model.map(str::to_owned),
             effort: effort.map(str::to_owned),
             permission_mode: Some(mode.to_owned()),
+            fast_mode: None,
+            ultracode: None,
         }
     }
 
@@ -6957,8 +7507,285 @@ mod tests {
             settings
                 .switch_to(&live(None, None, "bypassPermissions"))
                 .map(|requests| requests.len()),
-            Ok(3)
+            Ok(5)
         );
+    }
+
+    #[test]
+    fn claude_fast_mode_switches_in_place_and_does_not_decide_on_a_new_process() {
+        let command = |args: &[&str]| {
+            let mut spec = CommandSpec::new("claude");
+            spec.args = claude_args(args);
+            retained_fingerprint_command(Provider::Claude, spec).args
+        };
+        let plain = command(&["--print"]);
+        assert_eq!(
+            command(&["--print", "--settings", r#"{"fastMode":true}"#]),
+            plain
+        );
+        assert_eq!(
+            command(&["--print", "--settings", r#"{"fastMode":false}"#]),
+            plain
+        );
+        // What else the JSON holds still decides.
+        assert_ne!(
+            command(&[
+                "--print",
+                "--settings",
+                r#"{"ultracode":true,"fastMode":true,"model":"x"}"#
+            ]),
+            plain
+        );
+        assert_eq!(
+            command(&[
+                "--print",
+                "--settings",
+                r#"{"ultracode":true,"fastMode":true,"model":"x"}"#
+            ]),
+            command(&["--print", "--settings", r#"{"model":"x"}"#])
+        );
+
+        let (settings, _) = ClaudeLiveSettings::from_args(&claude_args(&[
+            "--settings",
+            r#"{"ultracode":true,"fastMode":true}"#,
+        ]));
+        assert_eq!(settings.fast_mode, Some(true));
+        let process = claude_process_settings(&["--settings", r#"{"fastMode":false}"#]);
+        let fast = |on| ClaudeLiveSettings {
+            fast_mode: Some(on),
+            ..live(None, None, "manual")
+        };
+        process.set_current(Some(fast(false)));
+        assert_eq!(process.switch_to(&fast(false)), Ok(Vec::new()));
+        assert_eq!(
+            process.switch_to(&fast(true)),
+            Ok(vec![serde_json::json!({
+                "subtype": "apply_flag_settings",
+                "settings": {"fastMode": true},
+            })])
+        );
+        // After a failed switch the live Fast mode is unknown, so it is reset
+        // even when the next turn does not mention it.
+        let unlaunched = claude_process_settings(&["--print"]);
+        unlaunched.set_current(None);
+        assert_eq!(
+            unlaunched.switch_to(&live(None, None, "manual")),
+            Ok(vec![
+                serde_json::json!({"subtype": "set_model", "model": null}),
+                serde_json::json!({"subtype": "apply_flag_settings",
+                    "settings": {"effortLevel": null}}),
+                serde_json::json!({"subtype": "apply_flag_settings",
+                    "settings": {"fastMode": null}}),
+                serde_json::json!({"subtype": "apply_flag_settings",
+                    "settings": {"ultracode": null}}),
+                serde_json::json!({"subtype": "set_permission_mode", "mode": "manual"}),
+            ])
+        );
+        // A launch with Fast mode set cannot be put back to Claude's default.
+        assert_eq!(
+            process.switch_to(&live(None, None, "manual")),
+            Err("the default Fast mode".to_owned())
+        );
+        process.set_current(None);
+        assert_eq!(
+            process.switch_to(&live(None, None, "manual")),
+            Err("the default Fast mode".to_owned())
+        );
+    }
+
+    #[test]
+    fn claude_ultracode_switches_in_place_and_does_not_decide_on_a_new_process() {
+        let command = |args: &[&str]| {
+            let mut spec = CommandSpec::new("claude");
+            spec.args = claude_args(args);
+            retained_fingerprint_command(Provider::Claude, spec).args
+        };
+        assert_eq!(
+            command(&[
+                "--print",
+                "--effort",
+                "xhigh",
+                "--settings",
+                r#"{"ultracode":true}"#
+            ]),
+            command(&["--print", "--effort", "high"])
+        );
+
+        let ultra = |on: Option<bool>, effort| ClaudeLiveSettings {
+            ultracode: on,
+            ..live(None, Some(effort), "manual")
+        };
+        let flag = |value: serde_json::Value| {
+            serde_json::json!({"subtype": "apply_flag_settings",
+                "settings": {"ultracode": value}})
+        };
+        let effort = |level: &str| {
+            serde_json::json!({"subtype": "apply_flag_settings",
+                "settings": {"effortLevel": level}})
+        };
+        let launched = claude_process_settings(&[
+            "--permission-mode",
+            "manual",
+            "--effort",
+            "xhigh",
+            "--settings",
+            r#"{"ultracode":true}"#,
+        ]);
+        assert_eq!(launched.launch.ultracode, Some(true));
+        assert_eq!(
+            launched.switch_to(&ultra(Some(true), "xhigh")),
+            Ok(Vec::new())
+        );
+        // Clearing the setting would keep the launch's value, so leaving
+        // ultracode turns it off explicitly.
+        assert_eq!(
+            launched.switch_to(&ultra(None, "high")),
+            Ok(vec![effort("high"), flag(serde_json::json!(false))])
+        );
+        launched.set_current(Some(ultra(None, "high")));
+        assert_eq!(
+            launched.switch_to(&ultra(Some(true), "xhigh")),
+            Ok(vec![effort("xhigh"), flag(serde_json::json!(true))])
+        );
+
+        // Launched without it, leaving ultracode clears the applied value,
+        // which restores what such a launch has.
+        let plain = claude_process_settings(&["--permission-mode", "manual", "--effort", "high"]);
+        assert_eq!(
+            plain.switch_to(&ultra(Some(true), "xhigh")),
+            Ok(vec![effort("xhigh"), flag(serde_json::json!(true))])
+        );
+        plain.set_current(Some(ultra(Some(true), "xhigh")));
+        assert_eq!(
+            plain.switch_to(&ultra(None, "high")),
+            Ok(vec![effort("high"), flag(serde_json::Value::Null)])
+        );
+        // After a failed switch it is unknown, so it is sent again.
+        launched.set_current(None);
+        assert!(launched
+            .switch_to(&ultra(None, "high"))
+            .unwrap()
+            .contains(&flag(serde_json::json!(false))));
+    }
+
+    #[test]
+    fn only_model_reasoning_and_compaction_are_deferred_to_keep_background_work() {
+        let fingerprint = |request: &TurnRequest| RetainedCodexFingerprint {
+            command: CommandSpec::new("codex"),
+            working_directory: request.working_directory.clone(),
+            model: request.model.clone(),
+            reasoning: request.reasoning.clone(),
+            permission_mode: request.permission_mode.clone(),
+            harness_options: request.harness_options.clone(),
+            launch_context: request.launch_context.clone(),
+            auto_compaction: request.auto_compaction,
+            required_sandbox_capabilities: request.required_sandbox_capabilities,
+        };
+        let mut running = TurnRequest::new(Provider::Codex, ".", "first");
+        running.model = Some("gpt-5".into());
+        running.reasoning = Some("high".into());
+        let mut wanted = TurnRequest::new(Provider::Codex, ".", "second");
+        wanted.model = Some("gpt-5-mini".into());
+        wanted.reasoning = Some("low".into());
+        wanted.auto_compaction = crate::AutoCompactionPolicy::Automatic;
+        wanted.keep_background_work = true;
+
+        let kept = with_retained_turn_settings(
+            &wanted,
+            &fingerprint(&running),
+            &fingerprint(&wanted),
+            None,
+        )
+        .expect("thinking and compaction are deferred");
+        assert_eq!(kept.prompt, "second");
+        assert_eq!(kept.model.as_deref(), Some("gpt-5"));
+        assert_eq!(kept.reasoning.as_deref(), Some("high"));
+        assert_eq!(
+            kept.auto_compaction,
+            crate::AutoCompactionPolicy::ProviderDefault
+        );
+
+        // Anything that decides what the agent can reach is never deferred.
+        let mut stricter = wanted.clone();
+        stricter.permission_mode = crate::PermissionMode::Plan;
+        assert!(with_retained_turn_settings(
+            &stricter,
+            &fingerprint(&running),
+            &fingerprint(&stricter),
+            None,
+        )
+        .is_none());
+        let mut elsewhere = wanted.clone();
+        elsewhere.working_directory = "/elsewhere".into();
+        assert!(with_retained_turn_settings(
+            &elsewhere,
+            &fingerprint(&running),
+            &fingerprint(&elsewhere),
+            None,
+        )
+        .is_none());
+
+        // Claude's fingerprint leaves out the model and effort: they come from
+        // the process's live settings.
+        let process = claude_process_settings(&[
+            "--permission-mode",
+            "manual",
+            "--model",
+            "opus",
+            "--effort",
+            "high",
+        ]);
+        let mut claude = TurnRequest::new(Provider::Claude, ".", "second");
+        claude.model = None;
+        claude.reasoning = None;
+        let defaults = live(None, None, "manual");
+        let kept = with_retained_turn_settings(
+            &claude,
+            &fingerprint(&claude),
+            &fingerprint(&claude),
+            Some((&process, &defaults)),
+        )
+        .expect("back to the defaults waits for the work");
+        assert_eq!(kept.model.as_deref(), Some("opus"));
+        assert_eq!(kept.reasoning.as_deref(), Some("high"));
+        // A switch the process can make is left alone.
+        let mut sonnet = claude.clone();
+        sonnet.model = Some("sonnet".into());
+        let kept = with_retained_turn_settings(
+            &sonnet,
+            &fingerprint(&sonnet),
+            &fingerprint(&sonnet),
+            Some((&process, &live(Some("sonnet"), None, "manual"))),
+        )
+        .unwrap();
+        assert_eq!(kept.model.as_deref(), Some("sonnet"));
+        assert_eq!(kept.reasoning.as_deref(), Some("high"));
+        // Turning thinking off keeps the process's effort, ultracode included.
+        let mut off = claude.clone();
+        off.reasoning = Some("off".into());
+        let mut not_off = fingerprint(&off);
+        not_off.reasoning = None;
+        process.set_current(Some(ClaudeLiveSettings {
+            ultracode: Some(true),
+            ..live(Some("opus"), Some("xhigh"), "manual")
+        }));
+        let kept = with_retained_turn_settings(
+            &off,
+            &not_off,
+            &fingerprint(&off),
+            Some((&process, &live(Some("opus"), None, "manual"))),
+        )
+        .unwrap();
+        assert_eq!(kept.reasoning.as_deref(), Some("ultracode"));
+        // After a failed switch the live settings are unknown.
+        process.set_current(None);
+        assert!(with_retained_turn_settings(
+            &claude,
+            &fingerprint(&claude),
+            &fingerprint(&claude),
+            Some((&process, &defaults)),
+        )
+        .is_none());
     }
 
     #[test]
@@ -8821,5 +9648,358 @@ mod tests {
             }
             panic!("provider grandchild {pid} survived cancellation");
         }
+    }
+
+    /// A parked Claude process on fake streams, its output already closed,
+    /// still running background shell `sh-1`, and the adapter tracking it.
+    #[cfg(feature = "claude")]
+    fn parked_claude_process() -> (crate::providers::Claude, Arc<RetainedCodexProcess>) {
+        parked_claude_process_reading(Box::new(tokio::io::empty()))
+    }
+
+    /// [`parked_claude_process`] whose output is read from `output`.
+    #[cfg(feature = "claude")]
+    fn parked_claude_process_reading(
+        output: crate::TransportReader,
+    ) -> (crate::providers::Claude, Arc<RetainedCodexProcess>) {
+        struct Live;
+        #[async_trait::async_trait]
+        impl crate::TransportProcessControl for Live {
+            async fn wait(&mut self) -> crate::TransportResult<crate::TransportExitStatus> {
+                std::future::pending().await
+            }
+            async fn terminate(&mut self) -> crate::TransportResult<()> {
+                Ok(())
+            }
+        }
+        let adapter = crate::providers::Claude::default();
+        let mut state = AdapterState::default();
+        adapter
+            .prepare_turn(
+                &TurnRequest::new(Provider::Claude, ".", "serve it"),
+                &mut state,
+            )
+            .unwrap();
+        adapter.mark_retained_turn(&mut state);
+        adapter
+            .parse_line(
+                r#"{"type":"system","subtype":"task_started","task_id":"sh-1","tool_use_id":"toolu_sh","description":"Run dev server","task_type":"local_bash","is_backgrounded":true}"#,
+                &mut state,
+            )
+            .unwrap();
+        assert_eq!(adapter.retained_background_task_ids(&state), ["sh-1"]);
+        let stream = || -> crate::TransportReader { Box::new(tokio::io::empty()) };
+        let process = crate::TransportProcess::new(
+            crate::TransportProcessHandle {
+                transport: "test".into(),
+                native_id: "parked".into(),
+            },
+            None,
+            None,
+            stream(),
+            stream(),
+            Live,
+        );
+        let request = TurnRequest::new(Provider::Claude, ".", "serve it");
+        let retained = Arc::new(RetainedCodexProcess {
+            provider: Provider::Claude,
+            fingerprint: RetainedCodexFingerprint {
+                command: CommandSpec::new("claude"),
+                working_directory: request.working_directory.clone(),
+                model: None,
+                reasoning: None,
+                permission_mode: request.permission_mode.clone(),
+                harness_options: request.harness_options.clone(),
+                launch_context: request.launch_context.clone(),
+                auto_compaction: request.auto_compaction,
+                required_sandbox_capabilities: request.required_sandbox_capabilities,
+            },
+            claude_settings: None,
+            io: AsyncMutex::new(Some(RetainedCodexIo {
+                process,
+                stdin: FrameWriter::new(Box::new(tokio::io::sink())),
+                reader: BufReader::new(output),
+                stderr_task: tokio::spawn(async { Ok(String::new()) }),
+                stdout_task: None,
+            })),
+            generation: AtomicU64::new(0),
+            usable: AtomicBool::new(true),
+            process_hint: None,
+            session_id: AsyncMutex::new(None),
+            permit: AsyncMutex::new(None),
+            handoff: RetainedHandoff::default(),
+        });
+        *retained
+            .handoff
+            .inherited
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(state);
+        (adapter, retained)
+    }
+
+    #[cfg(feature = "claude")]
+    #[tokio::test]
+    async fn a_parked_process_retired_first_leaves_a_replacement_nothing_to_announce() {
+        let (adapter, retained) = parked_claude_process();
+        // The parked supervisor saw the process fail and retires it...
+        assert_eq!(
+            retained.retire_parked_if_unclaimed(0, &adapter).await,
+            Some(vec!["sh-1".to_owned()])
+        );
+        // ...while a turn resuming another session replaces it.
+        retained.terminate().await.unwrap();
+        assert_eq!(retained.take_parked_task_ids(&adapter).len(), 0);
+    }
+
+    #[cfg(feature = "claude")]
+    #[tokio::test]
+    async fn a_parked_process_replaced_first_is_not_retired_by_its_supervisor() {
+        let (adapter, retained) = parked_claude_process();
+        // A turn resuming another session replaces the process...
+        retained.terminate().await.unwrap();
+        assert_eq!(retained.take_parked_task_ids(&adapter), ["sh-1"]);
+        // ...while its parked supervisor sees it fail.
+        assert_eq!(retained.retire_parked_if_unclaimed(0, &adapter).await, None);
+    }
+
+    #[cfg(feature = "claude")]
+    #[tokio::test]
+    async fn a_parked_process_a_replacement_began_terminating_is_left_to_it() {
+        let (adapter, retained) = parked_claude_process();
+        // The supervisor holds the I/O, about to retire the process, when a
+        // replacing turn starts terminating it.
+        let io = retained.io.lock().await;
+        let replacement = {
+            let retained = Arc::clone(&retained);
+            tokio::spawn(async move { retained.terminate().await })
+        };
+        tokio::task::yield_now().await;
+        assert!(!replacement.is_finished());
+        drop(io);
+        // The replacement bumped the generation first: the supervisor no
+        // longer owns the process, and the replacement announces its tasks.
+        assert_eq!(retained.retire_parked_if_unclaimed(0, &adapter).await, None);
+        replacement.await.unwrap().unwrap();
+        assert_eq!(retained.take_parked_task_ids(&adapter), ["sh-1"]);
+    }
+
+    /// A pool holding `retained`, parked as runtime `parked`.
+    #[cfg(feature = "claude")]
+    async fn pool_with(
+        retained: &Arc<RetainedCodexProcess>,
+    ) -> (CodexProcessSupervisor, crate::lifecycle::RuntimeId) {
+        let supervisor = CodexProcessSupervisor::new(ProviderProcessRetention {
+            max_processes: 1,
+            idle_timeout: Duration::from_secs(30),
+            initialization_timeout: Duration::from_secs(10),
+            active_inactivity_timeout: None,
+            held_task_quiet_timeout: None,
+        });
+        let runtime_id = crate::lifecycle::RuntimeId::new("parked").unwrap();
+        supervisor
+            .inner
+            .processes
+            .lock()
+            .await
+            .insert(runtime_id.clone(), Arc::clone(retained));
+        (supervisor, runtime_id)
+    }
+
+    /// Supervise `retained` while parked, as a turn that yields it does.
+    #[cfg(feature = "claude")]
+    fn supervise_parked(
+        supervisor: &CodexProcessSupervisor,
+        runtime_id: &crate::lifecycle::RuntimeId,
+        retained: &Arc<RetainedCodexProcess>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(supervise_parked_retained_process(
+            Arc::new(crate::providers::Claude::default()),
+            supervisor.clone(),
+            runtime_id.clone(),
+            Arc::clone(retained),
+            0,
+            Provider::Claude,
+            Duration::from_secs(30),
+            1024,
+        ))
+    }
+
+    #[cfg(feature = "claude")]
+    #[tokio::test]
+    async fn a_parked_process_that_exits_is_retired_before_a_waiting_turn_claims_it() {
+        let (_, retained) = parked_claude_process();
+        let (supervisor, runtime_id) = pool_with(&retained).await;
+        let mut ends = supervisor.inner.parked_ends.subscribe();
+
+        // The process's output is already closed. Its supervisor queues for
+        // the I/O first and a turn claiming the process queues behind it;
+        // the lock hands over in that order.
+        let io = retained.io.lock().await;
+        let parked = supervise_parked(&supervisor, &runtime_id, &retained);
+        tokio::task::yield_now().await;
+        let claim = {
+            let retained = Arc::clone(&retained);
+            tokio::spawn(async move { retained.claim().await })
+        };
+        tokio::task::yield_now().await;
+        drop(io);
+
+        // The supervisor retired the process before letting go of its I/O,
+        // so the turn starts a new process rather than inheriting a dead one.
+        assert_eq!(claim.await.unwrap(), None);
+        parked.await.unwrap();
+        assert_eq!(
+            ends.try_recv().unwrap(),
+            ParkedProcessEnded {
+                runtime_id,
+                task_ids: vec!["sh-1".to_owned()],
+                reason: ParkedProcessEndReason::Exited,
+            }
+        );
+        // A turn that found the process in the pool before it was retired,
+        // and replaces it now, has nothing left to announce.
+        retained.terminate().await.unwrap();
+        assert_eq!(
+            retained
+                .take_parked_task_ids(&crate::providers::Claude::default())
+                .len(),
+            0
+        );
+    }
+
+    #[cfg(feature = "claude")]
+    #[tokio::test]
+    async fn a_turn_that_claims_a_parked_process_first_owns_its_tasks() {
+        let (_, retained) = parked_claude_process();
+        let (supervisor, runtime_id) = pool_with(&retained).await;
+        let mut ends = supervisor.inner.parked_ends.subscribe();
+
+        // A turn claiming the process queues for the I/O before its
+        // supervisor does, whose read would find the output closed.
+        let io = retained.io.lock().await;
+        let claim = {
+            let retained = Arc::clone(&retained);
+            tokio::spawn(async move { retained.claim().await })
+        };
+        tokio::task::yield_now().await;
+        let parked = supervise_parked(&supervisor, &runtime_id, &retained);
+        tokio::task::yield_now().await;
+        drop(io);
+
+        // The turn owns the process and its tasks now: if the process is
+        // dead the turn fails, and its tasks are no longer parked.
+        assert_eq!(claim.await.unwrap(), Some(1));
+        parked.await.unwrap();
+        assert!(matches!(
+            ends.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        assert!(retained.handoff.take_inherited().is_some());
+    }
+
+    #[cfg(feature = "claude")]
+    #[tokio::test]
+    async fn a_replacement_that_begins_while_a_supervisor_waits_announces_alone() {
+        let (adapter, retained) = parked_claude_process();
+        let (supervisor, runtime_id) = pool_with(&retained).await;
+        let mut ends = supervisor.inner.parked_ends.subscribe();
+
+        // The supervisor queues for the I/O, whose read would find the
+        // output closed, and a turn resuming another session starts
+        // terminating the process behind it.
+        let io = retained.io.lock().await;
+        let parked = supervise_parked(&supervisor, &runtime_id, &retained);
+        tokio::task::yield_now().await;
+        let replacement = {
+            let retained = Arc::clone(&retained);
+            tokio::spawn(async move { retained.terminate().await })
+        };
+        tokio::task::yield_now().await;
+        drop(io);
+
+        // Terminating moved the generation on before the supervisor read, so
+        // it ends without a word, and the replacement announces the tasks.
+        parked.await.unwrap();
+        replacement.await.unwrap().unwrap();
+        assert!(matches!(
+            ends.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        assert_eq!(retained.take_parked_task_ids(&adapter), ["sh-1"]);
+    }
+
+    #[cfg(feature = "claude")]
+    #[tokio::test(start_paused = true)]
+    async fn a_parked_process_outlives_its_idle_timeout_while_a_task_is_listed() {
+        let (mut provider_output, output) = tokio::io::duplex(4096);
+        let (_, retained) = parked_claude_process_reading(Box::new(output));
+        let (supervisor, runtime_id) = pool_with(&retained).await;
+        let mut ends = supervisor.inner.parked_ends.subscribe();
+        let parked = tokio::spawn(supervise_parked_retained_process(
+            Arc::new(crate::providers::Claude::default()),
+            supervisor.clone(),
+            runtime_id.clone(),
+            Arc::clone(&retained),
+            0,
+            Provider::Claude,
+            Duration::from_secs(1),
+            1024,
+        ));
+
+        // Far past the idle timeout, the silent shell is still listed, so
+        // the process is not retired on its own.
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        assert!(!parked.is_finished());
+        assert!(retained.usable.load(Ordering::Acquire));
+
+        // Once the shell has ended, the process retires at its idle timeout,
+        // and nothing is announced: no work went with it.
+        tokio::io::AsyncWriteExt::write_all(
+            &mut provider_output,
+            b"{\"type\":\"system\",\"subtype\":\"task_notification\",\"task_id\":\"sh-1\",\"status\":\"completed\",\"summary\":\"server exited\"}\n",
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(60), parked)
+            .await
+            .expect("the idle process must retire")
+            .unwrap();
+        assert!(!retained.usable.load(Ordering::Acquire));
+        assert_eq!(supervisor.inner.processes.lock().await.len(), 0);
+        assert!(matches!(
+            ends.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn a_subscriber_that_falls_behind_is_told_how_many_ends_it_missed() {
+        let supervisor = CodexProcessSupervisor::new(ProviderProcessRetention {
+            max_processes: 1,
+            idle_timeout: Duration::from_secs(30),
+            initialization_timeout: Duration::from_secs(10),
+            active_inactivity_timeout: None,
+            held_task_quiet_timeout: None,
+        });
+        let mut ends = supervisor.inner.parked_ends.subscribe();
+        let runtime_id = crate::lifecycle::RuntimeId::new("parked").unwrap();
+        for _ in 0..=FOLLOW_UP_ANNOUNCEMENTS {
+            supervisor.announce_parked_end(
+                &runtime_id,
+                vec!["sh-1".to_owned()],
+                ParkedProcessEndReason::Exited,
+            );
+        }
+        // Nothing to announce without tasks.
+        supervisor.announce_parked_end(&runtime_id, Vec::new(), ParkedProcessEndReason::Exited);
+        assert!(matches!(
+            ends.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(1))
+        ));
+        let mut received = 0;
+        while ends.try_recv().is_ok() {
+            received += 1;
+        }
+        assert_eq!(received, FOLLOW_UP_ANNOUNCEMENTS);
     }
 }

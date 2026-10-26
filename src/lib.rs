@@ -80,7 +80,8 @@ pub use extensions::{
 };
 pub use interactions::{InteractionBroker, InteractionBrokerError, InteractionResolution};
 pub use runtime::{
-    AgentRuntime, AgentRuntimeBuilder, CodexProcessRetention, ProviderProcessRetention,
+    AgentRuntime, AgentRuntimeBuilder, CodexProcessRetention, ParkedProcessEndReason,
+    ParkedProcessEnded, ProviderProcessRetention,
 };
 pub use sandbox::{
     ResolvedSandboxProfile, SandboxBackend, SandboxCapabilities, SandboxContext, SandboxError,

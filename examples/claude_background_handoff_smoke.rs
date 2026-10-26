@@ -52,6 +52,7 @@ mod unix {
                 idle_timeout: Duration::from_secs(60),
                 initialization_timeout: Duration::from_secs(60),
                 active_inactivity_timeout: Some(Duration::from_secs(180)),
+                held_task_quiet_timeout: None,
             });
         builder.register(Claude::default());
         let client = InProcessRuntimeClient::new(builder.build()?);

@@ -118,6 +118,20 @@ pub enum RuntimeError {
         /// Configured deadline.
         seconds: u64,
     },
+    /// A provider process that was still starting up produced nothing within
+    /// its startup deadline, so it never answered the turn.
+    ///
+    /// This does not mean the prompt was not delivered: a provider may already
+    /// have received it and begun work whose acknowledgement had not arrived.
+    /// Callers must not assume a retry is free of repeated side effects; use
+    /// the failure's delivery state to decide.
+    #[error("{provider} did not respond within {seconds} seconds of starting")]
+    StartupTimeout {
+        /// Provider that did not respond.
+        provider: Provider,
+        /// Configured startup deadline.
+        seconds: u64,
+    },
     /// A turn was cancelled by its owner.
     #[error("{provider} turn was cancelled")]
     Cancelled {

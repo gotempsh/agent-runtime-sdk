@@ -24,6 +24,24 @@ The provider process itself still exits at the end of a turn. Conversation
 continuity uses the provider `session_id`; process preservation applies only to
 descendants created by provider tools.
 
+## Background commands of a one-shot Codex turn
+
+A background command the Codex app-server started with its own shell tool
+belongs to the app-server process, not to the SDK. In a one-shot turn the
+SDK closes the app-server's stdin at `turn/completed`, so the app-server exits
+and takes such a command with it, whatever the policy says. This was observed
+with `codex app-server` 0.162: a `sleep 15` command started by a turn that
+had already ended never wrote its finish marker.
+
+Opt into process retention when a command must outlive the turn. The retained
+app-server keeps owning it, and the SDK keeps the process alive while
+`thread/backgroundTerminals/list` reports a live terminal, past the idle
+timeout. [Retained runtimes](../reference/retained-runtimes.md) shows how to
+enable it. For a command whose
+lifetime the application must control, use `ManagedProcessSupervisor`. The
+`background_terminal_retention_smoke` example checks the retained case against
+a real Codex.
+
 ## Make the tool truly detachable
 
 The child tool must not keep the provider's standard input, output, or error

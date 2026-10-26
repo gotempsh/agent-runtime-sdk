@@ -1210,9 +1210,31 @@ fn server_request(
                 });
             }
         }
+        // Codex asks before running an MCP tool the server does not mark
+        // read-only (and for every MCP tool under `untrusted`), as an
+        // elicitation. Answering `{}` is not a valid reply (`action` is
+        // required) and Codex fails the call with "user rejected MCP tool
+        // call", so the question goes to the application like any approval.
+        "mcpServer/elicitation/request" => {
+            if let Some(request) = mcp_tool_approval(&id, &params) {
+                output
+                    .events
+                    .push(TurnEvent::ApprovalRequested(request.clone()));
+                output.interaction = Some(InteractionRequest::Approval {
+                    request,
+                    original: value.clone(),
+                });
+            } else {
+                // Any other elicitation is a form or a URL this adapter cannot
+                // put in front of anyone. Decline it explicitly.
+                output
+                    .writes
+                    .push(encode(&reply(&id, json!({"action": "decline"})))?);
+            }
+        }
         // An unanswered server request blocks the app server forever. An empty
         // result is the reference driver's behavior for requests this adapter
-        // does not model (MCP elicitation, dynamic tool calls).
+        // does not model (dynamic tool calls).
         _ => {
             let _ = turn;
             output.writes.push(encode(&reply(&id, json!({})))?);
@@ -1733,6 +1755,51 @@ fn approval_tool_name(method: &str) -> &'static str {
     }
 }
 
+const MCP_ELICITATION_METHOD: &str = "mcpServer/elicitation/request";
+
+/// The approval behind an MCP elicitation, when it asks whether a tool may
+/// run (`_meta.codex_approval_kind == "mcp_tool_call"`). The tool is named the
+/// way Claude names MCP tools, `mcp__<server>__<tool>`, so one allow-list
+/// covers every harness. When the tool cannot be read from the message the
+/// name stops at the server, `mcp__<server>`: it can never match a per-tool
+/// allow-list entry, so the application asks instead of guessing.
+fn mcp_tool_approval(id: &Value, params: &Value) -> Option<ApprovalRequest> {
+    let meta = params.get("_meta")?;
+    if meta.get("codex_approval_kind").and_then(Value::as_str) != Some("mcp_tool_call") {
+        return None;
+    }
+    let message = params
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let server = params
+        .get("serverName")
+        .and_then(Value::as_str)
+        .filter(|server| !server.is_empty())?;
+    // `Allow the <server> MCP server to run tool "<tool>"?`
+    let tool = message
+        .split_once("run tool \"")
+        .and_then(|(_, rest)| rest.split_once('"'))
+        .map(|(tool, _)| tool)
+        .filter(|tool| !tool.is_empty());
+    Some(ApprovalRequest {
+        id: interaction_id(id),
+        tool_name: tool.map_or_else(
+            || format!("mcp__{server}"),
+            |tool| format!("mcp__{server}__{tool}"),
+        ),
+        description: Some(if message.is_empty() {
+            format!("Run a tool of the {server} MCP server")
+        } else {
+            message.to_string()
+        }),
+        input: meta
+            .get("tool_params")
+            .cloned()
+            .unwrap_or_else(|| json!({})),
+    })
+}
+
 fn describe_approval(method: &str, params: &Value) -> String {
     match method {
         "item/commandExecution/requestApproval" => {
@@ -1822,6 +1889,15 @@ fn answers_for(params: &Value, note: &str) -> Value {
 
 /// Encode an approval decision as a `*RequestApprovalResponse`.
 pub(super) fn approval_response(original: &Value, decision: ApprovalDecision) -> Result<Vec<u8>> {
+    if original.get("method").and_then(Value::as_str) == Some(MCP_ELICITATION_METHOD) {
+        // `McpServerElicitationRequestResponse`: the decision is `action`.
+        let id = original.get("id").cloned().unwrap_or(Value::Null);
+        let action = match decision {
+            ApprovalDecision::Deny { .. } => "decline",
+            ApprovalDecision::Allow | ApprovalDecision::AllowForSession => "accept",
+        };
+        return encode(&reply(&id, json!({"action": action, "content": null})));
+    }
     let wire = match decision {
         ApprovalDecision::Allow => "accept",
         ApprovalDecision::AllowForSession => "acceptForSession",
@@ -2472,13 +2548,87 @@ mod tests {
     fn an_unmodelled_server_request_is_acknowledged_so_the_turn_cannot_stall() {
         let mut state = AdapterState::default();
         let output = parse_line(
-            r#"{"jsonrpc":"2.0","id":"server-5","method":"mcpServer/elicitation/request","params":{}}"#,
+            r#"{"jsonrpc":"2.0","id":"server-5","method":"item/tool/call","params":{}}"#,
             &mut state,
         )
         .unwrap();
 
         assert!(output.interaction.is_none());
         assert_eq!(decode(output.writes[0].clone())["id"], json!("server-5"));
+    }
+
+    const MCP_TOOL_APPROVAL: &str = r#"{"jsonrpc":"2.0","id":"server-6","method":"mcpServer/elicitation/request","params":{"threadId":"t","turnId":"u","serverName":"temps_fleet","mode":"form","_meta":{"codex_approval_kind":"mcp_tool_call","persist":["session","always"],"tool_params":{"title":"x"}},"message":"Allow the temps_fleet MCP server to run tool \"report_finding\"?","requestedSchema":{"type":"object","properties":{}}}}"#;
+
+    #[test]
+    fn an_mcp_tool_approval_reaches_the_application_instead_of_being_rejected() {
+        let mut state = AdapterState::default();
+        let output = parse_line(MCP_TOOL_APPROVAL, &mut state).unwrap();
+
+        // Nothing is written: an `{}` reply is what made Codex fail the call
+        // with "user rejected MCP tool call".
+        assert_eq!(output.writes.len(), 0);
+        let Some(InteractionRequest::Approval { request, original }) = output.interaction else {
+            panic!("the tool approval must wait for a decision");
+        };
+        assert_eq!(request.tool_name, "mcp__temps_fleet__report_finding");
+        assert_eq!(request.input, json!({"title": "x"}));
+        assert_eq!(
+            request.description.as_deref(),
+            Some("Allow the temps_fleet MCP server to run tool \"report_finding\"?")
+        );
+        for (decision, action) in [
+            (ApprovalDecision::Allow, "accept"),
+            (ApprovalDecision::AllowForSession, "accept"),
+            (ApprovalDecision::Deny { reason: None }, "decline"),
+        ] {
+            let response = decode(approval_response(&original, decision).unwrap());
+            assert_eq!(response["id"], json!("server-6"));
+            assert_eq!(response["result"]["action"], json!(action));
+            assert!(response["result"].get("decision").is_none());
+        }
+    }
+
+    #[test]
+    fn an_mcp_tool_approval_whose_tool_cannot_be_read_is_not_given_a_tool_name() {
+        // Codex rewording the message must not turn into a made-up tool name
+        // that an application's allow-list could match.
+        let mut state = AdapterState::default();
+        let line = MCP_TOOL_APPROVAL.replace("run tool", "run the operation");
+        let output = parse_line(&line, &mut state).unwrap();
+        let Some(InteractionRequest::Approval { request, .. }) = output.interaction else {
+            panic!("the approval must still wait for a decision");
+        };
+        assert_eq!(request.tool_name, "mcp__temps_fleet");
+
+        let without_message = MCP_TOOL_APPROVAL.replace(
+            r#""message":"Allow the temps_fleet MCP server to run tool \"report_finding\"?","#,
+            "",
+        );
+        assert!(!without_message.contains("\"message\""));
+        let output = parse_line(&without_message, &mut state).unwrap();
+        let Some(InteractionRequest::Approval { request, .. }) = output.interaction else {
+            panic!("the approval must still wait for a decision");
+        };
+        assert_eq!(request.tool_name, "mcp__temps_fleet");
+        assert_eq!(
+            request.description.as_deref(),
+            Some("Run a tool of the temps_fleet MCP server")
+        );
+    }
+
+    #[test]
+    fn an_mcp_form_elicitation_is_declined_with_a_valid_action() {
+        let mut state = AdapterState::default();
+        let output = parse_line(
+            r#"{"jsonrpc":"2.0","id":"server-7","method":"mcpServer/elicitation/request","params":{"threadId":"t","serverName":"docs","mode":"form","message":"Which project?","requestedSchema":{"type":"object","properties":{}}}}"#,
+            &mut state,
+        )
+        .unwrap();
+
+        assert!(output.interaction.is_none());
+        let response = decode(output.writes[0].clone());
+        assert_eq!(response["id"], json!("server-7"));
+        assert_eq!(response["result"], json!({"action": "decline"}));
     }
 
     // Session titles: a hidden thread, the way Codex's TUI titles threads.

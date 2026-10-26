@@ -1107,6 +1107,7 @@ fn protocol_turn_input(input: TurnInput) -> ProtocolTurnInput {
         attachments: input.attachments,
         interaction_policy: input.interaction_policy,
         request_session_title: input.request_session_title,
+        keep_background_work: input.keep_background_work,
     }
 }
 
