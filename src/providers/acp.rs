@@ -289,16 +289,12 @@ impl AcpAgents {
 #[derive(Debug, Clone, Default)]
 pub struct Acp {
     agents: AcpAgents,
-    sessions: Arc<RwLock<BTreeMap<String, Value>>>,
 }
 
 impl Acp {
     /// Run agents from `agents`.
     pub fn new(agents: AcpAgents) -> Self {
-        Self {
-            agents,
-            sessions: Default::default(),
-        }
+        Self { agents }
     }
 
     /// The registry this adapter reads.
@@ -1060,24 +1056,26 @@ impl AgentAdapter for Acp {
         Ok(Some(turn.retained_start))
     }
 
-    fn mark_retained_turn(&self, state: &mut AdapterState) {
+    fn inherit_retained_handoff(&self, previous: AdapterState, state: &mut AdapterState) {
+        let prior = load(&previous);
         let mut turn = load(state);
-        let cached = turn.resume.as_ref().and_then(|id| {
-            self.sessions
-                .read()
-                .unwrap_or_else(|e| e.into_inner())
-                .get(&session_cache_key(&turn, id))
-                .cloned()
-        });
-        if let (Some(session), Some(config)) = (turn.resume.clone(), cached) {
+        if turn.agent_id != prior.agent_id
+            || turn.working_directory != prior.working_directory
+            || turn.resume != prior.session_id
+        {
+            turn.retained_error = Some(
+                "The retained ACP connection belongs to a different agent, directory or session"
+                    .into(),
+            );
+            store(state, &turn);
+            return;
+        }
+        if let Some(session) = turn.resume.clone() {
             turn.session_id = Some(session.clone());
-            turn.session_config = config.clone();
-            turn.supports_images = config
-                .get("_supportsImages")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
+            turn.session_config = prior.session_config.clone();
+            turn.supports_images = prior.supports_images;
             let mut output = AdapterOutput::default();
-            match configure_session(&session, &config, state, &mut turn) {
+            match configure_session(&session, &prior.session_config, state, &mut turn) {
                 Ok(()) => match advance(state, &mut turn, &mut output) {
                     Ok(()) => turn.retained_start = output.writes.into_iter().flatten().collect(),
                     Err(error) => turn.retained_error = Some(error.to_string()),
@@ -1333,18 +1331,6 @@ impl AgentAdapter for Acp {
             }
             (None, Some(_)) => response(&value, state, &mut turn, &mut output)?,
             (Some(_) | None, None) => {}
-        }
-        if let Some(session) = turn.session_id.as_ref() {
-            if !turn.session_config.is_null() {
-                let mut sessions = self.sessions.write().unwrap_or_else(|e| e.into_inner());
-                let key = session_cache_key(&turn, session);
-                if sessions.len() >= 256 && !sessions.contains_key(&key) {
-                    if let Some(oldest) = sessions.keys().next().cloned() {
-                        sessions.remove(&oldest);
-                    }
-                }
-                sessions.insert(key, turn.session_config.clone());
-            }
         }
         store(state, &turn);
         Ok(output)
@@ -1768,6 +1754,14 @@ fn response(
         }
         ID_PROMPT => {
             output.terminal = true;
+            // Only session metadata survives an idle process. Do not retain prompts,
+            // tools or the per-turn MCP credential values in carried parser state.
+            state.extensions.remove(PROMPT_KEY);
+            turn.tools.clear();
+            turn.open_permissions.clear();
+            turn.mcp_servers.clear();
+            turn.instructions = None;
+            turn.retained_start.clear();
             if let Some(error) = error {
                 let auth = error_code(error) == Some(AUTH_REQUIRED_CODE);
                 fail(
@@ -2023,15 +2017,6 @@ fn select_values(option: &Value) -> Vec<String> {
         }
     }
     values
-}
-
-fn session_cache_key(turn: &TurnState, session: &str) -> String {
-    format!(
-        "{}\0{}\0{}",
-        turn.agent_id,
-        turn.working_directory.display(),
-        session
-    )
 }
 
 fn session_snapshot(result: &Value) -> Value {
@@ -2496,7 +2481,7 @@ mod tests {
             .harness_options
             .insert("config".into(), r#"{"mode":"ask"}"#.into());
         let mut next = started(&adapter, &request);
-        adapter.mark_retained_turn(&mut next);
+        adapter.inherit_retained_handoff(state, &mut next);
         let bytes = adapter.retained_turn_start(&next).unwrap().unwrap();
         let first: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(first["method"], "session/set_config_option");

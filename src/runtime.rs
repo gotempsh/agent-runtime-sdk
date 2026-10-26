@@ -1911,9 +1911,11 @@ async fn complete_retained_turn(
     mut state: AdapterState,
 ) -> Result<RetainedTurnEnd> {
     let result = finish_retained_turn(adapter, request, events, &mut state).await?;
-    let carried = adapter
-        .retained_background_work(&state)
-        .then(|| Box::new(state));
+    let keep_state = adapter.retained_background_work(&state) || request.provider == Provider::Acp;
+    if request.provider == Provider::Acp {
+        state.result = TurnResult::default();
+    }
+    let carried = keep_state.then(|| Box::new(state));
     Ok(RetainedTurnEnd::Completed(result, carried))
 }
 
@@ -5250,6 +5252,9 @@ impl AgentRuntime {
             }
         } else if let Some(candidate) = existing.clone() {
             claimed_generation = candidate.claim().await;
+            if provider == Provider::Acp && claimed_generation.is_some() {
+                inherited_state = candidate.handoff.take_inherited();
+            }
             if claimed_generation.is_none() {
                 // Its idle supervisor retired it after the lookup above.
                 supervisor.remove_if_same(runtime_id, &candidate).await;
@@ -5610,7 +5615,10 @@ impl AgentRuntime {
             Ok(RetainedTurnEnd::Completed(result, carried)) => {
                 *retained.session_id.lock().await = result.session_id.clone();
                 cleanup.disarm();
-                if let Some(carried) = carried {
+                if provider == Provider::Acp {
+                    *retained.handoff.inherited.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = carried.map(|s| *s);
+                    self.retain_idle_process(adapter.clone(), supervisor, runtime_id, retained, generation, provider);
+                } else if let Some(carried) = carried {
                     self.park_retained_process(
                         adapter.clone(),
                         supervisor,
