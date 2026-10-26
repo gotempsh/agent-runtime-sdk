@@ -4260,6 +4260,11 @@ impl AgentRuntime {
             if key == "model_relay" && provider == Provider::Codex {
                 continue;
             }
+            // ACP session configuration is an opaque map validated against the
+            // agent's actual setup response before prompting, not one static choice.
+            if key == "config" && provider == Provider::Acp {
+                continue;
+            }
             if key == "service_tier" && provider == Provider::Codex {
                 continue;
             }

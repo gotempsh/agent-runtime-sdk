@@ -64,6 +64,8 @@ while IFS= read -r line; do
     *'"method":"session/new"'*)
       if [ "$MOCK_ACP_MODE" = auth ]; then
         say '{"jsonrpc":"2.0","id":2,"error":{"code":-32000,"message":"Authentication required"}}'
+      elif [ "$MOCK_ACP_MODE" = config ]; then
+        say '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"mock-session","configOptions":[{"id":"mode","name":"Mode","category":"mode","type":"select","currentValue":"agent","options":[{"value":"agent","name":"Agent"},{"value":"ask","name":"Ask"}]}]}}'
       else
         echo 'Loaded cached credentials.'
         say '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"mock-session"}}'
@@ -71,6 +73,8 @@ while IFS= read -r line; do
     *'"method":"session/load"'*)
       update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"replayed"}}'
       say '{"jsonrpc":"2.0","id":2,"result":null}' ;;
+    *'"method":"session/set_config_option"'*)
+      say '{"jsonrpc":"2.0","id":100,"result":{}}' ;;
     *'"method":"session/prompt"'*)
       update '{"sessionUpdate":"plan","entries":[{"content":"Run the tests","priority":"high","status":"in_progress"}]}'
       update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Running tests."}}'
@@ -730,4 +734,41 @@ async fn retained_acp_turns_use_one_process_and_one_session() {
         .dispose(&RuntimeId::new("acp-reuse").unwrap())
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn session_config_is_accepted_by_runtime_then_validated_before_prompting() {
+    let fixture = Fixture::new();
+    let runtime = fixture.runtime("config");
+    let mut request = fixture.request("configure");
+    request.permission_mode = PermissionMode::FullAccess;
+    request
+        .harness_options
+        .insert("config".into(), r#"{"mode":"ask"}"#.into());
+    let result = runtime
+        .run(request, &Collector::default(), None)
+        .await
+        .unwrap();
+    assert!(result.text.contains("All green"));
+    let methods = fixture.methods();
+    assert!(
+        methods
+            .iter()
+            .position(|m| m == "session/set_config_option")
+            .unwrap()
+            < methods.iter().position(|m| m == "session/prompt").unwrap()
+    );
+    let before = methods.iter().filter(|m| *m == "session/prompt").count();
+    let mut bad = fixture.request("invalid");
+    bad.harness_options
+        .insert("config".into(), r#"{"mode":"invented"}"#.into());
+    assert!(runtime.run(bad, &Collector::default(), None).await.is_err());
+    assert_eq!(
+        fixture
+            .methods()
+            .iter()
+            .filter(|m| *m == "session/prompt")
+            .count(),
+        before
+    );
 }
