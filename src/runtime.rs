@@ -5768,10 +5768,14 @@ impl AgentRuntime {
         // past initialization from its first moment.
         let mut saw_semantic_activity =
             request.continuation || handoff.initialized.load(Ordering::Acquire);
-        let mut turn_submitted = provider != Provider::OpenCode;
+        let mut turn_submitted = !matches!(provider, Provider::OpenCode | Provider::Acp) || handoff.initialized.load(Ordering::Acquire);
         let mut last_semantic_activity = tokio::time::Instant::now();
         let mut first_text = true;
         let mut process_ready = false;
+        if provider == Provider::Acp && handoff.initialized.load(Ordering::Acquire) {
+            events.emit(TurnEvent::ProviderProcessStatus { status: crate::ProviderProcessStatus::Ready, message: "Using the existing ACP session".into() }).await?;
+            process_ready = true;
+        }
         // Requests background work raised while no turn owned the process.
         for interaction in parked_interactions {
             if self
@@ -5956,7 +5960,7 @@ impl AgentRuntime {
             }
             if !process_ready
                 && semantic_activity
-                && (provider != Provider::OpenCode || output.turn_submitted)
+                && (!matches!(provider, Provider::OpenCode | Provider::Acp) || output.turn_submitted)
             {
                 events
                     .emit(TurnEvent::ProviderProcessStatus {

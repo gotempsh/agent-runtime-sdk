@@ -1449,7 +1449,7 @@ fn canonical_tool_name(name: &str, input: Option<&Value>) -> String {
                     && s.bytes()
                         .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
             };
-            if valid(server) && valid(tool) {
+            if valid(server) && !server.contains("__") && valid(tool) {
                 return format!("mcp__{server}__{tool}");
             }
         }
@@ -1642,6 +1642,10 @@ fn response(
                     json!({"cwd": cwd, "mcpServers": servers}),
                 ),
             };
+            output.events.push(TurnEvent::ProviderProcessStatus {
+                status: crate::ProviderProcessStatus::Checking,
+                message: format!("Opening {}'s ACP session", turn.agent_label),
+            });
             output.writes.push(encode(&open)?);
         }
         ID_SESSION => {
@@ -2079,6 +2083,10 @@ fn advance(
 ) -> Result<()> {
     if !turn.pending.is_empty() {
         let (_, next) = turn.pending.remove(0);
+        output.events.push(TurnEvent::ProviderProcessStatus {
+            status: crate::ProviderProcessStatus::Checking,
+            message: format!("Applying {} settings", turn.agent_label),
+        });
         turn.inflight_config = Some(next.clone());
         output.writes.push(encode(&next)?);
         return Ok(());
