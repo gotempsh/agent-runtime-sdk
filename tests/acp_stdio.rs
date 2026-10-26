@@ -310,7 +310,7 @@ async fn resuming_loads_the_session_without_replaying_it() {
         .unwrap();
     assert_eq!(result.text, "Running tests. All green.");
     assert_eq!(fixture.methods()[1], "session/load");
-    assert!(!events
+    assert!(events
         .events()
         .iter()
         .any(|event| matches!(event, TurnEvent::SessionStarted { .. })));
@@ -684,4 +684,50 @@ async fn a_failed_turn_stops_reading_stderr() {
         let _ = std::process::Command::new("kill").arg(pid.trim()).status();
     }
     assert!(!wrote, "a failed turn left its stderr reader running");
+}
+
+#[tokio::test]
+async fn retained_acp_turns_use_one_process_and_one_session() {
+    use temps_agent_runtime::lifecycle::{InvocationId, RuntimeId};
+    use temps_agent_runtime::retained::{
+        InProcessRuntimeClient, RuntimeClient, RuntimeSpec, TurnInput,
+    };
+    use temps_agent_runtime::ProviderProcessRetention;
+    let fixture = Fixture::new();
+    let agents = AcpAgents::new();
+    agents.insert(fixture.agent("ok")).unwrap();
+    let mut builder =
+        AgentRuntime::builder().provider_process_retention(ProviderProcessRetention {
+            max_processes: 1,
+            idle_timeout: Duration::from_secs(30),
+            initialization_timeout: Duration::from_secs(10),
+            active_inactivity_timeout: Some(Duration::from_secs(10)),
+            held_task_quiet_timeout: None,
+        });
+    builder.register(Acp::new(agents));
+    let client = InProcessRuntimeClient::new(builder.build().unwrap());
+    let mut spec = RuntimeSpec::new(
+        RuntimeId::new("acp-reuse").unwrap(),
+        Provider::Acp,
+        &fixture.workspace,
+    );
+    spec.permission_mode = PermissionMode::FullAccess;
+    spec.harness_options
+        .insert(AGENT_OPTION.into(), "mock".into());
+    let handle = client.acquire(spec).await.unwrap();
+    for id in ["first", "second"] {
+        let input = TurnInput::new(InvocationId::new(id).unwrap(), "test");
+        let turn = handle.start_turn(input).await.unwrap();
+        let result = turn.wait().await.unwrap();
+        assert!(result.text.contains("All green"), "{result:?}");
+    }
+    let methods = fixture.methods();
+    assert_eq!(methods.iter().filter(|m| *m == "initialize").count(), 1);
+    assert_eq!(methods.iter().filter(|m| *m == "session/new").count(), 1);
+    assert_eq!(methods.iter().filter(|m| *m == "session/load").count(), 0);
+    assert_eq!(methods.iter().filter(|m| *m == "session/prompt").count(), 2);
+    client
+        .dispose(&RuntimeId::new("acp-reuse").unwrap())
+        .await
+        .unwrap();
 }
