@@ -62,6 +62,14 @@ Versioning and Keep a Changelog conventions.
   seconds of starting") instead of `Timeout` ("turn timed out"), so applications
   can tell a failed start from a turn that ran too long. Both map to
   `RuntimeFailureKind::Timeout`.
+- Codex turns (`exec` and `app-server`) now run with `--config notify=[]`, so
+  the `notify` command in the user's `~/.codex/config.toml` no longer runs when
+  an SDK turn ends. The Codex desktop app installs one that calls its "Codex
+  Computer Use" helper, which sends an Apple Event; macOS blamed the host
+  application and asked "wants access to control Codex Computer Use" on every
+  host. A user's own `notify` hook (a desktop notifier or webhook, for example)
+  stops firing for SDK turns too; turn events still reach the host through the
+  protocol. There is no opt-out yet.
 
 ### Added
 

@@ -369,6 +369,18 @@ fn codex_tool_event(item: &Value, completed: bool) -> Option<TurnEvent> {
     })
 }
 
+/// Stop the user's global Codex `notify` hook from running for SDK turns.
+///
+/// `notify` in `~/.codex/config.toml` is a command Codex runs when a turn ends.
+/// The Codex desktop app installs one that calls its own "Codex Computer Use"
+/// helper, and that helper sends an Apple Event to the desktop app. A turn the
+/// SDK runs is not a desktop turn, and the hook runs inside the host's process
+/// tree, so macOS blames the host and asks "wants access to control Codex
+/// Computer Use" every time. The SDK's own turn events do not use it.
+fn disable_user_turn_hooks(spec: &mut CommandSpec) {
+    spec.args.extend(["--config".into(), "notify=[]".into()]);
+}
+
 /// Translate turn-scoped MCP servers into `-c mcp_servers.<name>.*` overrides.
 ///
 /// Codex parses each `--config` value as TOML, so every string is emitted as a
@@ -944,6 +956,7 @@ impl AgentAdapter for Codex {
         if self.app_server_mode() {
             spec.args.push("app-server".into());
             append_mcp_launch_context(&mut spec, request)?;
+            disable_user_turn_hooks(&mut spec);
             append_model_relay(
                 &mut spec,
                 request,
@@ -962,6 +975,7 @@ impl AgentAdapter for Codex {
             "--skip-git-repo-check".into(),
         ]);
         append_mcp_launch_context(&mut spec, request)?;
+        disable_user_turn_hooks(&mut spec);
         append_model_relay(
             &mut spec,
             request,
@@ -1302,6 +1316,20 @@ mod tests {
                 "relay URL {base_url} was not configured"
             );
             assert!(!format!("{:?}", command.args).contains("test-secret"));
+        }
+    }
+
+    #[test]
+    fn turns_do_not_run_the_users_notify_hook() {
+        let request = TurnRequest::new(Provider::Codex, ".", "inspect");
+        for adapter in [Codex::default(), Codex::app_server()] {
+            let command = adapter.command(&request).unwrap();
+            let args: Vec<_> = command.args.iter().map(|a| a.to_string_lossy()).collect();
+            assert!(
+                args.windows(2)
+                    .any(|w| w[0] == "--config" && w[1] == "notify=[]"),
+                "{args:?}"
+            );
         }
     }
 
