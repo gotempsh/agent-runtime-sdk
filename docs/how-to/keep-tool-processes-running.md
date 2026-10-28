@@ -62,9 +62,9 @@ state. See
 [Manage background commands and services](manage-background-processes.md).
 
 Do not work around provider cleanup by merely escaping the SDK's process group
-with `setsid` or an equivalent. An untracked process that escapes the group also
-escapes the SDK's cancellation and timeout cleanup. A real supervisor must own
-both start and stop.
+with `setsid` or an equivalent. Local Linux/macOS launches retain SDK ownership
+across session changes and reparenting through an inherited environment marker.
+A real supervisor must own both start and stop.
 
 ## Opt into turn-scoped cleanup
 
@@ -79,6 +79,30 @@ request.tool_process_policy = ToolProcessPolicy::TerminateOnCompletion;
 ```
 
 This terminates remaining descendants after the provider exits naturally.
+
+For local Linux and macOS launches, the SDK injects a fresh random
+`TEMPS_AGENT_PROCESS_SCOPE` value for each provider process. Cleanup first kills
+the provider group, then discovers processes with that exact inherited marker,
+including daemons that called `setsid` and were reparented before cleanup began.
+It rechecks the marker and start time before signaling each PID, with up to
+three discovery passes to catch children forked during cleanup. Separate SDK
+launches receive separate scopes, including managed services. No process is
+selected by executable name, and environment values are never logged.
+
+This is best-effort lifecycle cleanup, not an OS containment boundary. A tool
+that clears the marker, changes user, or runs where process environments cannot
+be inspected can escape it. Environment inspection and PID signaling are not
+atomic on macOS; identity rechecks reduce, but cannot eliminate, PID reuse
+races. Arbitrary forking during the bounded cleanup can also escape. Remote
+transports retain their existing remote cleanup behavior; Windows and other
+Unix platforms retain their existing tree/group cleanup. The SDK cannot run
+cleanup after the embedding host is killed or crashes. Use an outer supervisor,
+container/cgroup, or explicit service registration for those guarantees.
+
+`PreserveOnCompletion` still leaves these daemons running after successful
+completion. Applications using that policy must close ephemeral browser
+sessions themselves, or choose `TerminateOnCompletion` for that workload.
+Already-running unmarked daemons cannot be adopted retroactively.
 
 ## Understand the hard-stop cases
 

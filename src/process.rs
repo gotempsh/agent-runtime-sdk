@@ -96,7 +96,10 @@ fn windows_program(spec: &CommandSpec) -> std::path::PathBuf {
     spec.program.clone()
 }
 
-pub(crate) fn spawn(spec: &CommandSpec, cwd: &std::path::Path) -> std::io::Result<Child> {
+pub(crate) fn spawn(
+    spec: &CommandSpec,
+    cwd: &std::path::Path,
+) -> std::io::Result<(Child, ProcessTreeGuard)> {
     #[cfg(windows)]
     let program = windows_program(spec);
     #[cfg(not(windows))]
@@ -109,6 +112,8 @@ pub(crate) fn spawn(spec: &CommandSpec, cwd: &std::path::Path) -> std::io::Resul
         command.env_clear().envs(preserved);
     }
     command.envs(&spec.environment);
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let scope = ProcessScope::attach(&mut command)?;
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -118,13 +123,22 @@ pub(crate) fn spawn(spec: &CommandSpec, cwd: &std::path::Path) -> std::io::Resul
     command.process_group(0);
     #[cfg(windows)]
     command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW for desktop hosts.
-    command.spawn()
+    let child = command.spawn()?;
+    #[allow(unused_mut)] // The scope is attached only on Linux and macOS.
+    let mut guard = ProcessTreeGuard::for_child(&child);
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        guard.scope = Some(scope);
+    }
+    Ok((child, guard))
 }
 
-/// Kills the entire provider process group when a turn future is cancelled or
+/// Kills the provider group and locally scoped detached processes when cancelled or
 /// times out. Provider CLIs commonly launch shell and tool grandchildren, so
 /// killing only the immediate child would leave work running in the sandbox.
 pub(crate) struct ProcessTreeGuard {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    scope: Option<ProcessScope>,
     #[cfg(unix)]
     process_group: Option<i32>,
     #[cfg(windows)]
@@ -134,6 +148,8 @@ pub(crate) struct ProcessTreeGuard {
 impl ProcessTreeGuard {
     pub(crate) fn for_child(child: &Child) -> Self {
         Self {
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            scope: None,
             #[cfg(unix)]
             process_group: child.id().and_then(|id| i32::try_from(id).ok()),
             #[cfg(windows)]
@@ -142,6 +158,10 @@ impl ProcessTreeGuard {
     }
 
     pub(crate) fn disarm(&mut self) {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            self.scope = None;
+        }
         #[cfg(unix)]
         {
             self.process_group = None;
@@ -160,6 +180,10 @@ impl ProcessTreeGuard {
                 nix::sys::signal::Signal::SIGKILL,
             );
         }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if let Some(scope) = self.scope.take() {
+            scope.terminate();
+        }
         #[cfg(windows)]
         if let Some(process_id) = self.process_id.take() {
             use std::os::windows::process::CommandExt;
@@ -170,6 +194,60 @@ impl ProcessTreeGuard {
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status();
+        }
+    }
+}
+
+// A process group is not an ownership boundary: setsid() and double-forking
+// escape it. An inherited, unguessable marker survives both and does not rely
+// on observing ancestry before the intermediate parent exits. This is cleanup
+// for cooperative tools, not a sandbox against tools that clear their env.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct ProcessScope(std::ffi::OsString);
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl ProcessScope {
+    const KEY: &'static str = "TEMPS_AGENT_PROCESS_SCOPE";
+
+    fn attach(command: &mut Command) -> std::io::Result<Self> {
+        let mut bytes = [0_u8; 16];
+        getrandom::fill(&mut bytes).map_err(std::io::Error::other)?;
+        let token = u128::from_ne_bytes(bytes);
+        let value = format!("{token:032x}");
+        // Always replace an inherited or caller-supplied marker. Each provider
+        // launch has an independent lifetime, including nested SDK launches.
+        command.env(Self::KEY, &value);
+        Ok(Self(format!("{}={value}", Self::KEY).into()))
+    }
+
+    fn terminate(&self) {
+        use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+        let refresh = ProcessRefreshKind::nothing().with_environ(UpdateKind::Always);
+        // Bounded rescans catch children forked during cleanup. No persistent
+        // process list, global environment mutation or watcher is required.
+        for _ in 0..3 {
+            let mut snapshot = System::new();
+            snapshot.refresh_processes_specifics(ProcessesToUpdate::All, true, refresh);
+            let candidates: Vec<_> = snapshot
+                .processes()
+                .iter()
+                .filter(|(_, process)| process.environ().contains(&self.0))
+                .map(|(pid, process)| (*pid, process.start_time()))
+                .collect();
+            if candidates.is_empty() {
+                break;
+            }
+            for (pid, started) in candidates {
+                // Re-read ownership immediately before signalling. Never kill
+                // from a stale PID list, or infer ownership from a name/PPID.
+                let mut current = System::new();
+                current.refresh_processes_specifics(ProcessesToUpdate::Some(&[pid]), true, refresh);
+                if let Some(process) = current.process(pid) {
+                    if process.start_time() == started && process.environ().contains(&self.0) {
+                        process.kill();
+                    }
+                }
+            }
         }
     }
 }
@@ -361,6 +439,23 @@ mod tests {
             use std::io::Read;
             fn main() {
                 let args: Vec<_> = std::env::args().skip(1).collect();
+                #[cfg(unix)]
+                if args.first().map(String::as_str) == Some("--daemonize") {
+                    use std::process::{Command, Stdio};
+                    Command::new(std::env::current_exe().expect("executable"))
+                        .arg("--detached").arg(&args[1])
+                        .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
+                        .spawn().expect("daemon");
+                    return;
+                }
+                #[cfg(unix)]
+                if args.first().map(String::as_str) == Some("--detached") {
+                    unsafe extern "C" { fn setsid() -> i32; }
+                    assert!(unsafe { setsid() } > 0, "new session");
+                    std::fs::write(&args[1], std::process::id().to_string()).expect("ready");
+                    std::thread::sleep(std::time::Duration::from_secs(20));
+                    return;
+                }
                 if args.first().map(String::as_str) == Some("--exit") {
                     eprintln!("fixture failure");
                     std::process::exit(17);
@@ -425,8 +520,7 @@ mod tests {
         }
         spec.environment
             .insert("SDK_LAUNCH_TEST".into(), "explicit".into());
-        let mut child = spawn(&spec, cwd).expect("launch provider fixture");
-        let mut guard = ProcessTreeGuard::for_child(&child);
+        let (mut child, mut guard) = spawn(&spec, cwd).expect("launch provider fixture");
         let mut stdin = child.stdin.take().expect("piped stdin");
         stdin
             .write_all(b"{\"id\":1}\n")
@@ -481,14 +575,16 @@ mod tests {
             for argument in ["line\nnext", "line\rnext"] {
                 let mut invalid = CommandSpec::new(&shim);
                 invalid.args.push(argument.into());
-                let error = spawn(&invalid, root.path()).expect_err("reject batch newline");
+                let error = spawn(&invalid, root.path())
+                    .err()
+                    .expect("reject batch newline");
                 assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
             }
         }
 
         let mut spec = CommandSpec::new(&binary);
         spec.args = vec!["--exit".into()];
-        let child = spawn(&spec, root.path()).expect("failure fixture");
+        let (child, _guard) = spawn(&spec, root.path()).expect("failure fixture");
         let output = tokio::time::timeout(Duration::from_secs(10), child.wait_with_output())
             .await
             .expect("exit deadline")
@@ -497,14 +593,93 @@ mod tests {
         assert!(String::from_utf8_lossy(&output.stderr).contains("fixture failure"));
 
         spec.args = vec!["--wait".into()];
-        let mut child = spawn(&spec, root.path()).expect("cancellation fixture");
-        let mut guard = ProcessTreeGuard::for_child(&child);
+        let (mut child, mut guard) = spawn(&spec, root.path()).expect("cancellation fixture");
         guard.terminate();
         let status = tokio::time::timeout(Duration::from_secs(10), child.wait())
             .await
             .expect("termination deadline")
             .expect("termination status");
         assert!(!status.success());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn detached_reparented_processes_are_scoped_and_preservation_is_explicit() {
+        use sysinfo::{Pid, ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, System};
+        struct Daemon(u32);
+        impl Drop for Daemon {
+            fn drop(&mut self) {
+                let _ = nix::sys::signal::kill(
+                    nix::unistd::Pid::from_raw(i32::try_from(self.0).expect("pid")),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+            }
+        }
+        fn alive(pid: u32) -> bool {
+            let mut system = System::new();
+            system.refresh_processes_specifics(
+                ProcessesToUpdate::Some(&[Pid::from_u32(pid)]),
+                true,
+                ProcessRefreshKind::nothing(),
+            );
+            system
+                .process(Pid::from_u32(pid))
+                .is_some_and(|p| p.status() != ProcessStatus::Zombie)
+        }
+        let root = tempfile::tempdir().expect("directory");
+        let binary = native_fixture(root.path());
+        let mut guards = Vec::new();
+        let mut daemons = Vec::new();
+        for index in 0..3 {
+            let ready = root.path().join(format!("ready-{index}"));
+            let mut spec = CommandSpec::new(&binary);
+            spec.args = vec!["--daemonize".into(), ready.clone().into_os_string()];
+            // An explicit marker must not merge the ownership of separate launches.
+            spec.environment
+                .insert(ProcessScope::KEY.into(), "caller-token".into());
+            let (mut child, guard) = spawn(&spec, root.path()).expect("spawn");
+            assert!(child.wait().await.expect("provider exit").success());
+            let daemon = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if let Ok(text) = std::fs::read_to_string(&ready) {
+                        if let Ok(pid) = text.parse::<u32>() {
+                            break Daemon(pid);
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("daemon ready");
+            // The original parent has already been reaped, and setsid() has
+            // removed this process from the provider group before cleanup.
+            assert_eq!(
+                nix::unistd::getpgid(Some(nix::unistd::Pid::from_raw(
+                    i32::try_from(daemon.0).expect("pid")
+                )))
+                .expect("group")
+                .as_raw(),
+                i32::try_from(daemon.0).expect("pid")
+            );
+            guards.push(guard);
+            daemons.push(daemon);
+        }
+        // A naturally completed preserving launch leaves its daemon alone.
+        guards[0].disarm();
+        guards[0].terminate();
+        assert!(alive(daemons[0].0));
+        // Explicit termination (TerminateOnCompletion) covers the escaped daemon.
+        guards[1].terminate();
+        // Dropping the guard (cancel/timeout/error) has the same behavior.
+        drop(guards.pop());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while alive(daemons[1].0) || alive(daemons[2].0) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("detached daemons terminated");
+        assert!(alive(daemons[0].0), "another scope was killed");
     }
 
     #[tokio::test]

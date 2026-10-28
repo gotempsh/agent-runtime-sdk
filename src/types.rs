@@ -230,6 +230,9 @@ pub enum ToolProcessPolicy {
     #[default]
     PreserveOnCompletion,
     /// Terminate remaining descendants in the provider process group/tree.
+    /// Local Linux/macOS launches also clean up detached processes that retain
+    /// the SDK's inherited ownership marker. See the process lifetime guide
+    /// for containment limits; this policy is not a security sandbox.
     TerminateOnCompletion,
 }
 

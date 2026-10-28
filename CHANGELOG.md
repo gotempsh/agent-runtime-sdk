@@ -237,6 +237,12 @@ Versioning and Keep a Changelog conventions.
 
 ### Fixed
 
+- Local Linux/macOS process cleanup now discovers detached, reparented tools
+  through a random inherited launch marker, in addition to killing the provider
+  process group. Cleanup rechecks process identity before signaling and keeps
+  separate launches isolated. `PreserveOnCompletion` remains unchanged; remote
+  cleanup and host-crash recovery still require an outer supervisor.
+
 - A Claude turn that Claude Code ended without a finished reply no longer shows
   its debug line (`[ede_diagnostic] result_type=user last_content_type=n/a
   stop_reason=null`) as the failure. The diagnostic now names what happened,
