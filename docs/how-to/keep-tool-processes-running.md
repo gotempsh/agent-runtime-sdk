@@ -92,7 +92,7 @@ selected by executable name, and environment values are never logged.
 This is best-effort lifecycle cleanup, not an OS containment boundary. A tool
 that clears the marker, changes user, or runs where process environments cannot
 be inspected can escape it. Environment inspection and PID signaling are not
-atomic on macOS; identity rechecks reduce, but cannot eliminate, PID reuse
+atomic on Linux or macOS; identity rechecks reduce, but cannot eliminate, PID reuse
 races. Arbitrary forking during the bounded cleanup can also escape. Remote
 transports retain their existing remote cleanup behavior; Windows and other
 Unix platforms retain their existing tree/group cleanup. The SDK cannot run

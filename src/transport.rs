@@ -546,8 +546,10 @@ impl TransportProcessControl for LocalProcessControl {
     }
 
     async fn terminate(&mut self) -> TransportResult<()> {
-        self.process_tree.terminate();
-        Ok(())
+        self.process_tree
+            .terminate_async()
+            .await
+            .map_err(|error| TransportError::local("terminate", std::io::Error::other(error)))
     }
 
     fn disarm(&mut self) {

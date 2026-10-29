@@ -422,7 +422,7 @@ impl Acp {
         };
         let outcome = tokio::time::timeout(timeout, exchange).await;
         drop(stdin);
-        guard.terminate();
+        let _ = guard.terminate_async().await;
         let _ = child.kill().await;
         // Stopping the agent's process group does not close stderr when a
         // descendant left the group and kept the pipe, so the read is bounded

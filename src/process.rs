@@ -136,6 +136,7 @@ pub(crate) fn spawn(
 /// Kills the provider group and locally scoped detached processes when cancelled or
 /// times out. Provider CLIs commonly launch shell and tool grandchildren, so
 /// killing only the immediate child would leave work running in the sandbox.
+#[derive(Default)]
 pub(crate) struct ProcessTreeGuard {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     scope: Option<ProcessScope>,
@@ -170,6 +171,13 @@ impl ProcessTreeGuard {
         {
             self.process_id = None;
         }
+    }
+
+    /// Transfer ownership before awaiting so cancellation cannot drop an armed
+    /// guard on the async worker or cancel cleanup already queued for execution.
+    pub(crate) async fn terminate_async(&mut self) -> Result<(), tokio::task::JoinError> {
+        let mut guard = std::mem::take(self);
+        tokio::task::spawn_blocking(move || guard.terminate()).await
     }
 
     pub(crate) fn terminate(&mut self) {
@@ -669,7 +677,17 @@ mod tests {
         guards[0].terminate();
         assert!(alive(daemons[0].0));
         // Explicit termination (TerminateOnCompletion) covers the escaped daemon.
-        guards[1].terminate();
+        guards[1].terminate_async().await.expect("blocking cleanup");
+        assert!(
+            guards[1].scope.is_none(),
+            "ownership moved to blocking worker"
+        );
+        assert!(guards[1].process_group.is_none());
+        // Repeated explicit cleanup is harmless and cannot rescan the scope.
+        guards[1]
+            .terminate_async()
+            .await
+            .expect("idempotent cleanup");
         // Dropping the guard (cancel/timeout/error) has the same behavior.
         drop(guards.pop());
         tokio::time::timeout(Duration::from_secs(5), async {
