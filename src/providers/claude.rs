@@ -2801,6 +2801,15 @@ fn is_terminal_task_status(status: &str) -> bool {
     )
 }
 
+fn task_activity_kind(status: &str) -> AgentTaskActivityKind {
+    match status {
+        "completed" => AgentTaskActivityKind::Completed,
+        "failed" | "timed_out" | "timeout" => AgentTaskActivityKind::Failed,
+        "stopped" | "killed" | "cancelled" | "interrupted" => AgentTaskActivityKind::Stopped,
+        _ => AgentTaskActivityKind::Updated,
+    }
+}
+
 /// Finish a turn whose background work just drained after its result.
 ///
 /// A one-shot process closes stdin now and keeps reading until Claude exits,
@@ -3012,7 +3021,9 @@ fn translate_system_task(
             output.events.push(TurnEvent::TaskActivity {
                 activity: AgentTaskActivity {
                     task_id: task_id.to_string(),
-                    kind: AgentTaskActivityKind::Updated,
+                    kind: status
+                        .as_deref()
+                        .map_or(AgentTaskActivityKind::Updated, task_activity_kind),
                     description,
                     status,
                     agent_type,
@@ -3194,15 +3205,7 @@ fn translate_system_task(
             let kind = if was_terminal && !resolves_unknown_end {
                 AgentTaskActivityKind::Updated
             } else {
-                match status.as_str() {
-                    "completed" => AgentTaskActivityKind::Completed,
-                    "failed" | "timed_out" | "timeout" => AgentTaskActivityKind::Failed,
-                    "stopped" | "killed" | "cancelled" | "interrupted" => {
-                        AgentTaskActivityKind::Stopped
-                    }
-                    // Unknown states and an "ended" receipt do not prove success.
-                    _ => AgentTaskActivityKind::Updated,
-                }
+                task_activity_kind(&status)
             };
             output.events.push(TurnEvent::TaskActivity {
                 activity: AgentTaskActivity {
@@ -5348,6 +5351,40 @@ setTimeout(() => {
             )));
             let duplicate = adapter.parse_line(&line, &mut state).unwrap();
             assert_eq!(duplicate.events, Vec::new());
+        }
+    }
+
+    #[test]
+    fn terminal_patch_emits_the_outcome_once_before_its_notification() {
+        let adapter = Claude::default();
+        for status in ["failed", "completed", "timed_out", "cancelled"] {
+            let mut state = retained_state(&adapter);
+            adapter.parse_line(BACKGROUND_STARTED, &mut state).unwrap();
+            let patch = format!(
+                r#"{{"type":"system","subtype":"task_updated","task_id":"agent-bg-1","patch":{{"status":"{status}"}}}}"#
+            );
+            let output = adapter.parse_line(&patch, &mut state).unwrap();
+            let kind = task_activity_kind(status);
+            assert_eq!(
+                output
+                    .events
+                    .iter()
+                    .filter(|event| matches!(event,
+                        TurnEvent::TaskActivity { activity } if activity.kind == kind
+                    ))
+                    .count(),
+                1
+            );
+            let notification = format!(
+                r#"{{"type":"system","subtype":"task_notification","task_id":"agent-bg-1","status":"{status}"}}"#
+            );
+            assert_eq!(
+                adapter
+                    .parse_line(&notification, &mut state)
+                    .unwrap()
+                    .events,
+                Vec::new()
+            );
         }
     }
 
