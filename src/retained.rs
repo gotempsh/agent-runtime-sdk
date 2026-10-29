@@ -1141,15 +1141,30 @@ impl TurnMessageBackend for InProcessTurnMessages {
             .await
         {
             Ok(MessageDelivery::Delivered) => Ok(()),
+            Ok(MessageDelivery::NotAccepting) => Err(failure(
+                RuntimeFailureKind::InvalidRequest,
+                DeliveryState::NotSent,
+                "This turn has ended".to_string(),
+            )),
+            Ok(MessageDelivery::Withdrawn) => Err(lifecycle_failure(
+                Some(entry.spec.runtime_id.clone()),
+                Some(self.invocation_id.clone()),
+                RuntimeFailureKind::Timeout,
+                RetryAdvice::After {
+                    milliseconds: 1_000,
+                },
+                DeliveryState::NotSent,
+                "The control was not taken in time; it was not sent".to_string(),
+            )),
             Ok(_) => Err(failure(
                 RuntimeFailureKind::CapabilityUnavailable,
                 DeliveryState::NotSent,
                 "The current step cannot be released by this runtime".to_string(),
             )),
-            Err(error) => Err(failure(
-                RuntimeFailureKind::InvalidRequest,
-                DeliveryState::PossiblySent,
-                error.to_string(),
+            Err(error) => Err(runtime_error_to_failure(
+                error,
+                entry.spec.runtime_id.clone(),
+                self.invocation_id.clone(),
             )),
         }
     }

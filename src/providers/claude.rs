@@ -1169,6 +1169,11 @@ impl AgentAdapter for Claude {
             // A one-shot process closes stdin once it answers, so there is no
             // channel to deliver a later message on.
             Ok(None)
+        } else if id.is_some_and(|id| native.own_commands.contains_key(id)) {
+            Err(RuntimeError::InvalidRequest {
+                field: "message",
+                message: "this input identity was already submitted to the turn".to_string(),
+            })
         } else if native.own_commands.len() >= MAX_TURN_MESSAGES {
             Err(RuntimeError::InvalidRequest {
                 field: "message",
@@ -1846,10 +1851,22 @@ impl AgentAdapter for Claude {
                             task_ids: native.background_task_ids.iter().cloned().collect(),
                         });
                 }
-                let released = std::mem::take(&mut native.read_now_interrupt);
+                // A control acknowledgement is not evidence that a result's
+                // error was caused by interruption. Preserve provider failures.
+                let requested_interrupt = std::mem::take(&mut native.read_now_interrupt);
+                let interrupted = requested_interrupt
+                    && value
+                        .get("errors")
+                        .and_then(Value::as_array)
+                        .is_some_and(|errors| {
+                            !errors.is_empty()
+                                && errors
+                                    .iter()
+                                    .all(|error| error.as_str() == Some("interrupted"))
+                        });
                 let failed =
-                    !released && value.get("is_error").and_then(Value::as_bool) == Some(true);
-                if released {
+                    !interrupted && value.get("is_error").and_then(Value::as_bool) == Some(true);
+                if interrupted {
                     state.terminal_failure = None;
                 }
 
@@ -5949,11 +5966,59 @@ setTimeout(() => {
         )
         .unwrap();
         let output = adapter.parse_line(&json!({"type":"control_response","response":{"subtype":"success","request_id":control["request_id"],"response":{"backgrounded":false}}}).to_string(), &mut state).unwrap();
-        assert!(output.writes.is_empty());
+        assert_eq!(output.writes, Vec::<Vec<u8>>::new());
         assert!(
             matches!(output.events.last(), Some(TurnEvent::InputControl {background:true,succeeded:false,message,..}) if message.contains("no eligible foreground task"))
         );
         assert!(!peek_native_state(&state).unwrap().read_now_interrupt);
+    }
+
+    #[test]
+    fn duplicate_identified_input_preserves_consumed_state() {
+        let adapter = Claude::default();
+        let (mut state, prompt) = retained_turn_with_prompt(&adapter);
+        adapter
+            .parse_line(&lifecycle(&prompt, "started"), &mut state)
+            .unwrap();
+        assert!(adapter
+            .encode_identified_input(Some(&prompt), "duplicate prompt", &mut state)
+            .is_err());
+        adapter
+            .encode_identified_input(Some("same"), "first", &mut state)
+            .unwrap();
+        adapter
+            .parse_line(&lifecycle("same", "started"), &mut state)
+            .unwrap();
+        assert!(adapter
+            .encode_identified_input(Some("same"), "retry", &mut state)
+            .is_err());
+        assert_eq!(
+            peek_native_state(&state).unwrap().own_commands["same"],
+            "started"
+        );
+    }
+
+    #[test]
+    fn interrupt_request_does_not_mask_provider_failure() {
+        let adapter = Claude::default();
+        let (mut state, prompt) = retained_turn_with_prompt(&adapter);
+        adapter
+            .parse_line(&lifecycle(&prompt, "started"), &mut state)
+            .unwrap();
+        adapter
+            .encode_identified_input(Some("waiting"), "next", &mut state)
+            .unwrap();
+        adapter
+            .encode_input_control("waiting", false, &mut state)
+            .unwrap();
+        adapter
+            .parse_line(
+                &json!({"type":"result","is_error":true,"result":"authentication failed"})
+                    .to_string(),
+                &mut state,
+            )
+            .unwrap();
+        assert!(state.terminal_failure.is_some());
     }
 
     #[test]
@@ -6009,7 +6074,7 @@ setTimeout(() => {
             .unwrap();
         let control: Value = serde_json::from_slice(&control).unwrap();
         let output = adapter.parse_line(&json!({"type":"control_response","response":{"subtype":"error","request_id":control["request_id"],"error":"unsupported"}}).to_string(),&mut state).unwrap();
-        assert!(output.writes.is_empty());
+        assert_eq!(output.writes, Vec::<Vec<u8>>::new());
         assert!(output.events.iter().any(|e| matches!(
             e,
             TurnEvent::InputControl {
