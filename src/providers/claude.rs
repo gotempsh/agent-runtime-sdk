@@ -2801,6 +2801,8 @@ fn is_terminal_task_status(status: &str) -> bool {
     )
 }
 
+/// Map an explicit provider status to an activity without inferring success
+/// from an unknown status or the absence of a task in a background snapshot.
 fn task_activity_kind(status: &str) -> AgentTaskActivityKind {
     match status {
         "completed" => AgentTaskActivityKind::Completed,
@@ -2838,6 +2840,9 @@ fn can_track(native: &ClaudeNativeState, task_id: &str) -> bool {
     native.tasks.contains_key(task_id) || native.tasks.len() < MAX_NATIVE_TASKS
 }
 
+/// Reconcile one native task frame into the bounded task registry and events.
+/// Terminal identities cannot be revived by replay; an unknown `ended` outcome
+/// may still be enriched by an explicit terminal receipt arriving later.
 fn translate_system_task(
     value: &Value,
     native: &mut ClaudeNativeState,
@@ -5291,6 +5296,7 @@ setTimeout(() => {
     const FOLLOW_UP_RESULT: &str =
         r#"{"type":"result","subtype":"success","is_error":false,"result":"The build finished."}"#;
 
+    /// Unknown and intermediate notifications preserve ownership of pending work.
     #[test]
     fn nonterminal_notification_does_not_finish_background_work() {
         let adapter = Claude::default();
@@ -5309,6 +5315,7 @@ setTimeout(() => {
         }
     }
 
+    /// Replayed start, patch, and snapshot frames never reopen a finished task.
     #[test]
     fn completed_task_is_not_revived_by_late_start_or_update() {
         let adapter = Claude::default();
@@ -5329,6 +5336,7 @@ setTimeout(() => {
             .any(|event| matches!(event, TurnEvent::ReplyFinishedWithBackgroundTasks { .. })));
     }
 
+    /// Each terminal notification retains its outcome and emits at most once.
     #[test]
     fn task_notifications_preserve_outcomes_and_ignore_duplicates() {
         let adapter = Claude::default();
@@ -5354,6 +5362,7 @@ setTimeout(() => {
         }
     }
 
+    /// A terminal patch emits the outcome even when its notification adds nothing.
     #[test]
     fn terminal_patch_emits_the_outcome_once_before_its_notification() {
         let adapter = Claude::default();
