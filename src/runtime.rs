@@ -747,6 +747,8 @@ struct RetainedHandoff {
 
 /// A user message sent into a running turn, answered once it is written.
 struct TurnMessage {
+    external_id: Option<String>,
+    control: Option<(String, bool)>,
     text: String,
     reply: oneshot::Sender<Result<crate::retained::MessageDelivery>>,
     /// Decides once whether the turn writes the message or the sender
@@ -1467,7 +1469,13 @@ async fn deliver_turn_message(
         // Withdrawn by a sender that stopped waiting.
         return Ok(());
     }
-    let frame = match adapter.encode_user_message(&message.text, state) {
+    let encoded = match &message.control {
+        Some((id, background)) => adapter.encode_input_control(id, *background, state),
+        None => {
+            adapter.encode_identified_input(message.external_id.as_deref(), &message.text, state)
+        }
+    };
+    let frame = match encoded {
         Ok(Some(frame)) => frame,
         Ok(None) => {
             let _ = message.reply.send(Ok(MessageDelivery::Unsupported));
@@ -4126,6 +4134,51 @@ impl AgentRuntime {
         provider: Provider,
         text: String,
     ) -> Result<crate::retained::MessageDelivery> {
+        self.submit_retained_input(runtime_id, provider, text, None, None)
+            .await
+    }
+
+    pub(crate) async fn send_identified_input(
+        &self,
+        runtime_id: &crate::lifecycle::RuntimeId,
+        provider: Provider,
+        id: String,
+        text: String,
+    ) -> Result<crate::retained::MessageDelivery> {
+        self.submit_retained_input(
+            runtime_id,
+            provider,
+            text,
+            None,
+            (!id.is_empty()).then_some(id),
+        )
+        .await
+    }
+    pub(crate) async fn control_retained_input(
+        &self,
+        runtime_id: &crate::lifecycle::RuntimeId,
+        provider: Provider,
+        id: String,
+        background: bool,
+    ) -> Result<crate::retained::MessageDelivery> {
+        self.submit_retained_input(
+            runtime_id,
+            provider,
+            String::new(),
+            Some((id, background)),
+            None,
+        )
+        .await
+    }
+
+    async fn submit_retained_input(
+        &self,
+        runtime_id: &crate::lifecycle::RuntimeId,
+        provider: Provider,
+        text: String,
+        control: Option<(String, bool)>,
+        external_id: Option<String>,
+    ) -> Result<crate::retained::MessageDelivery> {
         use crate::retained::MessageDelivery;
         if text.len() > self.max_prompt_bytes {
             return Err(RuntimeError::InvalidRequest {
@@ -4158,6 +4211,8 @@ impl AgentRuntime {
         let (reply, mut delivered) = oneshot::channel();
         let claim = Arc::new(AtomicU8::new(MESSAGE_QUEUED));
         let message = TurnMessage {
+            external_id,
+            control,
             text,
             reply,
             claim: Arc::clone(&claim),
@@ -7875,6 +7930,8 @@ mod tests {
             let (reply, delivered) = oneshot::channel();
             (
                 TurnMessage {
+                    external_id: None,
+                    control: None,
                     text: text.to_owned(),
                     reply,
                     claim: Arc::new(AtomicU8::new(claim)),

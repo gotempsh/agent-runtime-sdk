@@ -565,6 +565,27 @@ pub trait AgentAdapter: Send + Sync {
     /// The adapter records the message as belonging to the turn, so the turn
     /// ends only once the provider has answered it too. `Ok(None)` — the
     /// default — means the provider cannot accept input mid-turn.
+    /// Correlates user input with its provider lifecycle, when supported.
+    fn encode_identified_input(
+        &self,
+        _id: Option<&str>,
+        text: &str,
+        state: &mut AdapterState,
+    ) -> Result<Option<Vec<u8>>> {
+        self.encode_user_message(text, state)
+    }
+    /// Release foreground work without cancelling already accepted user input.
+    fn encode_input_control(
+        &self,
+        id: &str,
+        background: bool,
+        state: &mut AdapterState,
+    ) -> Result<Option<Vec<u8>>> {
+        let _ = (id, background, state);
+        Ok(None)
+    }
+
+    /// Encode a user message for a retained process, or decline mid-turn input.
     fn encode_user_message(&self, text: &str, state: &mut AdapterState) -> Result<Option<Vec<u8>>> {
         let _ = (text, state);
         Ok(None)

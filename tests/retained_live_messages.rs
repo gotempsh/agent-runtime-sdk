@@ -27,8 +27,8 @@ use temps_agent_runtime::{
 };
 use tokio::task::JoinHandle;
 
-const SCRIPT: &str = r"#!/usr/bin/env python3
-import collections,json,os,sys,threading,time
+const SCRIPT: &str = r#"#!/usr/bin/env python3
+import collections,json,os,sys,threading,time,subprocess
 LOG=LOG_PATH
 DIR=DIR_PATH
 LOCK=threading.Lock()
@@ -36,6 +36,8 @@ WORK=threading.Condition()
 QUEUE=collections.deque()
 INTERRUPT=threading.Event()
 RUNNING=threading.Event()
+BACKGROUND_MONITOR=threading.Event()
+READ_NOW=threading.Event()
 RESPONSES={}
 def log(kind, **data):
  with open(LOG,'a') as f:f.write(json.dumps(dict(kind=kind,pid=os.getpid(),**data))+'\n')
@@ -97,6 +99,24 @@ def foreground(uuid):
  result(text)
  for extra,_ in folded:lifecycle(extra,'completed')
  lifecycle(uuid,'completed')
+def monitor_sentinel(uuid):
+ release=os.path.join(DIR,'sentinel-release');done=os.path.join(DIR,'sentinel-done')
+ sentinel=subprocess.Popen(['sh','-c','while [ ! -e "$1" ]; do sleep 0.05; done; printf survived > "$2"','fixture',release,done])
+ wrapper=subprocess.Popen(['sh','-c','while [ ! -s "$1" ]; do sleep 0.05; done; cat "$1"','fixture',done],stdout=subprocess.DEVNULL)
+ log('sentinel-start',sentinel=sentinel.pid,wrapper=wrapper.pid)
+ emit({'type':'assistant','parent_tool_use_id':None,'message':{'content':[{'type':'tool_use','id':'toolu_monitor','name':'Bash','input':{'command':'while [ ! -s sentinel-output ]; do sleep 10; done; cat sentinel-output'}}]}})
+ def reap():
+  sentinel.wait();log('sentinel-finished')
+  wrapper.wait();log('wrapper-finished')
+ threading.Thread(target=reap,daemon=True).start()
+ while not BACKGROUND_MONITOR.is_set() and not READ_NOW.is_set():time.sleep(.01)
+ if READ_NOW.is_set():
+  READ_NOW.clear();wrapper.terminate();log('monitor-stopped')
+  result('',error=True);lifecycle(uuid,'cancelled')
+ else:
+  BACKGROUND_MONITOR.clear();log('monitor-backgrounded')
+  emit({'type':'user','message':{'role':'user','content':[{'type':'tool_result','tool_use_id':'toolu_monitor','content':'Monitoring continues in the background.'}]}})
+  result('monitor yielded');lifecycle(uuid,'completed')
 def run(uuid,prompt):
  lifecycle(uuid,'started')
  emit({'type':'system','subtype':'init','session_id':'fixture-session'})
@@ -118,6 +138,8 @@ def run(uuid,prompt):
  if prompt=='spawn-bg-then-work':
   start_background()
   foreground(uuid);return
+ if prompt=='monitor-sentinel':
+  monitor_sentinel(uuid);return
  if prompt=='work':
   foreground(uuid);return
  result('reply:'+prompt);lifecycle(uuid,'completed')
@@ -139,9 +161,15 @@ for line in sys.stdin:
  if kind=='control_request':
   subtype=frame['request'].get('subtype')
   log('control',subtype=subtype)
-  if subtype=='interrupt':
-   # Like Claude, an interrupt with nothing running is a no-op.
-   if RUNNING.is_set():INTERRUPT.set()
+  if subtype=='background_tasks':
+   if not released('ack-only-background'):BACKGROUND_MONITOR.set()
+   log('monitor-background-ack')
+   emit({'type':'control_response','response':{'request_id':frame['request_id'],'subtype':'success','response':{}}})
+  elif subtype=='interrupt':
+   # A read-now interrupt releases only foreground work, retaining inputs.
+   if RUNNING.is_set():
+    if frame['request'].get('cancel_queued')==False:READ_NOW.set()
+    else:INTERRUPT.set()
    with WORK:queued=[uuid for uuid,_ in QUEUE]
    emit({'type':'control_response','response':{'request_id':frame['request_id'],'subtype':'success','response':{'still_queued':queued}}})
   elif subtype in('set_model','apply_flag_settings','set_permission_mode'):
@@ -167,7 +195,7 @@ for line in sys.stdin:
   lifecycle(uuid,'queued')
   with WORK:
    QUEUE.append((uuid,text));WORK.notify()
-";
+"#;
 
 /// Records approvals and answers them from a fixed decision.
 struct Approver;
@@ -383,6 +411,79 @@ fn task_activity(events: &[TurnEvent], task: &str, kind: AgentTaskActivityKind) 
                 if activity.task_id == task && activity.kind == kind
         )
     })
+}
+
+#[tokio::test]
+async fn read_now_yields_real_monitor_without_killing_independent_sentinel_or_replaying_input() {
+    for ack_only in [false, true] {
+        let f = Fixture::new(true).await;
+        if ack_only {
+            f.release("ack-only-background");
+        }
+        let running = f.start("monitor-turn", "monitor-sentinel").await;
+        f.wait_for_log("sentinel-start").await;
+        running
+            .turn_messages
+            .send_identified("original-followup", "original input")
+            .await
+            .unwrap();
+        running
+            .turn_messages
+            .read_now("original-followup", true)
+            .await
+            .unwrap();
+        if ack_only {
+            // A control ACK alone does not advance queued input. Explicit stop
+            // is a distinct action, and still never resends the original text.
+            f.wait_for_log("monitor-background-ack").await;
+            assert!(!f
+                .events()
+                .iter()
+                .any(|e| e["kind"] == "prompt" && e["prompt"] == "original input"));
+            running
+                .turn_messages
+                .read_now("original-followup", false)
+                .await
+                .unwrap();
+            f.wait_for_log("monitor-stopped").await;
+        } else {
+            f.wait_for_log("monitor-backgrounded").await;
+        }
+        f.wait_for_prompt("original input").await;
+        let marker = f
+            .events()
+            .into_iter()
+            .find(|e| e["kind"] == "sentinel-start")
+            .unwrap();
+        let pid = marker["sentinel"].as_i64().unwrap();
+        assert!(
+            std::process::Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .status()
+                .unwrap()
+                .success(),
+            "independent background work must remain alive"
+        );
+        assert!(!f.dir.path().join("sentinel-done").exists());
+        f.release("sentinel-release");
+        f.wait_for_log("sentinel-finished").await;
+        f.wait_for_log("wrapper-finished").await;
+        assert_eq!(
+            fs::read_to_string(f.dir.path().join("sentinel-done")).unwrap(),
+            "survived"
+        );
+        let events = running.events.await.unwrap();
+        assert_eq!(events.iter().filter(|e| matches!(e, TurnEvent::InputMessageState {id,state} if id == "original-followup" && state == "started")).count(), 1);
+        running.completion.await.unwrap().unwrap();
+        assert_eq!(
+            f.events()
+                .iter()
+                .filter(|e| e["kind"] == "received" && e["prompt"] == "original input")
+                .count(),
+            1
+        );
+        f.dispose().await;
+    }
 }
 
 #[tokio::test]
