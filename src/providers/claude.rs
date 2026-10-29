@@ -2789,7 +2789,15 @@ fn task_usage(value: Option<&Value>) -> Option<AgentTaskUsage> {
 fn is_terminal_task_status(status: &str) -> bool {
     matches!(
         status,
-        "completed" | "failed" | "killed" | "stopped" | "ended" | "cancelled" | "interrupted"
+        "completed"
+            | "failed"
+            | "killed"
+            | "stopped"
+            | "ended"
+            | "cancelled"
+            | "interrupted"
+            | "timed_out"
+            | "timeout"
     )
 }
 
@@ -2861,6 +2869,14 @@ fn translate_system_task(
                 return;
             };
             if task_id.is_empty() || !can_track(native, task_id) {
+                return;
+            }
+            // Native IDs identify one execution. Replayed starts cannot revive it.
+            if native
+                .tasks
+                .get(task_id)
+                .is_some_and(|task| is_terminal_task_status(&task.status))
+            {
                 return;
             }
             if let Some(tool_use_id) = value.get("tool_use_id").and_then(Value::as_str) {
@@ -2938,6 +2954,15 @@ fn translate_system_task(
                 .get(task_id)
                 .cloned()
                 .unwrap_or_else(|| fallback_task(task_id));
+            if is_terminal_task_status(&task.status)
+                && !(task.status == "ended"
+                    && patch
+                        .and_then(|patch| patch.get("status"))
+                        .and_then(Value::as_str)
+                        .is_some_and(is_terminal_task_status))
+            {
+                return;
+            }
             let description = patch
                 .and_then(|patch| patch.get("description"))
                 .and_then(Value::as_str)
@@ -3134,12 +3159,21 @@ fn translate_system_task(
                 .get(task_id)
                 .cloned()
                 .unwrap_or_else(|| fallback_task(task_id));
+            let previous = task.clone();
+            let was_terminal = is_terminal_task_status(&task.status);
             let status = bounded(
                 value
                     .get("status")
                     .and_then(Value::as_str)
                     .unwrap_or(&task.status),
             );
+            // An empty background snapshot only says "ended", not why.
+            // The explicit terminal receipt may arrive after that snapshot.
+            let resolves_unknown_end =
+                task.status == "ended" && is_terminal_task_status(&status) && status != "ended";
+            if was_terminal && status != task.status && !resolves_unknown_end {
+                return;
+            }
             let summary = optional_bounded(value.get("summary").and_then(Value::as_str));
             task.status.clone_from(&status);
             if let Some(summary) = &summary {
@@ -3148,14 +3182,27 @@ fn translate_system_task(
             if status == "failed" && task.error.is_none() {
                 task.error.clone_from(&summary);
             }
+            if task == previous && was_terminal {
+                return;
+            }
             let agent_type = task.agent_type.clone();
             native.tasks.insert(task_id.to_string(), task);
-            let ended = native.background_task_ids.remove(task_id);
-            background_work_drained(native, output, ended);
-            let kind = match status.as_str() {
-                "failed" => AgentTaskActivityKind::Failed,
-                "stopped" | "killed" => AgentTaskActivityKind::Stopped,
-                _ => AgentTaskActivityKind::Completed,
+            if is_terminal_task_status(&status) {
+                let ended = native.background_task_ids.remove(task_id);
+                background_work_drained(native, output, ended);
+            }
+            let kind = if was_terminal && !resolves_unknown_end {
+                AgentTaskActivityKind::Updated
+            } else {
+                match status.as_str() {
+                    "completed" => AgentTaskActivityKind::Completed,
+                    "failed" | "timed_out" | "timeout" => AgentTaskActivityKind::Failed,
+                    "stopped" | "killed" | "cancelled" | "interrupted" => {
+                        AgentTaskActivityKind::Stopped
+                    }
+                    // Unknown states and an "ended" receipt do not prove success.
+                    _ => AgentTaskActivityKind::Updated,
+                }
             };
             output.events.push(TurnEvent::TaskActivity {
                 activity: AgentTaskActivity {
@@ -3181,6 +3228,13 @@ fn translate_system_task(
                         continue;
                     };
                     if task_id.is_empty() || !can_track(native, task_id) {
+                        continue;
+                    }
+                    if native
+                        .tasks
+                        .get(task_id)
+                        .is_some_and(|task| is_terminal_task_status(&task.status))
+                    {
                         continue;
                     }
                     live_ids.insert(task_id.to_string());
@@ -5233,6 +5287,69 @@ setTimeout(() => {
     const FOLLOW_UP_TEXT: &str = r#"{"type":"assistant","parent_tool_use_id":null,"message":{"content":[{"type":"text","text":"The build finished."}]}}"#;
     const FOLLOW_UP_RESULT: &str =
         r#"{"type":"result","subtype":"success","is_error":false,"result":"The build finished."}"#;
+
+    #[test]
+    fn nonterminal_notification_does_not_finish_background_work() {
+        let adapter = Claude::default();
+        for status in ["running", "queued", "unknown"] {
+            let mut state = retained_state(&adapter);
+            adapter.parse_line(BACKGROUND_STARTED, &mut state).unwrap();
+            adapter.parse_line(PARENT_RESULT, &mut state).unwrap();
+            let line = format!(
+                r#"{{"type":"system","subtype":"task_notification","task_id":"agent-bg-1","status":"{status}"}}"#
+            );
+            let output = adapter.parse_line(&line, &mut state).unwrap();
+            assert!(adapter.retained_completion_grace(&state).is_none());
+            assert!(output.events.iter().any(|event| matches!(event,
+                TurnEvent::TaskActivity { activity } if activity.kind == AgentTaskActivityKind::Updated
+            )));
+        }
+    }
+
+    #[test]
+    fn completed_task_is_not_revived_by_late_start_or_update() {
+        let adapter = Claude::default();
+        let mut state = retained_state(&adapter);
+        for line in [
+            BACKGROUND_STARTED,
+            BACKGROUND_FINISHED,
+            BACKGROUND_STARTED,
+            r#"{"type":"system","subtype":"task_updated","task_id":"agent-bg-1","patch":{"status":"running","is_backgrounded":true}}"#,
+            r#"{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"agent-bg-1","task_type":"local_agent"}]}"#,
+        ] {
+            adapter.parse_line(line, &mut state).unwrap();
+        }
+        let result = adapter.parse_line(PARENT_RESULT, &mut state).unwrap();
+        assert!(!result
+            .events
+            .iter()
+            .any(|event| matches!(event, TurnEvent::ReplyFinishedWithBackgroundTasks { .. })));
+    }
+
+    #[test]
+    fn task_notifications_preserve_outcomes_and_ignore_duplicates() {
+        let adapter = Claude::default();
+        for (status, kind) in [
+            ("completed", AgentTaskActivityKind::Completed),
+            ("failed", AgentTaskActivityKind::Failed),
+            ("timed_out", AgentTaskActivityKind::Failed),
+            ("cancelled", AgentTaskActivityKind::Stopped),
+            ("interrupted", AgentTaskActivityKind::Stopped),
+            ("ended", AgentTaskActivityKind::Updated),
+        ] {
+            let mut state = retained_state(&adapter);
+            adapter.parse_line(BACKGROUND_STARTED, &mut state).unwrap();
+            let line = format!(
+                r#"{{"type":"system","subtype":"task_notification","task_id":"agent-bg-1","status":"{status}","summary":"Watcher ended; readiness not established"}}"#
+            );
+            let output = adapter.parse_line(&line, &mut state).unwrap();
+            assert!(output.events.iter().any(|event| matches!(event,
+                TurnEvent::TaskActivity { activity } if activity.kind == kind && activity.status.as_deref() == Some(status)
+            )));
+            let duplicate = adapter.parse_line(&line, &mut state).unwrap();
+            assert_eq!(duplicate.events, Vec::new());
+        }
+    }
 
     fn retained_state(adapter: &Claude) -> AdapterState {
         let mut state = AdapterState::default();
