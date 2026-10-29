@@ -16,6 +16,13 @@ Versioning and Keep a Changelog conventions.
 
 ### Added
 
+- Identified retained input with native `InputMessageState` receipts and explicit
+  `read_now` foreground controls. Control acknowledgements stay separate from
+  message consumption; background refusal never escalates to interruption.
+  Claude declines input after its reply has settled and waits for queued input
+  to settle before advertising a background handoff. See
+  [steering retained turns](docs/how-to/steer-retained-turns.md).
+
 - `AgentRuntime::subscribe_parked_process_ends`: announces a parked retained
   process that ended while background work it started was still running (it
   exited or was killed, it wrote output the runtime could not read, or a turn

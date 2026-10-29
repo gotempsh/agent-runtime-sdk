@@ -1084,6 +1084,25 @@ pub enum PlanEntryStatus {
 #[serde(tag = "type", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum TurnEvent {
+    /// Native lifecycle of identified user input (not inferred from output).
+    InputMessageState {
+        /// User input identity.
+        id: String,
+        /// queued, started, completed, cancelled or discarded.
+        state: String,
+    },
+    /// Provider acknowledgement of an explicit foreground control.
+    InputControl {
+        /// Host action identifier.
+        id: String,
+        /// Distinguishes background and stop requests for the same input.
+        #[serde(default)]
+        background: bool,
+        /// Whether the provider accepted the request.
+        succeeded: bool,
+        /// Human-readable outcome.
+        message: String,
+    },
     /// Session identifier became available.
     SessionStarted {
         /// Provider-native resumable identifier.

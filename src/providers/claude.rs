@@ -437,11 +437,16 @@ struct ClaudeNativeState {
     /// Lifecycle of each user message this turn submitted, keyed by the
     /// message UUID Claude echoes in `command_lifecycle` frames.
     own_commands: BTreeMap<String, String>,
+    #[serde(default)]
+    identified_commands: BTreeSet<String>,
     /// The CLI reports `command_lifecycle`, so turn completion can wait for
     /// this turn's own messages instead of trusting the first `result`.
     lifecycle_seen: bool,
     /// Claude acknowledged the runtime's native interrupt.
     interrupting: bool,
+    #[serde(default)]
+    read_now_interrupt: bool,
+
     /// Workflow ticks since each workflow task's snapshot was last emitted.
     #[serde(default)]
     workflow_quiet_ticks: BTreeMap<String, u32>,
@@ -453,6 +458,19 @@ struct ClaudeNativeState {
     /// is written after the turn's first frame.
     #[serde(default)]
     session_title_description: Option<String>,
+}
+
+fn accept_input_receipt(previous: &str, next: &str) -> bool {
+    if !matches!(
+        next,
+        "queued" | "started" | "completed" | "cancelled" | "discarded"
+    ) {
+        return false;
+    }
+    if matches!(previous, "completed" | "cancelled" | "discarded") {
+        return previous == next;
+    }
+    !(previous == "started" && next == "queued")
 }
 
 impl ClaudeNativeState {
@@ -1135,18 +1153,37 @@ impl AgentAdapter for Claude {
     }
 
     fn encode_user_message(&self, text: &str, state: &mut AdapterState) -> Result<Option<Vec<u8>>> {
+        self.encode_identified_input(None, text, state)
+    }
+    fn encode_identified_input(
+        &self,
+        id: Option<&str>,
+        text: &str,
+        state: &mut AdapterState,
+    ) -> Result<Option<Vec<u8>>> {
         let mut native = take_native_state(state);
-        let outcome = if !native.retained_turn {
+        let outcome = if !native.retained_turn || native.answered() {
+            // The result can beat Fleet's observation of ReplyFinished. Decline
+            // before writing: the caller can durably queue the same identity
+            // and hand off a held reply without replaying accepted input.
             // A one-shot process closes stdin once it answers, so there is no
             // channel to deliver a later message on.
             Ok(None)
+        } else if id.is_some_and(|id| native.own_commands.contains_key(id)) {
+            Err(RuntimeError::InvalidRequest {
+                field: "message",
+                message: "this input identity was already submitted to the turn".to_string(),
+            })
         } else if native.own_commands.len() >= MAX_TURN_MESSAGES {
             Err(RuntimeError::InvalidRequest {
                 field: "message",
                 message: format!("a turn accepts at most {MAX_TURN_MESSAGES} user messages"),
             })
         } else {
-            let uuid = new_message_uuid();
+            let uuid = id.map_or_else(new_message_uuid, str::to_string);
+            if id.is_some() {
+                native.identified_commands.insert(uuid.clone());
+            }
             native
                 .own_commands
                 .insert(uuid.clone(), "pending".to_string());
@@ -1154,6 +1191,34 @@ impl AgentAdapter for Claude {
         };
         put_native_state(state, native);
         outcome
+    }
+
+    fn encode_input_control(
+        &self,
+        id: &str,
+        background: bool,
+        state: &mut AdapterState,
+    ) -> Result<Option<Vec<u8>>> {
+        let mut native = take_native_state(state);
+        let pending = native
+            .own_commands
+            .get(id)
+            .is_some_and(|s| matches!(s.as_str(), "pending" | "queued"));
+        let result = if !native.retained_turn || !native.lifecycle_seen || !pending {
+            Ok(None)
+        } else {
+            if !background {
+                native.read_now_interrupt = true;
+            }
+            serde_json::to_vec(&json!({
+                "type": "control_request",
+                "request_id": format!("temps-read-now:{}:{id}", if background { "background" } else { "stop" }),
+                "request": if background { json!({"subtype":"background_tasks"}) }
+                    else { json!({"subtype":"interrupt", "cancel_queued":false}) }
+            })).map(Some).map_err(|e| RuntimeError::Protocol { provider: Provider::Claude, message: e.to_string() })
+        };
+        put_native_state(state, native);
+        result
     }
 
     fn interrupt_request(&self, state: &AdapterState) -> Option<Vec<u8>> {
@@ -1779,14 +1844,32 @@ impl AgentAdapter for Claude {
                 // answered by this result or by a later exchange.
                 output.terminal = !native.holds_turn_open()
                     && (!native.retained_turn || native.own_commands_done());
-                if native.holds_turn_open() {
+                if native.holds_turn_open() && native.own_commands_done() {
                     output
                         .events
                         .push(TurnEvent::ReplyFinishedWithBackgroundTasks {
                             task_ids: native.background_task_ids.iter().cloned().collect(),
                         });
                 }
-                let failed = value.get("is_error").and_then(Value::as_bool) == Some(true);
+                // A control acknowledgement is not evidence that a result's
+                // error was caused by interruption. Preserve provider failures.
+                let requested_interrupt = std::mem::take(&mut native.read_now_interrupt);
+                let interrupted = requested_interrupt
+                    && value
+                        .get("errors")
+                        .and_then(Value::as_array)
+                        .is_some_and(|errors| {
+                            !errors.is_empty()
+                                && errors
+                                    .iter()
+                                    .all(|error| error.as_str() == Some("interrupted"))
+                        });
+                let failed =
+                    !interrupted && value.get("is_error").and_then(Value::as_bool) == Some(true);
+                if interrupted {
+                    state.terminal_failure = None;
+                }
+
                 state.result.status = if failed {
                     let diagnostic = value
                         .get("result")
@@ -1865,7 +1948,19 @@ impl AgentAdapter for Claude {
                 if let (Some(command), Some(lifecycle)) = (command, lifecycle) {
                     native.lifecycle_seen = true;
                     if let Some(tracked) = native.own_commands.get_mut(command) {
+                        // Repeated/out-of-order receipts must not turn consumed
+                        // input back into queued work or reopen a terminal input.
+                        if !accept_input_receipt(tracked, lifecycle) {
+                            put_native_state(state, native);
+                            return Ok(output);
+                        }
                         *tracked = bounded(lifecycle);
+                        if native.identified_commands.contains(command) {
+                            output.events.push(TurnEvent::InputMessageState {
+                                id: command.into(),
+                                state: lifecycle.into(),
+                            });
+                        }
                         // Stopping a turn stops every message it submitted,
                         // including ones Claude had queued behind the
                         // interrupted exchange.
@@ -1878,6 +1973,15 @@ impl AgentAdapter for Claude {
                         // with a result that belongs to this turn.
                         native.follow_up_active = true;
                         native.awaiting_follow_up = false;
+                    }
+                    // A result may precede the final command receipt. Do not
+                    // offer an idle handoff while accepted input is still queued.
+                    if native.retained_turn && native.answered() && native.holds_turn_open() {
+                        output
+                            .events
+                            .push(TurnEvent::ReplyFinishedWithBackgroundTasks {
+                                task_ids: native.background_task_ids.iter().cloned().collect(),
+                            });
                     }
                     // A turn whose last own message just finished ends here,
                     // unless Claude may still answer drained background work.
@@ -1896,6 +2000,35 @@ impl AgentAdapter for Claude {
                     .pointer("/response/request_id")
                     .and_then(Value::as_str)
                 {
+                    Some(id) if id.starts_with("temps-read-now:") => {
+                        let accepted = value.pointer("/response/subtype").and_then(Value::as_str)
+                            == Some("success");
+                        let action = id.trim_start_matches("temps-read-now:");
+                        let (background, input_id) =
+                            if let Some(input) = action.strip_prefix("background:") {
+                                (true, input)
+                            } else {
+                                (false, action.strip_prefix("stop:").unwrap_or(action))
+                            };
+                        let no_background_task = background
+                            && accepted
+                            && value
+                                .pointer("/response/response/backgrounded")
+                                .and_then(Value::as_bool)
+                                == Some(false);
+                        let succeeded = accepted && !no_background_task;
+                        if !succeeded && !background {
+                            native.read_now_interrupt = false;
+                        }
+                        output.events.push(TurnEvent::InputControl {
+                            id: input_id.to_string(),
+                            background,
+                            succeeded,
+                            message: if succeeded { "Claude acknowledged the control request. Waiting for confirmation that the original message has started.".into() }
+                                else if no_background_task { "Claude found no eligible foreground task to background. Refresh delivery status; the original message has not been resent.".into() }
+                                else { value.pointer("/response/error").and_then(Value::as_str).unwrap_or("Claude refused the action. Wait for the step to finish or try Read it now.").to_string() },
+                        });
+                    }
                     Some(INTERRUPT_REQUEST_ID) => native.interrupting = true,
                     // A failed request leaves the session untitled; the
                     // caller asks again on a later turn.
@@ -3287,6 +3420,17 @@ fn explain_ede_diagnostic(fields: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn input_receipts_never_regress_consumption_or_accept_unknown_states() {
+        assert!(accept_input_receipt("pending", "queued"));
+        assert!(accept_input_receipt("queued", "started"));
+        assert!(accept_input_receipt("started", "completed"));
+        assert!(!accept_input_receipt("started", "queued"));
+        assert!(!accept_input_receipt("completed", "started"));
+        assert!(!accept_input_receipt("cancelled", "completed"));
+        assert!(!accept_input_receipt("pending", "anything"));
+    }
 
     #[test]
     fn account_profiles_usage_never_reads_default_keychain_or_credential_file() {
@@ -4704,6 +4848,29 @@ setTimeout(() => {
     }
 
     #[test]
+    fn live_input_after_native_reply_is_declined_before_writing() {
+        let adapter = Claude::default();
+        let mut state = AdapterState::default();
+        let mut native = ClaudeNativeState {
+            retained_turn: true,
+            result_seen: true,
+            lifecycle_seen: true,
+            ..Default::default()
+        };
+        native
+            .own_commands
+            .insert("original".into(), "completed".into());
+        put_native_state(&mut state, native);
+        assert!(adapter
+            .encode_identified_input(Some("next"), "do not duplicate", &mut state)
+            .unwrap()
+            .is_none());
+        let native = peek_native_state(&state).unwrap();
+        assert!(!native.own_commands.contains_key("next"));
+        assert!(!native.interrupting);
+    }
+
+    #[test]
     fn a_background_shell_holds_the_turn_open_after_the_reply() {
         let adapter = Claude::default();
         let mut state = AdapterState::default();
@@ -5705,6 +5872,224 @@ setTimeout(() => {
     }
 
     #[test]
+    fn read_now_retains_injected_messages_exactly_once() {
+        for background in [false, true] {
+            let adapter = Claude::default();
+            let (mut state, prompt) = retained_turn_with_prompt(&adapter);
+            adapter
+                .parse_line(&lifecycle(&prompt, "started"), &mut state)
+                .unwrap();
+            for id in ["message-one", "message-two"] {
+                let frame = adapter
+                    .encode_identified_input(Some(id), id, &mut state)
+                    .unwrap()
+                    .unwrap();
+                let frame: Value = serde_json::from_slice(&frame).unwrap();
+                assert_eq!(frame["uuid"], id);
+                adapter
+                    .parse_line(&lifecycle(id, "queued"), &mut state)
+                    .unwrap();
+            }
+            let control = adapter
+                .encode_input_control("message-one", background, &mut state)
+                .unwrap()
+                .unwrap();
+            let control: Value = serde_json::from_slice(&control).unwrap();
+            assert_eq!(control["type"], "control_request");
+            assert!(
+                control.get("message").is_none(),
+                "never sends the text a second time"
+            );
+            assert_eq!(
+                control["request"]["subtype"],
+                if background {
+                    "background_tasks"
+                } else {
+                    "interrupt"
+                }
+            );
+            if !background {
+                assert_eq!(control["request"]["cancel_queued"], false);
+            }
+            adapter.parse_line(&json!({"type":"control_response","response":{"subtype":"success","request_id":control["request_id"]}}).to_string(), &mut state).unwrap();
+            assert!(!peek_native_state(&state).unwrap().interrupting);
+            if !background {
+                adapter
+                    .parse_line(
+                        r#"{"type":"result","is_error":true,"errors":["interrupted"]}"#,
+                        &mut state,
+                    )
+                    .unwrap();
+                assert!(state.terminal_failure.is_none());
+            }
+            adapter
+                .parse_line(&lifecycle(&prompt, "cancelled"), &mut state)
+                .unwrap();
+            for id in ["message-one", "message-two"] {
+                let output = adapter
+                    .parse_line(&lifecycle(id, "started"), &mut state)
+                    .unwrap();
+                assert!(
+                    output.writes.is_empty(),
+                    "injected messages are not interrupted or replayed"
+                );
+                assert!(
+                    adapter
+                        .encode_input_control(id, false, &mut state)
+                        .unwrap()
+                        .is_none(),
+                    "read messages cannot interrupt later work"
+                );
+                adapter
+                    .parse_line(&lifecycle(id, "completed"), &mut state)
+                    .unwrap();
+            }
+            assert_eq!(peek_native_state(&state).unwrap().own_commands.len(), 3);
+        }
+    }
+
+    #[test]
+    fn background_ack_with_false_result_is_actionable_refusal_without_stop() {
+        let adapter = Claude::default();
+        let (mut state, prompt) = retained_turn_with_prompt(&adapter);
+        adapter
+            .parse_line(&lifecycle(&prompt, "started"), &mut state)
+            .unwrap();
+        adapter
+            .encode_identified_input(Some("original"), "fixture", &mut state)
+            .unwrap();
+        let control: Value = serde_json::from_slice(
+            &adapter
+                .encode_input_control("original", true, &mut state)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        let output = adapter.parse_line(&json!({"type":"control_response","response":{"subtype":"success","request_id":control["request_id"],"response":{"backgrounded":false}}}).to_string(), &mut state).unwrap();
+        assert_eq!(output.writes, Vec::<Vec<u8>>::new());
+        assert!(
+            matches!(output.events.last(), Some(TurnEvent::InputControl {background:true,succeeded:false,message,..}) if message.contains("no eligible foreground task"))
+        );
+        assert!(!peek_native_state(&state).unwrap().read_now_interrupt);
+    }
+
+    #[test]
+    fn duplicate_identified_input_preserves_consumed_state() {
+        let adapter = Claude::default();
+        let (mut state, prompt) = retained_turn_with_prompt(&adapter);
+        adapter
+            .parse_line(&lifecycle(&prompt, "started"), &mut state)
+            .unwrap();
+        assert!(adapter
+            .encode_identified_input(Some(&prompt), "duplicate prompt", &mut state)
+            .is_err());
+        adapter
+            .encode_identified_input(Some("same"), "first", &mut state)
+            .unwrap();
+        adapter
+            .parse_line(&lifecycle("same", "started"), &mut state)
+            .unwrap();
+        assert!(adapter
+            .encode_identified_input(Some("same"), "retry", &mut state)
+            .is_err());
+        assert_eq!(
+            peek_native_state(&state).unwrap().own_commands["same"],
+            "started"
+        );
+    }
+
+    #[test]
+    fn interrupt_request_does_not_mask_provider_failure() {
+        let adapter = Claude::default();
+        let (mut state, prompt) = retained_turn_with_prompt(&adapter);
+        adapter
+            .parse_line(&lifecycle(&prompt, "started"), &mut state)
+            .unwrap();
+        adapter
+            .encode_identified_input(Some("waiting"), "next", &mut state)
+            .unwrap();
+        adapter
+            .encode_input_control("waiting", false, &mut state)
+            .unwrap();
+        adapter
+            .parse_line(
+                &json!({"type":"result","is_error":true,"result":"authentication failed"})
+                    .to_string(),
+                &mut state,
+            )
+            .unwrap();
+        assert!(state.terminal_failure.is_some());
+    }
+
+    #[test]
+    fn late_background_refusal_does_not_clear_explicit_foreground_stop() {
+        let adapter = Claude::default();
+        let (mut state, prompt) = retained_turn_with_prompt(&adapter);
+        adapter
+            .parse_line(&lifecycle(&prompt, "started"), &mut state)
+            .unwrap();
+        adapter
+            .encode_identified_input(Some("original"), "fixture", &mut state)
+            .unwrap();
+        let background: Value = serde_json::from_slice(
+            &adapter
+                .encode_input_control("original", true, &mut state)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        let stop: Value = serde_json::from_slice(
+            &adapter
+                .encode_input_control("original", false, &mut state)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_ne!(background["request_id"], stop["request_id"]);
+        let output = adapter.parse_line(&json!({"type":"control_response","response":{"subtype":"error","request_id":background["request_id"],"error":"late refusal"}}).to_string(), &mut state).unwrap();
+        assert!(peek_native_state(&state).unwrap().read_now_interrupt);
+        assert!(matches!(
+            output.events.last(),
+            Some(TurnEvent::InputControl {
+                background: true,
+                succeeded: false,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn read_now_refusal_is_reported_and_never_falls_back_to_stop() {
+        let adapter = Claude::default();
+        let (mut state, prompt) = retained_turn_with_prompt(&adapter);
+        adapter
+            .parse_line(&lifecycle(&prompt, "started"), &mut state)
+            .unwrap();
+        adapter
+            .encode_identified_input(Some("waiting"), "text", &mut state)
+            .unwrap();
+        let control = adapter
+            .encode_input_control("waiting", true, &mut state)
+            .unwrap()
+            .unwrap();
+        let control: Value = serde_json::from_slice(&control).unwrap();
+        let output = adapter.parse_line(&json!({"type":"control_response","response":{"subtype":"error","request_id":control["request_id"],"error":"unsupported"}}).to_string(),&mut state).unwrap();
+        assert_eq!(output.writes, Vec::<Vec<u8>>::new());
+        assert!(output.events.iter().any(|e| matches!(
+            e,
+            TurnEvent::InputControl {
+                succeeded: false,
+                ..
+            }
+        )));
+        assert!(!peek_native_state(&state).unwrap().interrupting);
+        assert!(adapter
+            .encode_input_control("missing", false, &mut state)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
     fn message_uuids_are_unique_version_four_uuids() {
         let first = new_message_uuid();
         assert_ne!(first, new_message_uuid());
@@ -5770,13 +6155,18 @@ setTimeout(() => {
             lifecycle(&prompt, "queued"),
             lifecycle(&prompt, "started"),
             PARENT_RESULT.to_string(),
-            lifecycle(&prompt, "completed"),
         ] {
             adapter.parse_line(&line, &mut state).unwrap();
         }
         // Written, but Claude has not reported it yet when another result
         // (for example its answer to a finished task) arrives.
-        adapter.encode_user_message("next", &mut state).unwrap();
+        assert!(adapter
+            .encode_user_message("next", &mut state)
+            .unwrap()
+            .is_some());
+        adapter
+            .parse_line(&lifecycle(&prompt, "completed"), &mut state)
+            .unwrap();
         assert!(
             !adapter
                 .parse_line(PARENT_RESULT, &mut state)
