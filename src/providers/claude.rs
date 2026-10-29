@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -26,6 +26,7 @@ use crate::{
 
 const CLAUDE_STATE_KEY: &str = "claude.native_tasks";
 const MAX_NATIVE_TASKS: usize = 32;
+const MAX_RETIRED_TASKS: usize = 128;
 const MAX_TASK_FIELD_CHARS: usize = 4_000;
 /// Agents kept per workflow; the rest are counted in `omitted_agents`.
 const MAX_WORKFLOW_AGENTS: usize = 100;
@@ -406,6 +407,12 @@ fn context_window_from_label(value: &str) -> Option<u64> {
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct ClaudeNativeState {
     tasks: BTreeMap<String, AgentTask>,
+    /// Recent terminal identities outlive their turn without occupying live slots.
+    #[serde(default)]
+    retired_tasks: VecDeque<AgentTask>,
+    /// Last usage emitted per tracked or recently retired task, for enrichment dedup.
+    #[serde(default)]
+    task_usage: BTreeMap<String, AgentTaskUsage>,
     background_task_ids: BTreeSet<String>,
     tool_use_to_task: BTreeMap<String, String>,
     tool_names: BTreeMap<String, String>,
@@ -1310,6 +1317,23 @@ impl AgentAdapter for Claude {
         // Only live work crosses the hand-off. Finished tasks stay with the
         // turn that reported them; carrying them would let a chain of
         // hand-offs fill the bounded task table and hide new subagents.
+        native.retired_tasks = previous.retired_tasks;
+        for (id, task) in &previous.tasks {
+            if !previous.background_task_ids.contains(id) && is_terminal_task_status(&task.status) {
+                native.retired_tasks.push_back(task.clone());
+            }
+        }
+        while native.retired_tasks.len() > MAX_RETIRED_TASKS {
+            native.retired_tasks.pop_front();
+        }
+        native.task_usage = previous
+            .task_usage
+            .into_iter()
+            .filter(|(id, _)| {
+                previous.background_task_ids.contains(id)
+                    || native.retired_tasks.iter().any(|task| &task.id == id)
+            })
+            .collect();
         native.tasks = previous
             .tasks
             .into_iter()
@@ -2848,6 +2872,34 @@ fn translate_system_task(
     native: &mut ClaudeNativeState,
     output: &mut AdapterOutput,
 ) {
+    let retired = value
+        .get("task_id")
+        .and_then(Value::as_str)
+        .and_then(|id| native.retired_tasks.iter().position(|task| task.id == id));
+    if let Some(index) = retired {
+        let task = native
+            .retired_tasks
+            .remove(index)
+            .expect("known retired task");
+        let id = task.id.clone();
+        native.tasks.insert(id.clone(), task);
+        translate_system_task_frame(value, native, output);
+        let task = native
+            .tasks
+            .remove(&id)
+            .expect("reconciliation preserves identity");
+        native.retired_tasks.insert(index, task);
+    } else {
+        translate_system_task_frame(value, native, output);
+    }
+}
+
+/// Apply a native frame with any retired identity temporarily available for enrichment.
+fn translate_system_task_frame(
+    value: &Value,
+    native: &mut ClaudeNativeState,
+    output: &mut AdapterOutput,
+) {
     match value.get("subtype").and_then(Value::as_str) {
         Some("permission_denied") => {
             let id = value
@@ -2885,14 +2937,6 @@ fn translate_system_task(
             if task_id.is_empty() || !can_track(native, task_id) {
                 return;
             }
-            // Native IDs identify one execution. Replayed starts cannot revive it.
-            if native
-                .tasks
-                .get(task_id)
-                .is_some_and(|task| is_terminal_task_status(&task.status))
-            {
-                return;
-            }
             if let Some(tool_use_id) = value.get("tool_use_id").and_then(Value::as_str) {
                 if !tool_use_id.is_empty() {
                     native
@@ -2908,6 +2952,30 @@ fn translate_system_task(
                     .unwrap_or("Background task"),
             );
             let task_type = value.get("task_type").and_then(Value::as_str);
+            if let Some(known) = native
+                .tasks
+                .get(task_id)
+                .filter(|task| is_terminal_task_status(&task.status))
+                .cloned()
+            {
+                let mut task = known.clone();
+                if task_type.is_some() {
+                    task.kind = task_kind(task_type, agent_type.as_deref());
+                }
+                if task.description == fallback_task(task_id).description
+                    || task.description.is_empty()
+                {
+                    task.description.clone_from(&description);
+                }
+                if task.agent_type.is_none() {
+                    task.agent_type = agent_type;
+                }
+                if task != known {
+                    native.tasks.insert(task_id.to_string(), task);
+                    emit_tasks(native, output);
+                }
+                return;
+            }
             // The Workflow tool's result can arrive first and already record
             // where the run writes its transcripts.
             let known = native.tasks.get(task_id);
@@ -3198,7 +3266,14 @@ fn translate_system_task(
             if status == "failed" && task.error.is_none() {
                 task.error.clone_from(&summary);
             }
-            if task == previous && was_terminal {
+            let usage = task_usage(value.get("usage"));
+            let new_usage = usage
+                .as_ref()
+                .is_some_and(|usage| native.task_usage.get(task_id) != Some(usage));
+            if let Some(usage) = &usage {
+                native.task_usage.insert(task_id.to_string(), usage.clone());
+            }
+            if task == previous && was_terminal && !new_usage {
                 return;
             }
             let agent_type = task.agent_type.clone();
@@ -3222,7 +3297,7 @@ fn translate_system_task(
                     summary,
                     last_tool_name: None,
                     spawn_depth: None,
-                    usage: task_usage(value.get("usage")),
+                    usage,
                     workflow_agent: None,
                 },
             });
@@ -3236,6 +3311,9 @@ fn translate_system_task(
                         continue;
                     };
                     if task_id.is_empty() || !can_track(native, task_id) {
+                        continue;
+                    }
+                    if native.retired_tasks.iter().any(|task| task.id == task_id) {
                         continue;
                     }
                     if native
@@ -5397,6 +5475,82 @@ setTimeout(() => {
         }
     }
 
+    /// Completed work cannot return after a retained process changes turns.
+    #[test]
+    fn terminal_identity_survives_handoff_without_filling_live_tasks() {
+        let adapter = Claude::default();
+        let mut previous = retained_state(&adapter);
+        for line in [
+            BACKGROUND_STARTED,
+            BACKGROUND_FINISHED,
+            r#"{"type":"system","subtype":"task_started","task_id":"still-live","task_type":"local_agent","is_backgrounded":true}"#,
+            PARENT_RESULT,
+        ] {
+            adapter.parse_line(line, &mut previous).unwrap();
+        }
+        let mut next = retained_state(&adapter);
+        adapter.inherit_retained_handoff(previous, &mut next);
+        adapter.parse_line(BACKGROUND_STARTED, &mut next).unwrap();
+        adapter.parse_line(r#"{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"agent-bg-1","task_type":"local_agent"},{"task_id":"still-live","task_type":"local_agent"}]}"#, &mut next).unwrap();
+        let native = peek_native_state(&next).unwrap();
+        assert_eq!(
+            native.background_task_ids,
+            BTreeSet::from(["still-live".into()])
+        );
+        assert_eq!(native.tasks.len(), 1);
+        assert_eq!(
+            adapter
+                .parse_line(BACKGROUND_FINISHED, &mut next)
+                .unwrap()
+                .events,
+            Vec::new()
+        );
+        adapter.parse_line(r#"{"type":"system","subtype":"task_notification","task_id":"still-live","status":"completed"}"#, &mut next).unwrap();
+        let result = adapter.parse_line(PARENT_RESULT, &mut next).unwrap();
+        assert!(!result
+            .events
+            .iter()
+            .any(|event| matches!(event, TurnEvent::ReplyFinishedWithBackgroundTasks { .. })));
+    }
+
+    /// A receipt may precede its first start; metadata still belongs to that task.
+    #[test]
+    fn late_start_enriches_terminal_task_without_reviving_it() {
+        let adapter = Claude::default();
+        let mut state = retained_state(&adapter);
+        adapter.parse_line(BACKGROUND_FINISHED, &mut state).unwrap();
+        adapter.parse_line(BACKGROUND_STARTED, &mut state).unwrap();
+        let native = peek_native_state(&state).unwrap();
+        let task = &native.tasks["agent-bg-1"];
+        assert_eq!(task.status, "completed");
+        assert_eq!(task.kind, "subagent");
+        assert_eq!(task.description, "Wait for the build");
+        assert_eq!(
+            native
+                .tool_use_to_task
+                .get("toolu_agent")
+                .map(String::as_str),
+            Some("agent-bg-1")
+        );
+        assert_eq!(native.background_task_ids, BTreeSet::new());
+    }
+
+    /// Usage arriving after the outcome is an enrichment, never a second completion.
+    #[test]
+    fn terminal_usage_is_reported_once_after_a_patch() {
+        let adapter = Claude::default();
+        let mut state = retained_state(&adapter);
+        adapter.parse_line(BACKGROUND_STARTED, &mut state).unwrap();
+        adapter.parse_line(r#"{"type":"system","subtype":"task_updated","task_id":"agent-bg-1","patch":{"status":"completed"}}"#, &mut state).unwrap();
+        let receipt = r#"{"type":"system","subtype":"task_notification","task_id":"agent-bg-1","status":"completed","usage":{"total_tokens":42,"tool_uses":2,"duration_ms":300}}"#;
+        let result = adapter.parse_line(receipt, &mut state).unwrap();
+        assert!(result.events.iter().any(|event| matches!(event, TurnEvent::TaskActivity { activity } if activity.kind == AgentTaskActivityKind::Updated && activity.usage.as_ref().is_some_and(|usage| usage.total_tokens == 42))));
+        assert_eq!(
+            adapter.parse_line(receipt, &mut state).unwrap().events,
+            Vec::new()
+        );
+    }
+
     fn retained_state(adapter: &Claude) -> AdapterState {
         let mut state = AdapterState::default();
         adapter.mark_retained_turn(&mut state);
@@ -5624,7 +5778,7 @@ setTimeout(() => {
         }
         // A long-running subagent keeps every turn open while each turn
         // starts and finishes another one, then hands off.
-        for turn in 0..(MAX_NATIVE_TASKS * 2) {
+        for turn in 0..(MAX_RETIRED_TASKS * 2) {
             let mut next = retained_state(&adapter);
             adapter.inherit_retained_handoff(state, &mut next);
             state = next;
@@ -5671,6 +5825,8 @@ setTimeout(() => {
             adapter.parse_line(PARENT_RESULT, &mut state).unwrap();
         }
         let native = peek_native_state(&state).unwrap();
+        assert!(native.retired_tasks.len() <= MAX_RETIRED_TASKS);
+        assert!(native.task_usage.len() <= MAX_RETIRED_TASKS + MAX_NATIVE_TASKS);
         assert!(native.tasks.len() <= 2, "{:?}", native.tasks.keys());
         assert!(native.tool_use_to_task.len() <= 2);
         assert!(
