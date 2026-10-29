@@ -82,7 +82,7 @@ def foreground(uuid):
   if INTERRUPT.is_set():
    log('work-stopped')
    emit({'type':'system','subtype':'task_notification','task_id':'fg-1','status':'stopped'})
-   result('',error=True);lifecycle(uuid,'cancelled')
+   emit({'type':'result','is_error':True,'errors':['interrupted']});lifecycle(uuid,'cancelled')
    # Like Claude, the stopped exchange reaches the transcript just after
    # the turn is reported over.
    time.sleep(.05)
@@ -112,7 +112,7 @@ def monitor_sentinel(uuid):
  while not BACKGROUND_MONITOR.is_set() and not READ_NOW.is_set():time.sleep(.01)
  if READ_NOW.is_set():
   READ_NOW.clear();wrapper.terminate();log('monitor-stopped')
-  result('',error=True);lifecycle(uuid,'cancelled')
+  emit({'type':'result','is_error':True,'errors':['interrupted']});lifecycle(uuid,'cancelled')
  else:
   BACKGROUND_MONITOR.clear();log('monitor-backgrounded')
   emit({'type':'user','message':{'role':'user','content':[{'type':'tool_result','tool_use_id':'toolu_monitor','content':'Monitoring continues in the background.'}]}})
@@ -130,7 +130,7 @@ def run(uuid,prompt):
   time.sleep(.2)
  if INTERRUPT.is_set():
   log('cancelled',prompt=prompt)
-  result('',error=True);lifecycle(uuid,'cancelled');return
+  emit({'type':'result','is_error':True,'errors':['interrupted']});lifecycle(uuid,'cancelled');return
  if prompt in('spawn-bg','spawn-bg-approval'):
   start_background(approval=prompt=='spawn-bg-approval')
   emit({'type':'assistant','parent_tool_use_id':None,'message':{'content':[{'type':'text','text':'LAUNCHED'}]}})
