@@ -1533,36 +1533,38 @@ async fn supervise_idle_retained_process(
                 }
                 probe_deadline = Some(now + KEEPALIVE_RESPONSE_TIMEOUT);
             }
-            read_idle_retained_line(&mut io.reader, max_event_line_bytes).await
-        };
-        match observed {
-            None => {}
-            Some(Ok(Some(line))) => match adapter.classify_idle_frame(&line) {
-                IdleFrame::Background => {
-                    // Work an earlier turn left pending can still answer; the
-                    // adapter may need to clean up what it opened.
-                    let replies = adapter.idle_frame_writes(&line);
+            let read = read_idle_retained_line(&mut io.reader, max_event_line_bytes).await;
+            // A frame is handled under the I/O lock that read it: a turn claims
+            // the process through the same lock, so it cannot take the inherited
+            // state or change the generation between the read and what it says
+            // about the process, and the reply goes to the process it came from.
+            if let Some(Ok(Some(line))) = &read {
+                if matches!(adapter.classify_idle_frame(line), IdleFrame::Background) {
                     {
-                        // What the frame says about the process belongs in the
-                        // state the next turn inherits.
                         let mut inherited = retained
                             .handoff
                             .inherited
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
                         if let Some(state) = inherited.as_mut() {
-                            adapter.observe_idle_frame(&line, state);
+                            adapter.observe_idle_frame(line, state);
                         }
                     }
+                    // Work an earlier turn left pending can still answer; the
+                    // adapter may need to clean up what it opened.
+                    let replies = adapter.idle_frame_writes(line);
                     if !replies.is_empty() {
-                        let mut io = retained.io.lock().await;
-                        if current(&retained) {
-                            if let Some(io) = io.as_mut() {
-                                write_optional_frames(Some(&mut io.stdin), &replies).await;
-                            }
-                        }
+                        write_optional_frames(Some(&mut io.stdin), &replies).await;
                     }
                 }
+            }
+            read
+        };
+        match observed {
+            None => {}
+            Some(Ok(Some(line))) => match adapter.classify_idle_frame(&line) {
+                // Handled above, under the lock that read it.
+                IdleFrame::Background => {}
                 IdleFrame::KeepaliveResult { active: true } => {
                     probe_deadline = None;
                     expires_at = tokio::time::Instant::now() + idle_timeout;

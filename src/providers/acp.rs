@@ -2179,7 +2179,18 @@ fn advance(
 fn apply_setting_update(update: &Value, turn: &mut TurnState) -> bool {
     match update.get("sessionUpdate").and_then(Value::as_str) {
         Some("config_option_update") => {
-            turn.session_config = session_snapshot(update);
+            // An update carries the native options only: the legacy `modes`
+            // and `models` the session opened with still hold until the agent
+            // replaces them, so a later custom mode or model stays selectable.
+            let mut snapshot = session_snapshot(update);
+            for key in ["modes", "models", "_supportsImages"] {
+                if snapshot.get(key).is_none() {
+                    if let Some(kept) = turn.session_config.get(key) {
+                        snapshot[key] = kept.clone();
+                    }
+                }
+            }
+            turn.session_config = snapshot;
             true
         }
         Some("current_mode_update") => {
@@ -2669,6 +2680,48 @@ mod tests {
         let first: Value =
             serde_json::from_slice(&adapter.retained_turn_start(&next).unwrap().unwrap()).unwrap();
         assert_eq!(first["method"], "session/prompt");
+    }
+
+    #[test]
+    fn a_native_config_update_keeps_the_legacy_modes_the_session_opened_with() {
+        let adapter = Acp::new(agents());
+        let session = json!({"sessionId":"s",
+            "modes":{"currentModeId":"code","availableModes":[{"id":"code","name":"Code"},{"id":"architect","name":"Architect"}]},
+            "configOptions":[{"id":"effort","name":"Effort","category":"thought_level","type":"select","currentValue":"low","options":[{"value":"low","name":"Low"},{"value":"high","name":"High"}]}]});
+        let (mut state, _) = opened(&adapter, &turn("first"), session);
+        feed(
+            &adapter,
+            &mut state,
+            json!({"jsonrpc":"2.0","id":ID_PROMPT,"result":{"stopReason":"end_turn"}}),
+        );
+        // The update lists the native options only, as agents send it.
+        adapter.observe_idle_frame(
+            &json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s",
+                "update":{"sessionUpdate":"config_option_update","configOptions":[
+                    {"id":"effort","name":"Effort","category":"thought_level","type":"select","currentValue":"high",
+                     "options":[{"value":"low","name":"Low"},{"value":"high","name":"High"}]}]}}})
+            .to_string(),
+            &mut state,
+        );
+        let snapshot = load(&state).session_config;
+        assert_eq!(snapshot["configOptions"][0]["currentValue"], "high");
+        assert_eq!(snapshot["modes"]["currentModeId"], "code");
+
+        // The next turn can still select the custom mode the session offers.
+        let mut request = turn("second");
+        request.session_id = Some("s".into());
+        request.permission_mode = PermissionMode::Custom("architect".into());
+        let mut next = started(&adapter, &request);
+        adapter.inherit_retained_handoff(state, &mut next);
+        let first: Value = serde_json::from_slice(
+            &adapter
+                .retained_turn_start(&next)
+                .expect("the custom mode is still advertised")
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(first["method"], "session/set_mode");
+        assert_eq!(first["params"]["modeId"], "architect");
     }
 
     #[test]
