@@ -1397,6 +1397,28 @@ impl<R: tokio::io::AsyncBufRead + Unpin> tokio::io::AsyncBufRead for ArrivalRead
     }
 }
 
+/// The harness options that decide whether a retained process is reused, left
+/// without those the process applies in place: a Claude process switches Fast
+/// mode and permission mode live, and an ACP session applies a changed `config`
+/// through `configure_session` when the next turn takes it over. Keeping them
+/// would replace (or refuse to replace, with background work) a process that
+/// could have taken the change.
+fn retained_fingerprint_options(
+    provider: Provider,
+    options: &std::collections::BTreeMap<String, String>,
+    claude_live: bool,
+) -> std::collections::BTreeMap<String, String> {
+    let mut options = options.clone();
+    if claude_live {
+        options.remove("permission_mode");
+        options.remove("fast_mode");
+    }
+    if provider == Provider::Acp {
+        options.remove("config");
+    }
+    options
+}
+
 /// The inactivity deadline for a frame whose bytes are still arriving: the
 /// last arrival plus `inactivity`, bounded by [`FRAME_ARRIVAL_LIMIT`] from the
 /// start of the read. `None` when arrivals do not move `current` later.
@@ -4959,14 +4981,11 @@ impl AgentRuntime {
             } else {
                 request.permission_mode.clone()
             },
-            harness_options: {
-                let mut options = request.harness_options.clone();
-                if claude_live.is_some() {
-                    options.remove("permission_mode");
-                    options.remove("fast_mode");
-                }
-                options
-            },
+            harness_options: retained_fingerprint_options(
+                provider,
+                &request.harness_options,
+                claude_live.is_some(),
+            ),
             launch_context: request.launch_context.clone(),
             auto_compaction: request.auto_compaction,
             required_sandbox_capabilities: request.required_sandbox_capabilities,
@@ -8224,6 +8243,35 @@ mod tests {
         )
         .await
         .is_err());
+    }
+
+    #[test]
+    fn live_switchable_options_do_not_decide_on_a_new_retained_process() {
+        let mut options = std::collections::BTreeMap::new();
+        for (key, value) in [
+            ("agent", "gemini"),
+            ("config", r#"{"effort":"high"}"#),
+            ("permission_mode", "plan"),
+            ("fast_mode", "on"),
+        ] {
+            options.insert(key.to_string(), value.to_string());
+        }
+        // ACP applies a changed `config` in place; its agent still decides.
+        let acp = retained_fingerprint_options(Provider::Acp, &options, false);
+        assert!(!acp.contains_key("config"));
+        assert_eq!(acp.get("agent").map(String::as_str), Some("gemini"));
+        assert!(acp.contains_key("permission_mode"));
+
+        // Claude leaves out only what it switches live, and keeps `config`.
+        let claude = retained_fingerprint_options(Provider::Claude, &options, true);
+        assert!(!claude.contains_key("permission_mode") && !claude.contains_key("fast_mode"));
+        assert!(claude.contains_key("config") && claude.contains_key("agent"));
+
+        // Other providers are compared as given.
+        assert_eq!(
+            retained_fingerprint_options(Provider::Codex, &options, false),
+            options
+        );
     }
 
     #[tokio::test(start_paused = true)]

@@ -423,6 +423,33 @@ async fn probing_reports_capabilities_and_sign_in_state() {
 }
 
 #[tokio::test]
+async fn probe_progress_reports_only_stages_that_run() {
+    let fixture = Fixture::new();
+    for (check_session, opens_session) in [(false, false), (true, true)] {
+        let stages = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen = Arc::clone(&stages);
+        Acp::probe_agent_with_progress(
+            &fixture.agent("ok"),
+            &fixture.workspace,
+            check_session,
+            Duration::from_secs(10),
+            move |stage| seen.lock().unwrap().push(stage.to_string()),
+        )
+        .await
+        .unwrap();
+        let stages = stages.lock().unwrap();
+        assert!(!stages.is_empty(), "the first stage is always reported");
+        assert_eq!(
+            stages
+                .iter()
+                .any(|stage| stage.starts_with("Opening a session")),
+            opens_session,
+            "check_session={check_session}: {stages:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn probing_a_missing_or_silent_command_says_what_is_wrong() {
     let fixture = Fixture::new();
     let missing = AcpAgent::new("missing", "Missing", "temps-acp-not-installed", ["--acp"]);

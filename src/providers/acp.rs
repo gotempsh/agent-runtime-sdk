@@ -65,6 +65,8 @@ const PROMPT_KEY: &str = "acp_prompt";
 
 const ID_INITIALIZE: u64 = 1;
 const ID_SESSION: u64 = 2;
+/// Most session settings one turn may select; request ids `100..=131` carry them.
+const MAX_REQUESTED_CONFIG: usize = 32;
 const ID_SET_MODE: u64 = 3;
 const ID_SET_MODEL: u64 = 4;
 const ID_PROMPT: u64 = 5;
@@ -90,7 +92,6 @@ const STDERR_DRAIN: Duration = Duration::from_secs(2);
 pub struct AcpAgent {
     /// Stable identifier selected through [`AGENT_OPTION`]: lowercase ASCII
     /// letters, digits, `.`, `_` and `-`.
-    /// Opaque config id.
     pub id: String,
     /// Human-readable name used in diagnostics.
     pub label: String,
@@ -410,10 +411,10 @@ impl Acp {
             }
             let result = initialized.get("result").cloned().unwrap_or(Value::Null);
             let mut probe = AcpAgentProbe::from_initialize(&result);
-            progress("Opening a session and discovering models and settings");
             if !check_session {
                 return Ok(probe);
             }
+            progress("Opening a session and discovering models and settings");
             let session = send(request(
                 ID_SESSION,
                 "session/new",
@@ -707,13 +708,10 @@ impl AcpAgentProbe {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AcpAuthMethod {
     /// Protocol identifier.
-    /// Opaque config id.
     pub id: String,
     /// Human-readable name.
-    /// Human-readable label.
     pub name: String,
     /// Optional description.
-    /// Agent-provided explanation.
     pub description: Option<String>,
 }
 
@@ -741,7 +739,6 @@ pub enum AcpAuthentication {
 #[error("{message}")]
 pub struct AcpProbeError {
     /// Stable category.
-    /// ACP control type; this client advertises select support.
     pub kind: AcpProbeErrorKind,
     /// Bounded diagnostic.
     pub message: String,
@@ -1240,19 +1237,28 @@ impl AgentAdapter for Acp {
             .map(str::trim)
             .filter(|model| !model.is_empty() && *model != "default")
             .map(str::to_owned);
+        let requested_config: BTreeMap<String, String> = request
+            .harness_options
+            .get("config")
+            .map(|value| serde_json::from_str(value))
+            .transpose()
+            .map_err(|_| {
+                invalid(
+                    "harness_options.config",
+                    "expected an object of ACP config ids and string values",
+                )
+            })?
+            .unwrap_or_default();
+        // Rejected here, before the process starts, rather than after a session
+        // is open; `configure_session` keeps the same bound for other callers.
+        if requested_config.len() > MAX_REQUESTED_CONFIG {
+            return Err(invalid(
+                "harness_options.config",
+                format!("at most {MAX_REQUESTED_CONFIG} ACP settings may be selected"),
+            ));
+        }
         let turn = TurnState {
-            requested_config: request
-                .harness_options
-                .get("config")
-                .map(|value| serde_json::from_str(value))
-                .transpose()
-                .map_err(|_| {
-                    invalid(
-                        "harness_options.config",
-                        "expected an object of ACP config ids and string values",
-                    )
-                })?
-                .unwrap_or_default(),
+            requested_config,
             agent_label: agent.label.clone(),
             agent_id: agent.id.clone(),
             working_directory: request.working_directory.clone(),
@@ -1731,7 +1737,7 @@ fn response(
         }
         ID_SET_MODE | ID_SET_MODEL | 100..=131 => {
             if let Some(error) = error {
-                let what = if id == ID_SET_MODE { "mode" } else { "model" };
+                let what = refused_setting_label(id, turn.inflight_config.as_ref());
                 fail(
                     state,
                     output,
@@ -1835,6 +1841,25 @@ fn response(
     Ok(())
 }
 
+/// What a refused configuration request was changing, for the error text: the
+/// mode or model by request id, otherwise the setting named in the request
+/// still in flight.
+fn refused_setting_label(id: u64, inflight: Option<&Value>) -> String {
+    match id {
+        ID_SET_MODE => return "mode".into(),
+        ID_SET_MODEL => return "model".into(),
+        _ => {}
+    }
+    let params = inflight.map(|frame| &frame["params"]);
+    match params {
+        Some(p) if p.get("configId").is_some() => {
+            format!("setting `{}`", p["configId"].as_str().unwrap_or("?"))
+        }
+        Some(p) if p.get("modeId").is_some() => "mode".into(),
+        _ => "setting".into(),
+    }
+}
+
 /// Queue mode and model selection for a freshly opened session.
 fn configure_session(
     session: &str,
@@ -1842,8 +1867,10 @@ fn configure_session(
     state: &mut AdapterState,
     turn: &mut TurnState,
 ) -> std::result::Result<(), String> {
-    if turn.requested_config.len() > 32 {
-        return Err("At most 32 ACP settings may be selected".into());
+    if turn.requested_config.len() > MAX_REQUESTED_CONFIG {
+        return Err(format!(
+            "At most {MAX_REQUESTED_CONFIG} ACP settings may be selected"
+        ));
     }
     let discovered = session_config_options(result);
     for (index, (id, value)) in turn.requested_config.clone().into_iter().enumerate() {
@@ -2985,6 +3012,82 @@ mod tests {
         );
         assert_eq!(written(&out)[0]["method"], "session/prompt");
         assert_eq!(state.result.model.as_deref(), Some("pro"));
+    }
+
+    #[test]
+    fn a_refused_setting_is_named_not_reported_as_the_model() {
+        let adapter = Acp::new(agents());
+        let mut request = turn("hi");
+        request
+            .harness_options
+            .insert("config".into(), r#"{"effort":"high"}"#.into());
+        let session = json!({"sessionId": "s", "configOptions": [
+            {"id": "effort", "name": "Effort", "category": "thought_level", "type": "select", "currentValue": "low",
+                "options": [{"value": "low", "name": "Low"}, {"value": "high", "name": "High"}]}]});
+        let (mut state, out) = opened(&adapter, &request, session);
+        let frame = &written(&out)[0];
+        assert_eq!(frame["method"], "session/set_config_option");
+        let id = frame["id"].as_u64().unwrap();
+        assert!((100..=131).contains(&id));
+        let out = feed(
+            &adapter,
+            &mut state,
+            json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32000, "message": "not now"}}),
+        );
+        assert!(out.terminal);
+        let failure = state.terminal_failure.as_ref().unwrap();
+        assert!(
+            failure
+                .diagnostic
+                .contains("refused the requested setting `effort`"),
+            "{}",
+            failure.diagnostic
+        );
+        assert!(!failure.diagnostic.contains("requested model"));
+    }
+
+    #[test]
+    fn refused_setting_labels_follow_the_request() {
+        let config =
+            json!({"method": "session/set_config_option", "params": {"configId": "effort"}});
+        let mode = json!({"method": "session/set_mode", "params": {"modeId": "plan"}});
+        assert_eq!(refused_setting_label(ID_SET_MODE, None), "mode");
+        assert_eq!(refused_setting_label(ID_SET_MODEL, Some(&config)), "model");
+        assert_eq!(
+            refused_setting_label(100, Some(&config)),
+            "setting `effort`"
+        );
+        assert_eq!(refused_setting_label(101, Some(&mode)), "mode");
+        assert_eq!(refused_setting_label(102, None), "setting");
+    }
+
+    #[test]
+    fn too_many_settings_are_rejected_before_the_process_starts() {
+        let adapter = Acp::new(agents());
+        let mut request = turn("hi");
+        let config: BTreeMap<String, String> = (0..=MAX_REQUESTED_CONFIG)
+            .map(|index| (format!("setting-{index}"), "on".to_string()))
+            .collect();
+        request
+            .harness_options
+            .insert("config".into(), serde_json::to_string(&config).unwrap());
+        let error = adapter
+            .prepare_turn(&request, &mut AdapterState::default())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("at most 32 ACP settings"), "{error}");
+
+        // The limit itself is allowed.
+        let mut allowed = turn("hi");
+        let config: BTreeMap<String, String> = (0..MAX_REQUESTED_CONFIG)
+            .map(|index| (format!("setting-{index}"), "on".to_string()))
+            .collect();
+        allowed
+            .harness_options
+            .insert("config".into(), serde_json::to_string(&config).unwrap());
+        adapter
+            .prepare_turn(&allowed, &mut AdapterState::default())
+            .unwrap();
     }
 
     #[test]
