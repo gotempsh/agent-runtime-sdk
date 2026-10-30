@@ -64,6 +64,8 @@ while IFS= read -r line; do
     *'"method":"session/new"'*)
       if [ "$MOCK_ACP_MODE" = auth ]; then
         say '{"jsonrpc":"2.0","id":2,"error":{"code":-32000,"message":"Authentication required"}}'
+      elif [ "$MOCK_ACP_MODE" = config ]; then
+        say '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"mock-session","configOptions":[{"id":"mode","name":"Mode","category":"mode","type":"select","currentValue":"agent","options":[{"value":"agent","name":"Agent"},{"value":"ask","name":"Ask"}]}]}}'
       else
         echo 'Loaded cached credentials.'
         say '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"mock-session"}}'
@@ -71,6 +73,8 @@ while IFS= read -r line; do
     *'"method":"session/load"'*)
       update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"replayed"}}'
       say '{"jsonrpc":"2.0","id":2,"result":null}' ;;
+    *'"method":"session/set_config_option"'*)
+      say '{"jsonrpc":"2.0","id":100,"result":{}}' ;;
     *'"method":"session/prompt"'*)
       update '{"sessionUpdate":"plan","entries":[{"content":"Run the tests","priority":"high","status":"in_progress"}]}'
       update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Running tests."}}'
@@ -310,7 +314,7 @@ async fn resuming_loads_the_session_without_replaying_it() {
         .unwrap();
     assert_eq!(result.text, "Running tests. All green.");
     assert_eq!(fixture.methods()[1], "session/load");
-    assert!(!events
+    assert!(events
         .events()
         .iter()
         .any(|event| matches!(event, TurnEvent::SessionStarted { .. })));
@@ -416,6 +420,33 @@ async fn probing_reports_capabilities_and_sign_in_state() {
         probe.authentication,
         AcpAuthentication::Required { .. }
     ));
+}
+
+#[tokio::test]
+async fn probe_progress_reports_only_stages_that_run() {
+    let fixture = Fixture::new();
+    for (check_session, opens_session) in [(false, false), (true, true)] {
+        let stages = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen = Arc::clone(&stages);
+        Acp::probe_agent_with_progress(
+            &fixture.agent("ok"),
+            &fixture.workspace,
+            check_session,
+            Duration::from_secs(10),
+            move |stage| seen.lock().unwrap().push(stage.to_string()),
+        )
+        .await
+        .unwrap();
+        let stages = stages.lock().unwrap();
+        assert!(!stages.is_empty(), "the first stage is always reported");
+        assert_eq!(
+            stages
+                .iter()
+                .any(|stage| stage.starts_with("Opening a session")),
+            opens_session,
+            "check_session={check_session}: {stages:?}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -684,4 +715,87 @@ async fn a_failed_turn_stops_reading_stderr() {
         let _ = std::process::Command::new("kill").arg(pid.trim()).status();
     }
     assert!(!wrote, "a failed turn left its stderr reader running");
+}
+
+#[tokio::test]
+async fn retained_acp_turns_use_one_process_and_one_session() {
+    use temps_agent_runtime::lifecycle::{InvocationId, RuntimeId};
+    use temps_agent_runtime::retained::{
+        InProcessRuntimeClient, RuntimeClient, RuntimeSpec, TurnInput,
+    };
+    use temps_agent_runtime::ProviderProcessRetention;
+    let fixture = Fixture::new();
+    let agents = AcpAgents::new();
+    agents.insert(fixture.agent("ok")).unwrap();
+    let mut builder =
+        AgentRuntime::builder().provider_process_retention(ProviderProcessRetention {
+            max_processes: 1,
+            idle_timeout: Duration::from_secs(30),
+            initialization_timeout: Duration::from_secs(10),
+            active_inactivity_timeout: Some(Duration::from_secs(10)),
+            held_task_quiet_timeout: None,
+        });
+    builder.register(Acp::new(agents));
+    let client = InProcessRuntimeClient::new(builder.build().unwrap());
+    let mut spec = RuntimeSpec::new(
+        RuntimeId::new("acp-reuse").unwrap(),
+        Provider::Acp,
+        &fixture.workspace,
+    );
+    spec.permission_mode = PermissionMode::FullAccess;
+    spec.harness_options
+        .insert(AGENT_OPTION.into(), "mock".into());
+    let handle = client.acquire(spec).await.unwrap();
+    for id in ["first", "second"] {
+        let input = TurnInput::new(InvocationId::new(id).unwrap(), "test");
+        let turn = handle.start_turn(input).await.unwrap();
+        let result = turn.wait().await.unwrap();
+        assert!(result.text.contains("All green"), "{result:?}");
+    }
+    let methods = fixture.methods();
+    assert_eq!(methods.iter().filter(|m| *m == "initialize").count(), 1);
+    assert_eq!(methods.iter().filter(|m| *m == "session/new").count(), 1);
+    assert_eq!(methods.iter().filter(|m| *m == "session/load").count(), 0);
+    assert_eq!(methods.iter().filter(|m| *m == "session/prompt").count(), 2);
+    client
+        .dispose(&RuntimeId::new("acp-reuse").unwrap())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn session_config_is_accepted_by_runtime_then_validated_before_prompting() {
+    let fixture = Fixture::new();
+    let runtime = fixture.runtime("config");
+    let mut request = fixture.request("configure");
+    request.permission_mode = PermissionMode::FullAccess;
+    request
+        .harness_options
+        .insert("config".into(), r#"{"mode":"ask"}"#.into());
+    let result = runtime
+        .run(request, &Collector::default(), None)
+        .await
+        .unwrap();
+    assert!(result.text.contains("All green"));
+    let methods = fixture.methods();
+    assert!(
+        methods
+            .iter()
+            .position(|m| m == "session/set_config_option")
+            .unwrap()
+            < methods.iter().position(|m| m == "session/prompt").unwrap()
+    );
+    let before = methods.iter().filter(|m| *m == "session/prompt").count();
+    let mut bad = fixture.request("invalid");
+    bad.harness_options
+        .insert("config".into(), r#"{"mode":"invented"}"#.into());
+    assert!(runtime.run(bad, &Collector::default(), None).await.is_err());
+    assert_eq!(
+        fixture
+            .methods()
+            .iter()
+            .filter(|m| *m == "session/prompt")
+            .count(),
+        before
+    );
 }

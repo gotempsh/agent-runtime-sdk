@@ -65,6 +65,8 @@ const PROMPT_KEY: &str = "acp_prompt";
 
 const ID_INITIALIZE: u64 = 1;
 const ID_SESSION: u64 = 2;
+/// Most session settings one turn may select; request ids `100..=131` carry them.
+const MAX_REQUESTED_CONFIG: usize = 32;
 const ID_SET_MODE: u64 = 3;
 const ID_SET_MODEL: u64 = 4;
 const ID_PROMPT: u64 = 5;
@@ -337,8 +339,21 @@ impl Acp {
         check_session: bool,
         timeout: Duration,
     ) -> std::result::Result<AcpAgentProbe, AcpProbeError> {
+        Self::probe_agent_with_progress(agent, working_directory, check_session, timeout, |_| {})
+            .await
+    }
+
+    /// The same bounded probe, reporting concrete setup stages without prompting a model.
+    pub async fn probe_agent_with_progress(
+        agent: &AcpAgent,
+        working_directory: &Path,
+        check_session: bool,
+        timeout: Duration,
+        progress: impl Fn(&'static str) + Send + Sync,
+    ) -> std::result::Result<AcpAgentProbe, AcpProbeError> {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
+        progress("Starting the agent and negotiating ACP capabilities");
         agent
             .validate()
             .map_err(|error| AcpProbeError::new(AcpProbeErrorKind::Invalid, error.to_string()))?;
@@ -399,6 +414,7 @@ impl Acp {
             if !check_session {
                 return Ok(probe);
             }
+            progress("Opening a session and discovering models and settings");
             let session = send(request(
                 ID_SESSION,
                 "session/new",
@@ -407,6 +423,8 @@ impl Acp {
             writer.write_all(&session).await.map_err(io_probe_error)?;
             writer.flush().await.map_err(io_probe_error)?;
             let opened = read_response(&mut lines, ID_SESSION).await?;
+            probe.config_options =
+                session_config_options(opened.get("result").unwrap_or(&Value::Null));
             probe.authentication = match opened.get("error") {
                 None => AcpAuthentication::Authenticated,
                 Some(error) if error_code(error) == Some(AUTH_REQUIRED_CODE) => {
@@ -480,6 +498,160 @@ where
     ))
 }
 
+/// A selectable value advertised by an ACP agent. IDs are opaque.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcpConfigValue {
+    /// Opaque wire value.
+    pub value: String,
+    /// Human-readable label.
+    pub name: String,
+    /// Agent-provided explanation.
+    pub description: Option<String>,
+}
+
+/// ACP v1 select configuration, normalized from configOptions or legacy fields.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcpConfigOption {
+    /// Opaque config id.
+    pub id: String,
+    /// Human-readable label.
+    pub name: String,
+    /// Agent-provided explanation.
+    pub description: Option<String>,
+    /// Optional semantic category, such as model or mode.
+    pub category: Option<String>,
+    #[serde(rename = "type")]
+    /// ACP control type; this client advertises select support.
+    pub kind: String,
+    /// Current agent-selected value.
+    pub current_value: String,
+    /// Choices advertised by the agent, flattened from groups.
+    pub options: Vec<AcpConfigValue>,
+}
+
+/// Keep only protocol configuration, never arbitrary metadata or MCP credentials.
+pub fn session_config_options(result: &Value) -> Vec<AcpConfigOption> {
+    fn text(value: &Value, key: &str, max: usize) -> Option<String> {
+        value
+            .get(key)?
+            .as_str()
+            .filter(|s| !s.is_empty() && s.len() <= max)
+            .map(str::to_owned)
+    }
+    fn values(entries: &[Value], out: &mut Vec<AcpConfigValue>, depth: usize) {
+        if depth > 2 {
+            return;
+        }
+        for entry in entries.iter().take(256) {
+            if out.len() >= 256 {
+                break;
+            }
+            if let (Some(value), Some(name)) =
+                (text(entry, "value", 2048), text(entry, "name", 200))
+            {
+                if !out.iter().any(|v| v.value == value) {
+                    out.push(AcpConfigValue {
+                        value,
+                        name,
+                        description: text(entry, "description", 1000),
+                    });
+                }
+            } else if let Some(nested) = entry.get("options").and_then(Value::as_array) {
+                values(nested, out, depth + 1);
+            }
+        }
+    }
+    let mut options = Vec::new();
+    for option in result
+        .get("configOptions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .take(32)
+    {
+        if option.get("type").and_then(Value::as_str) != Some("select") {
+            continue;
+        }
+        let (Some(id), Some(name), Some(current_value)) = (
+            text(option, "id", 256),
+            text(option, "name", 200),
+            text(option, "currentValue", 2048),
+        ) else {
+            continue;
+        };
+        if options.iter().any(|o: &AcpConfigOption| o.id == id) {
+            continue;
+        }
+        let mut choices = Vec::new();
+        values(
+            option
+                .get("options")
+                .and_then(Value::as_array)
+                .map(Vec::as_slice)
+                .unwrap_or_default(),
+            &mut choices,
+            0,
+        );
+        options.push(AcpConfigOption {
+            id,
+            name,
+            current_value,
+            kind: "select".into(),
+            description: text(option, "description", 1000),
+            category: text(option, "category", 64),
+            options: choices,
+        });
+    }
+    for (category, field, list, current, value_key) in [
+        (
+            "model",
+            "models",
+            "availableModels",
+            "currentModelId",
+            "modelId",
+        ),
+        ("mode", "modes", "availableModes", "currentModeId", "id"),
+    ] {
+        if options
+            .iter()
+            .any(|o| o.category.as_deref() == Some(category) || o.id == category)
+        {
+            continue;
+        }
+        let Some(legacy) = result.get(field) else {
+            continue;
+        };
+        let Some(current_value) = text(legacy, current, 2048) else {
+            continue;
+        };
+        let choices = legacy
+            .get(list)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .take(256)
+            .filter_map(|v| {
+                Some(AcpConfigValue {
+                    value: text(v, value_key, 2048)?,
+                    name: text(v, "name", 200)?,
+                    description: text(v, "description", 1000),
+                })
+            })
+            .collect();
+        options.push(AcpConfigOption {
+            id: category.into(),
+            name: if category == "model" { "Model" } else { "Mode" }.into(),
+            current_value,
+            kind: "select".into(),
+            category: Some(category.into()),
+            description: None,
+            options: choices,
+        });
+    }
+    options
+}
+
 /// What a local ACP handshake reported about one agent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AcpAgentProbe {
@@ -497,6 +669,9 @@ pub struct AcpAgentProbe {
     pub resume_session: bool,
     /// Whether a session could be opened without signing in.
     pub authentication: AcpAuthentication,
+    /// Bounded, non-secret selectors reported by session setup.
+    #[serde(default)]
+    pub config_options: Vec<AcpConfigOption>,
 }
 
 impl AcpAgentProbe {
@@ -521,6 +696,7 @@ impl AcpAgentProbe {
             resume_session: capabilities
                 .and_then(|caps| caps.pointer("/sessionCapabilities/resume"))
                 .is_some_and(|resume| !resume.is_null()),
+            config_options: Vec::new(),
             authentication: AcpAuthentication::Unknown {
                 message: "a session was not opened".into(),
             },
@@ -599,6 +775,7 @@ pub enum AcpProbeErrorKind {
 #[serde(default)]
 struct TurnState {
     agent_label: String,
+    agent_id: String,
     working_directory: PathBuf,
     /// Session the caller asked to continue.
     resume: Option<String>,
@@ -615,6 +792,11 @@ struct TurnState {
     requested_mode: Option<String>,
     /// Model requested for this turn.
     requested_model: Option<String>,
+    requested_config: BTreeMap<String, String>,
+    session_config: Value,
+    retained_start: Vec<u8>,
+    retained_error: Option<String>,
+    inflight_config: Option<Value>,
     permission: Policy,
     /// Requests still to send after the session opens, in order.
     pending: Vec<(u64, Value)>,
@@ -854,6 +1036,104 @@ impl AgentAdapter for Acp {
         Provider::Acp
     }
 
+    fn supports_retained_process(&self) -> bool {
+        true
+    }
+
+    fn retained_turn_start(&self, state: &AdapterState) -> Result<Option<Vec<u8>>> {
+        let turn = load(state);
+        if let Some(error) = turn.retained_error {
+            return Err(protocol(&error));
+        }
+        if turn.retained_start.is_empty() {
+            return Err(protocol(
+                "the retained ACP session configuration is unavailable; restart the session",
+            ));
+        }
+        Ok(Some(turn.retained_start))
+    }
+
+    fn inherit_retained_handoff(&self, previous: AdapterState, state: &mut AdapterState) {
+        let prior = load(&previous);
+        let mut turn = load(state);
+        if turn.agent_id != prior.agent_id
+            || turn.working_directory != prior.working_directory
+            || turn.resume != prior.session_id
+        {
+            turn.retained_error = Some(
+                "The retained ACP connection belongs to a different agent, directory or session"
+                    .into(),
+            );
+            store(state, &turn);
+            return;
+        }
+        if let Some(session) = turn.resume.clone() {
+            turn.session_id = Some(session.clone());
+            turn.session_config = prior.session_config.clone();
+            turn.supports_images = prior.supports_images;
+            let mut output = AdapterOutput::default();
+            match configure_session(&session, &prior.session_config, state, &mut turn) {
+                Ok(()) => match advance(state, &mut turn, &mut output) {
+                    Ok(()) => turn.retained_start = output.writes.into_iter().flatten().collect(),
+                    Err(error) => turn.retained_error = Some(error.to_string()),
+                },
+                Err(error) => turn.retained_error = Some(error),
+            }
+        }
+        store(state, &turn);
+    }
+
+    fn classify_idle_frame(&self, line: &str) -> crate::adapter::IdleFrame {
+        // JSON-RPC notifications, including unknown extension notifications,
+        // are legal between prompts and must not retire a healthy connection.
+        match serde_json::from_str::<Value>(line) {
+            Ok(value) if value.get("method").and_then(Value::as_str).is_some() => {
+                crate::adapter::IdleFrame::Background
+            }
+            _ => crate::adapter::IdleFrame::Unexpected,
+        }
+    }
+
+    fn observe_idle_frame(&self, line: &str, inherited: &mut AdapterState) {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            return;
+        };
+        let is_notification = matches!(value.get("id"), None | Some(Value::Null));
+        if !is_notification || value.get("method").and_then(Value::as_str) != Some("session/update")
+        {
+            return;
+        }
+        let mut turn = load(inherited);
+        let params = &value["params"];
+        if let (Some(ours), Some(theirs)) = (
+            turn.session_id.as_deref(),
+            params.get("sessionId").and_then(Value::as_str),
+        ) {
+            if ours != theirs {
+                return;
+            }
+        }
+        if apply_setting_update(&params["update"], &mut turn) {
+            store(inherited, &turn);
+        }
+    }
+
+    fn idle_frame_writes(&self, line: &str) -> Vec<Vec<u8>> {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            return Vec::new();
+        };
+        let Some(id) = value.get("id").filter(|id| !id.is_null()) else {
+            return Vec::new();
+        };
+        let frame =
+            if value.get("method").and_then(Value::as_str) == Some("session/request_permission") {
+                reply(id, json!({"outcome":{"outcome":"cancelled"}}))
+            } else {
+                reply_error(id, -32601, "No active turn can answer this request")
+            };
+        encode(&frame).into_iter().collect()
+    }
+
     fn executable(&self) -> PathBuf {
         // Agents are chosen per turn; there is no single provider executable.
         PathBuf::from("acp")
@@ -981,8 +1261,30 @@ impl AgentAdapter for Acp {
             .map(str::trim)
             .filter(|model| !model.is_empty() && *model != "default")
             .map(str::to_owned);
+        let requested_config: BTreeMap<String, String> = request
+            .harness_options
+            .get("config")
+            .map(|value| serde_json::from_str(value))
+            .transpose()
+            .map_err(|_| {
+                invalid(
+                    "harness_options.config",
+                    "expected an object of ACP config ids and string values",
+                )
+            })?
+            .unwrap_or_default();
+        // Rejected here, before the process starts, rather than after a session
+        // is open; `configure_session` keeps the same bound for other callers.
+        if requested_config.len() > MAX_REQUESTED_CONFIG {
+            return Err(invalid(
+                "harness_options.config",
+                format!("at most {MAX_REQUESTED_CONFIG} ACP settings may be selected"),
+            ));
+        }
         let turn = TurnState {
+            requested_config,
             agent_label: agent.label.clone(),
+            agent_id: agent.id.clone(),
             working_directory: request.working_directory.clone(),
             resume: request
                 .session_id
@@ -1168,6 +1470,26 @@ fn option_for(options: &[Value], kinds: &[&str]) -> Option<String> {
     })
 }
 
+fn canonical_tool_name(name: &str, input: Option<&Value>) -> String {
+    if let Some(input) = input.filter(|_| name == "MCP: tool") {
+        if let (Some(server), Some(tool)) = (
+            input.get("providerIdentifier").and_then(Value::as_str),
+            input.get("toolName").and_then(Value::as_str),
+        ) {
+            let valid = |s: &str| {
+                !s.is_empty()
+                    && s.len() <= 128
+                    && s.bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+            };
+            if valid(server) && !server.contains("__") && valid(tool) {
+                return format!("mcp__{server}__{tool}");
+            }
+        }
+    }
+    bounded(name, MAX_TITLE_CHARS)
+}
+
 /// Answer a request the agent sent to the client.
 fn agent_request(
     method: &str,
@@ -1221,6 +1543,10 @@ fn agent_request(
         .filter(|input| !input.is_null())
         .cloned()
         .or_else(|| tracked.and_then(|tool| tool.input.clone()));
+    let title = canonical_tool_name(
+        tool.get("name").and_then(Value::as_str).unwrap_or(&title),
+        input.as_ref(),
+    );
     let description = permission_action(kind, tool, input.as_ref());
     if turn.open_permissions.len() < MAX_OPEN_PERMISSIONS {
         turn.open_permissions
@@ -1253,6 +1579,11 @@ fn response(
     let result = value.get("result").unwrap_or(&Value::Null);
     match id {
         ID_INITIALIZE => {
+            // Cold process: discard preparation intended for a retained connection.
+            turn.prompt_sent = false;
+            turn.pending.clear();
+            turn.session_id = None;
+            turn.retained_error = None;
             if let Some(error) = error {
                 fail(
                     state,
@@ -1344,6 +1675,10 @@ fn response(
                     json!({"cwd": cwd, "mcpServers": servers}),
                 ),
             };
+            output.events.push(TurnEvent::ProviderProcessStatus {
+                status: crate::ProviderProcessStatus::Checking,
+                message: format!("Opening {}'s ACP session", turn.agent_label),
+            });
             output.writes.push(encode(&open)?);
         }
         ID_SESSION => {
@@ -1402,7 +1737,9 @@ fn response(
                 },
             };
             state.result.session_id = Some(session.clone());
-            if turn.resume.as_deref() != Some(session.as_str()) {
+            turn.session_config = session_snapshot(result);
+            turn.session_config["_supportsImages"] = json!(turn.supports_images);
+            {
                 output.events.push(TurnEvent::SessionStarted {
                     session_id: session.clone(),
                     title: None,
@@ -1422,9 +1759,9 @@ fn response(
             }
             advance(state, turn, output)?;
         }
-        ID_SET_MODE | ID_SET_MODEL => {
+        ID_SET_MODE | ID_SET_MODEL | 100..=131 => {
             if let Some(error) = error {
-                let what = if id == ID_SET_MODE { "mode" } else { "model" };
+                let what = refused_setting_label(id, turn.inflight_config.as_ref());
                 fail(
                     state,
                     output,
@@ -1443,10 +1780,35 @@ fn response(
                 );
                 return Ok(());
             }
+            if result.get("configOptions").is_some() {
+                turn.session_config = session_snapshot(result);
+                turn.session_config["_supportsImages"] = json!(turn.supports_images);
+            } else if let Some(frame) = turn.inflight_config.take() {
+                let params = &frame["params"];
+                if let Some(id) = params.get("configId").and_then(Value::as_str) {
+                    if let Some(options) = turn.session_config["configOptions"].as_array_mut() {
+                        if let Some(option) = options.iter_mut().find(|o| o["id"] == id) {
+                            option["currentValue"] = params["value"].clone();
+                        }
+                    }
+                } else if let Some(mode) = params.get("modeId") {
+                    turn.session_config["modes"]["currentModeId"] = mode.clone();
+                } else if let Some(model) = params.get("modelId") {
+                    turn.session_config["models"]["currentModelId"] = model.clone();
+                }
+            }
             advance(state, turn, output)?;
         }
         ID_PROMPT => {
             output.terminal = true;
+            // Only session metadata survives an idle process. Do not retain prompts,
+            // tools or the per-turn MCP credential values in carried parser state.
+            state.extensions.remove(PROMPT_KEY);
+            turn.tools.clear();
+            turn.open_permissions.clear();
+            turn.mcp_servers.clear();
+            turn.instructions = None;
+            turn.retained_start.clear();
             if let Some(error) = error {
                 let auth = error_code(error) == Some(AUTH_REQUIRED_CODE);
                 fail(
@@ -1503,6 +1865,25 @@ fn response(
     Ok(())
 }
 
+/// What a refused configuration request was changing, for the error text: the
+/// mode or model by request id, otherwise the setting named in the request
+/// still in flight.
+fn refused_setting_label(id: u64, inflight: Option<&Value>) -> String {
+    match id {
+        ID_SET_MODE => return "mode".into(),
+        ID_SET_MODEL => return "model".into(),
+        _ => {}
+    }
+    let params = inflight.map(|frame| &frame["params"]);
+    match params {
+        Some(p) if p.get("configId").is_some() => {
+            format!("setting `{}`", p["configId"].as_str().unwrap_or("?"))
+        }
+        Some(p) if p.get("modeId").is_some() => "mode".into(),
+        _ => "setting".into(),
+    }
+}
+
 /// Queue mode and model selection for a freshly opened session.
 fn configure_session(
     session: &str,
@@ -1510,6 +1891,57 @@ fn configure_session(
     state: &mut AdapterState,
     turn: &mut TurnState,
 ) -> std::result::Result<(), String> {
+    if turn.requested_config.len() > MAX_REQUESTED_CONFIG {
+        return Err(format!(
+            "At most {MAX_REQUESTED_CONFIG} ACP settings may be selected"
+        ));
+    }
+    let discovered = session_config_options(result);
+    for (index, (id, value)) in turn.requested_config.clone().into_iter().enumerate() {
+        let option = discovered
+            .iter()
+            .find(|o| o.id == id)
+            .ok_or_else(|| format!("{} does not advertise setting `{id}`", turn.agent_label))?;
+        if !option.options.iter().any(|v| v.value == value) {
+            return Err(format!(
+                "{} has no value `{value}` for {}",
+                turn.agent_label, option.name
+            ));
+        }
+        if option.current_value == value {
+            continue;
+        }
+        let native = result
+            .get("configOptions")
+            .and_then(Value::as_array)
+            .is_some_and(|opts| {
+                opts.iter()
+                    .any(|o| o.get("id").and_then(Value::as_str) == Some(&id))
+            });
+        let request_id = 100 + index as u64;
+        let frame = if native {
+            request(
+                request_id,
+                "session/set_config_option",
+                json!({"sessionId":session,"configId":id,"value":value}),
+            )
+        } else if option.category.as_deref() == Some("mode") {
+            request(
+                request_id,
+                "session/set_mode",
+                json!({"sessionId":session,"modeId":value}),
+            )
+        } else if option.category.as_deref() == Some("model") {
+            request(
+                request_id,
+                "session/set_model",
+                json!({"sessionId":session,"modelId":value}),
+            )
+        } else {
+            return Err(format!("{} cannot set `{id}`", turn.agent_label));
+        };
+        turn.pending.push((request_id, frame));
+    }
     if let Some(mode) = turn.requested_mode.clone() {
         let modes = result
             .pointer("/modes/availableModes")
@@ -1655,6 +2087,31 @@ fn select_values(option: &Value) -> Vec<String> {
     values
 }
 
+fn session_snapshot(result: &Value) -> Value {
+    let options = session_config_options(result);
+    let native_ids = result
+        .get("configOptions")
+        .and_then(Value::as_array)
+        .map(|v| {
+            v.iter()
+                .filter_map(|v| v.get("id").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let mut snapshot = json!({"configOptions": options.iter().filter(|o| native_ids.contains(&o.id.as_str())).collect::<Vec<_>>()});
+    for option in &options {
+        if native_ids.contains(&option.id.as_str()) {
+            continue;
+        }
+        if option.category.as_deref() == Some("model") {
+            snapshot["models"] = json!({"currentModelId": option.current_value, "availableModels": option.options.iter().map(|v| json!({"modelId":v.value,"name":v.name})).collect::<Vec<_>>()});
+        } else if option.category.as_deref() == Some("mode") {
+            snapshot["modes"] = json!({"currentModeId": option.current_value, "availableModes": option.options.iter().map(|v| json!({"id":v.value,"name":v.name})).collect::<Vec<_>>()});
+        }
+    }
+    snapshot
+}
+
 fn choices_error(agent: &str, model: &str, values: &[String]) -> String {
     format!(
         "{agent} has no model `{model}`; it offers {}",
@@ -1679,6 +2136,11 @@ fn advance(
 ) -> Result<()> {
     if !turn.pending.is_empty() {
         let (_, next) = turn.pending.remove(0);
+        output.events.push(TurnEvent::ProviderProcessStatus {
+            status: crate::ProviderProcessStatus::Checking,
+            message: format!("Applying {} settings", turn.agent_label),
+        });
+        turn.inflight_config = Some(next.clone());
         output.writes.push(encode(&next)?);
         return Ok(());
     }
@@ -1690,7 +2152,7 @@ fn advance(
     };
     let prompt = state
         .extensions
-        .remove(PROMPT_KEY)
+        .get(PROMPT_KEY)
         .and_then(|value| value.as_str().map(str::to_owned))
         .unwrap_or_default();
     let mut blocks = Vec::with_capacity(2);
@@ -1709,6 +2171,36 @@ fn advance(
     turn.prompt_sent = true;
     output.turn_submitted = true;
     Ok(())
+}
+
+/// Apply a session update that changes the agent's own settings to the
+/// snapshot later turns compare their requested settings against. Returns
+/// whether `update` was one.
+fn apply_setting_update(update: &Value, turn: &mut TurnState) -> bool {
+    match update.get("sessionUpdate").and_then(Value::as_str) {
+        Some("config_option_update") => {
+            // An update carries the native options only: the legacy `modes`
+            // and `models` the session opened with still hold until the agent
+            // replaces them, so a later custom mode or model stays selectable.
+            let mut snapshot = session_snapshot(update);
+            for key in ["modes", "models", "_supportsImages"] {
+                if snapshot.get(key).is_none() {
+                    if let Some(kept) = turn.session_config.get(key) {
+                        snapshot[key] = kept.clone();
+                    }
+                }
+            }
+            turn.session_config = snapshot;
+            true
+        }
+        Some("current_mode_update") => {
+            if let Some(mode) = update.get("currentModeId") {
+                turn.session_config["modes"]["currentModeId"] = mode.clone();
+            }
+            true
+        }
+        _ => false,
+    }
 }
 
 fn session_update(
@@ -1786,6 +2278,9 @@ fn session_update(
                 .unwrap_or_default();
             output.events.push(TurnEvent::PlanUpdated { entries });
         }
+        "config_option_update" | "current_mode_update" => {
+            apply_setting_update(update, turn);
+        }
         "usage_update" => {
             let used = update.get("used").and_then(Value::as_u64);
             let size = update.get("size").and_then(Value::as_u64);
@@ -1860,7 +2355,8 @@ fn tool_call(update: &Value, turn: &mut TurnState, output: &mut AdapterOutput, c
         // The first title names the tool for the rest of the turn; agents
         // often retitle a call with its argument (a file path) later.
         let title = update
-            .get("title")
+            .get("name")
+            .or_else(|| update.get("title"))
             .and_then(Value::as_str)
             .map(|title| bounded(title, MAX_TITLE_CHARS))
             .or_else(|| {
@@ -1875,7 +2371,7 @@ fn tool_call(update: &Value, turn: &mut TurnState, output: &mut AdapterOutput, c
         }
         turn.tools.push(TrackedTool {
             id: id.to_string(),
-            title,
+            title: canonical_tool_name(&title, reported_input.as_ref()),
             input: None,
             output: None,
         });
@@ -2042,6 +2538,215 @@ mod tests {
         json!({"jsonrpc": "2.0", "id": ID_INITIALIZE, "result": {
             "protocolVersion": 1, "agentCapabilities": capabilities, "authMethods": []
         }})
+    }
+
+    #[test]
+    fn idle_notifications_keep_the_connection_and_requests_are_answered_without_approval() {
+        let adapter = Acp::new(agents());
+        let notice = json!({"jsonrpc":"2.0","method":"vendor/activity","params":{}}).to_string();
+        assert_eq!(
+            adapter.classify_idle_frame(&notice),
+            crate::adapter::IdleFrame::Background
+        );
+        assert_eq!(adapter.idle_frame_writes(&notice), Vec::<Vec<u8>>::new());
+        let permission =
+            json!({"jsonrpc":"2.0","id":"p","method":"session/request_permission","params":{}})
+                .to_string();
+        let replies = adapter.idle_frame_writes(&permission);
+        let reply: Value = serde_json::from_slice(&replies[0]).unwrap();
+        assert_eq!(reply["result"]["outcome"]["outcome"], "cancelled");
+    }
+
+    #[test]
+    fn config_discovery_prefers_native_grouped_values_and_falls_back_to_legacy() {
+        let result = json!({"configOptions":[{"id":"choose-model","name":"Model","category":"model","type":"select","currentValue":"vendor/a","options":[{"group":"Vendor","options":[{"value":"vendor/a","name":"A"}]}]}],"models":{"currentModelId":"old","availableModels":[{"modelId":"old","name":"Old"}]},"modes":{"currentModeId":"ask","availableModes":[{"id":"ask","name":"Ask"}]}});
+        let options = session_config_options(&result);
+        assert_eq!(options.len(), 2);
+        assert_eq!(options[0].id, "choose-model");
+        assert_eq!(options[0].options[0].value, "vendor/a");
+        assert_eq!(options[1].category.as_deref(), Some("mode"));
+        assert_eq!(session_config_options(&json!({})), Vec::new());
+        assert_eq!(
+            session_config_options(&json!({"configOptions":[{"id":"bad","type":"unknown"}]})),
+            Vec::new()
+        );
+    }
+
+    #[test]
+    fn resumed_sessions_announce_ready_and_retained_turns_skip_handshake_and_load() {
+        let adapter = Acp::new(agents());
+        let (mut state, _) = opened(
+            &adapter,
+            &turn("first"),
+            json!({"sessionId":"s","configOptions":[{"id":"mode","name":"Mode","category":"mode","type":"select","currentValue":"agent","options":[{"value":"agent","name":"Agent"},{"value":"ask","name":"Ask"}]}]}),
+        );
+        feed(
+            &adapter,
+            &mut state,
+            json!({"jsonrpc":"2.0","id":ID_PROMPT,"result":{"stopReason":"end_turn"}}),
+        );
+        let mut request = turn("second");
+        request.session_id = Some("s".into());
+        request
+            .harness_options
+            .insert("config".into(), r#"{"mode":"ask"}"#.into());
+        let mut next = started(&adapter, &request);
+        adapter.inherit_retained_handoff(state, &mut next);
+        let bytes = adapter.retained_turn_start(&next).unwrap().unwrap();
+        let first: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(first["method"], "session/set_config_option");
+        assert_eq!(first["params"]["value"], "ask");
+        let out = feed(
+            &adapter,
+            &mut next,
+            json!({"jsonrpc":"2.0","id":100,"result":{}}),
+        );
+        assert_eq!(written(&out)[0]["method"], "session/prompt");
+        assert_eq!(written(&out)[0]["params"]["prompt"][0]["text"], "second");
+        // Cold fallback still opens the provider session and never loses the prompt.
+        let mut cold = started(&adapter, &request);
+        adapter.mark_retained_turn(&mut cold);
+        feed(
+            &adapter,
+            &mut cold,
+            initialized(json!({"loadSession":true})),
+        );
+        let out = feed(
+            &adapter,
+            &mut cold,
+            json!({"jsonrpc":"2.0","id":2,"result":{"configOptions":[]}}),
+        );
+        assert!(out
+            .events
+            .iter()
+            .any(|e| matches!(e, TurnEvent::SessionStarted { .. })));
+    }
+
+    #[test]
+    fn a_setting_the_agent_changed_while_idle_is_not_skipped_as_already_current() {
+        let adapter = Acp::new(agents());
+        let session = json!({"sessionId":"s","configOptions":[{"id":"effort","name":"Effort","category":"thought_level","type":"select","currentValue":"low","options":[{"value":"low","name":"Low"},{"value":"high","name":"High"}]}]});
+        let finished = || {
+            let (mut state, _) = opened(&adapter, &turn("first"), session.clone());
+            feed(
+                &adapter,
+                &mut state,
+                json!({"jsonrpc":"2.0","id":ID_PROMPT,"result":{"stopReason":"end_turn"}}),
+            );
+            state
+        };
+        let mut request = turn("second");
+        request.session_id = Some("s".into());
+        request
+            .harness_options
+            .insert("config".into(), r#"{"effort":"low"}"#.into());
+        let update = |value: &str, id: &str| {
+            json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":id,
+                "update":{"sessionUpdate":"config_option_update","configOptions":[
+                    {"id":"effort","name":"Effort","category":"thought_level","type":"select","currentValue":value,
+                     "options":[{"value":"low","name":"Low"},{"value":"high","name":"High"}]}]}}})
+            .to_string()
+        };
+
+        // Nothing changed while idle: `low` is already current, so the next
+        // turn goes straight to the prompt.
+        let mut next = started(&adapter, &request);
+        adapter.inherit_retained_handoff(finished(), &mut next);
+        let first: Value =
+            serde_json::from_slice(&adapter.retained_turn_start(&next).unwrap().unwrap()).unwrap();
+        assert_eq!(first["method"], "session/prompt");
+
+        // The agent switched itself to `high` while idle: `low` is requested again.
+        let mut inherited = finished();
+        adapter.observe_idle_frame(&update("high", "s"), &mut inherited);
+        let mut next = started(&adapter, &request);
+        adapter.inherit_retained_handoff(inherited, &mut next);
+        let first: Value =
+            serde_json::from_slice(&adapter.retained_turn_start(&next).unwrap().unwrap()).unwrap();
+        assert_eq!(first["method"], "session/set_config_option");
+        assert_eq!(first["params"]["value"], "low");
+
+        // A frame for another session, a request, or other noise changes nothing.
+        let mut inherited = finished();
+        adapter.observe_idle_frame(&update("high", "other"), &mut inherited);
+        adapter.observe_idle_frame(
+            &json!({"jsonrpc":"2.0","id":9,"method":"session/update","params":{"sessionId":"s"}})
+                .to_string(),
+            &mut inherited,
+        );
+        adapter.observe_idle_frame("not json", &mut inherited);
+        let mut next = started(&adapter, &request);
+        adapter.inherit_retained_handoff(inherited, &mut next);
+        let first: Value =
+            serde_json::from_slice(&adapter.retained_turn_start(&next).unwrap().unwrap()).unwrap();
+        assert_eq!(first["method"], "session/prompt");
+    }
+
+    #[test]
+    fn a_native_config_update_keeps_the_legacy_modes_the_session_opened_with() {
+        let adapter = Acp::new(agents());
+        let session = json!({"sessionId":"s",
+            "modes":{"currentModeId":"code","availableModes":[{"id":"code","name":"Code"},{"id":"architect","name":"Architect"}]},
+            "configOptions":[{"id":"effort","name":"Effort","category":"thought_level","type":"select","currentValue":"low","options":[{"value":"low","name":"Low"},{"value":"high","name":"High"}]}]});
+        let (mut state, _) = opened(&adapter, &turn("first"), session);
+        feed(
+            &adapter,
+            &mut state,
+            json!({"jsonrpc":"2.0","id":ID_PROMPT,"result":{"stopReason":"end_turn"}}),
+        );
+        // The update lists the native options only, as agents send it.
+        adapter.observe_idle_frame(
+            &json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s",
+                "update":{"sessionUpdate":"config_option_update","configOptions":[
+                    {"id":"effort","name":"Effort","category":"thought_level","type":"select","currentValue":"high",
+                     "options":[{"value":"low","name":"Low"},{"value":"high","name":"High"}]}]}}})
+            .to_string(),
+            &mut state,
+        );
+        let snapshot = load(&state).session_config;
+        assert_eq!(snapshot["configOptions"][0]["currentValue"], "high");
+        assert_eq!(snapshot["modes"]["currentModeId"], "code");
+
+        // The next turn can still select the custom mode the session offers.
+        let mut request = turn("second");
+        request.session_id = Some("s".into());
+        request.permission_mode = PermissionMode::Custom("architect".into());
+        let mut next = started(&adapter, &request);
+        adapter.inherit_retained_handoff(state, &mut next);
+        let first: Value = serde_json::from_slice(
+            &adapter
+                .retained_turn_start(&next)
+                .expect("the custom mode is still advertised")
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(first["method"], "session/set_mode");
+        assert_eq!(first["params"]["modeId"], "architect");
+    }
+
+    #[test]
+    fn permission_names_use_standard_names_or_explicit_mcp_wrapper_metadata() {
+        assert_eq!(
+            canonical_tool_name(
+                "MCP: tool",
+                Some(&json!({"providerIdentifier":"temps_fleet","toolName":"list_daemons"}))
+            ),
+            "mcp__temps_fleet__list_daemons"
+        );
+        assert_eq!(
+            canonical_tool_name(
+                "execute",
+                Some(&json!({"providerIdentifier":"temps_fleet","toolName":"list_daemons"}))
+            ),
+            "execute"
+        );
+        assert_eq!(
+            canonical_tool_name(
+                "MCP: tool",
+                Some(&json!({"providerIdentifier":"other/invalid","toolName":"list_daemons"}))
+            ),
+            "MCP: tool"
+        );
     }
 
     #[test]
@@ -2286,8 +2991,10 @@ mod tests {
             json!({"jsonrpc": "2.0", "id": ID_SESSION, "result": {}}),
         );
         assert!(
-            out.events.is_empty(),
-            "a resumed session is not announced again"
+            out.events
+                .iter()
+                .any(|e| matches!(e, TurnEvent::SessionStarted { .. })),
+            "a resumed session announces readiness"
         );
         let prompt = &written(&out)[0];
         assert_eq!(prompt["params"]["sessionId"], "s-1");
@@ -2456,6 +3163,82 @@ mod tests {
         );
         assert_eq!(written(&out)[0]["method"], "session/prompt");
         assert_eq!(state.result.model.as_deref(), Some("pro"));
+    }
+
+    #[test]
+    fn a_refused_setting_is_named_not_reported_as_the_model() {
+        let adapter = Acp::new(agents());
+        let mut request = turn("hi");
+        request
+            .harness_options
+            .insert("config".into(), r#"{"effort":"high"}"#.into());
+        let session = json!({"sessionId": "s", "configOptions": [
+            {"id": "effort", "name": "Effort", "category": "thought_level", "type": "select", "currentValue": "low",
+                "options": [{"value": "low", "name": "Low"}, {"value": "high", "name": "High"}]}]});
+        let (mut state, out) = opened(&adapter, &request, session);
+        let frame = &written(&out)[0];
+        assert_eq!(frame["method"], "session/set_config_option");
+        let id = frame["id"].as_u64().unwrap();
+        assert!((100..=131).contains(&id));
+        let out = feed(
+            &adapter,
+            &mut state,
+            json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32000, "message": "not now"}}),
+        );
+        assert!(out.terminal);
+        let failure = state.terminal_failure.as_ref().unwrap();
+        assert!(
+            failure
+                .diagnostic
+                .contains("refused the requested setting `effort`"),
+            "{}",
+            failure.diagnostic
+        );
+        assert!(!failure.diagnostic.contains("requested model"));
+    }
+
+    #[test]
+    fn refused_setting_labels_follow_the_request() {
+        let config =
+            json!({"method": "session/set_config_option", "params": {"configId": "effort"}});
+        let mode = json!({"method": "session/set_mode", "params": {"modeId": "plan"}});
+        assert_eq!(refused_setting_label(ID_SET_MODE, None), "mode");
+        assert_eq!(refused_setting_label(ID_SET_MODEL, Some(&config)), "model");
+        assert_eq!(
+            refused_setting_label(100, Some(&config)),
+            "setting `effort`"
+        );
+        assert_eq!(refused_setting_label(101, Some(&mode)), "mode");
+        assert_eq!(refused_setting_label(102, None), "setting");
+    }
+
+    #[test]
+    fn too_many_settings_are_rejected_before_the_process_starts() {
+        let adapter = Acp::new(agents());
+        let mut request = turn("hi");
+        let config: BTreeMap<String, String> = (0..=MAX_REQUESTED_CONFIG)
+            .map(|index| (format!("setting-{index}"), "on".to_string()))
+            .collect();
+        request
+            .harness_options
+            .insert("config".into(), serde_json::to_string(&config).unwrap());
+        let error = adapter
+            .prepare_turn(&request, &mut AdapterState::default())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("at most 32 ACP settings"), "{error}");
+
+        // The limit itself is allowed.
+        let mut allowed = turn("hi");
+        let config: BTreeMap<String, String> = (0..MAX_REQUESTED_CONFIG)
+            .map(|index| (format!("setting-{index}"), "on".to_string()))
+            .collect();
+        allowed
+            .harness_options
+            .insert("config".into(), serde_json::to_string(&config).unwrap());
+        adapter
+            .prepare_turn(&allowed, &mut AdapterState::default())
+            .unwrap();
     }
 
     #[test]

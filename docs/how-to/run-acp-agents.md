@@ -121,3 +121,23 @@ so run it on an explicit user action.
   broken pipe.
 - Questions (elicitation) and client-side file system and terminal methods
   are not offered.
+
+## Discovery and retained sessions
+
+`Acp::probe_agent` exposes bounded `config_options` from ACP v1 session setup.
+Native `configOptions` take priority over legacy `models` and `modes` fields;
+select groups are flattened while opaque IDs stay unchanged. The optional
+`probe_agent_with_progress` callback reports startup and session discovery steps.
+Neither probe sends a model prompt.
+
+Pass a JSON object of advertised string values in `harness_options["config"]`
+to set session selectors, independently of the client's `PermissionMode`.
+Unsupported settings and values fail before prompt submission. Native config
+requests use `session/set_config_option`; legacy modes and models use their
+corresponding legacy methods.
+
+When process retention is enabled on the runtime, ACP reuses the same session
+and stdio process between turns. Session configuration snapshots are bounded
+and scoped by agent, working directory, and session identity. A cold replacement
+still performs normal capability negotiation and resume/load. Cancellation and
+permission decisions keep using the same ACP operations in either lifecycle.

@@ -669,6 +669,18 @@ pub trait AgentAdapter: Send + Sync {
         Vec::new()
     }
 
+    /// Record what a frame read between turns says about the process, in the
+    /// state the next turn on it inherits.
+    ///
+    /// Called for each [`IdleFrame::Background`] frame, after
+    /// [`Self::idle_frame_writes`], with the state left by the last turn. An
+    /// agent that changes its own settings while idle would otherwise leave
+    /// that state stale, and the next turn would judge its requested settings
+    /// against old values. The default records nothing.
+    fn observe_idle_frame(&self, line: &str, inherited: &mut AdapterState) {
+        let _ = (line, inherited);
+    }
+
     /// Supply a protocol carrier to use instead of the child's stdout and stdin.
     ///
     /// Called once, after the provider process is spawned and before the first

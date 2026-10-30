@@ -1397,6 +1397,28 @@ impl<R: tokio::io::AsyncBufRead + Unpin> tokio::io::AsyncBufRead for ArrivalRead
     }
 }
 
+/// The harness options that decide whether a retained process is reused, left
+/// without those the process applies in place: a Claude process switches Fast
+/// mode and permission mode live, and an ACP session applies a changed `config`
+/// through `configure_session` when the next turn takes it over. Keeping them
+/// would replace (or refuse to replace, with background work) a process that
+/// could have taken the change.
+fn retained_fingerprint_options(
+    provider: Provider,
+    options: &std::collections::BTreeMap<String, String>,
+    claude_live: bool,
+) -> std::collections::BTreeMap<String, String> {
+    let mut options = options.clone();
+    if claude_live {
+        options.remove("permission_mode");
+        options.remove("fast_mode");
+    }
+    if provider == Provider::Acp {
+        options.remove("config");
+    }
+    options
+}
+
 /// The inactivity deadline for a frame whose bytes are still arriving: the
 /// last arrival plus `inactivity`, bounded by [`FRAME_ARRIVAL_LIMIT`] from the
 /// start of the read. `None` when arrivals do not move `current` later.
@@ -1511,24 +1533,38 @@ async fn supervise_idle_retained_process(
                 }
                 probe_deadline = Some(now + KEEPALIVE_RESPONSE_TIMEOUT);
             }
-            read_idle_retained_line(&mut io.reader, max_event_line_bytes).await
+            let read = read_idle_retained_line(&mut io.reader, max_event_line_bytes).await;
+            // A frame is handled under the I/O lock that read it: a turn claims
+            // the process through the same lock, so it cannot take the inherited
+            // state or change the generation between the read and what it says
+            // about the process, and the reply goes to the process it came from.
+            if let Some(Ok(Some(line))) = &read {
+                if matches!(adapter.classify_idle_frame(line), IdleFrame::Background) {
+                    {
+                        let mut inherited = retained
+                            .handoff
+                            .inherited
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if let Some(state) = inherited.as_mut() {
+                            adapter.observe_idle_frame(line, state);
+                        }
+                    }
+                    // Work an earlier turn left pending can still answer; the
+                    // adapter may need to clean up what it opened.
+                    let replies = adapter.idle_frame_writes(line);
+                    if !replies.is_empty() {
+                        write_optional_frames(Some(&mut io.stdin), &replies).await;
+                    }
+                }
+            }
+            read
         };
         match observed {
             None => {}
             Some(Ok(Some(line))) => match adapter.classify_idle_frame(&line) {
-                IdleFrame::Background => {
-                    // Work an earlier turn left pending can still answer; the
-                    // adapter may need to clean up what it opened.
-                    let replies = adapter.idle_frame_writes(&line);
-                    if !replies.is_empty() {
-                        let mut io = retained.io.lock().await;
-                        if current(&retained) {
-                            if let Some(io) = io.as_mut() {
-                                write_optional_frames(Some(&mut io.stdin), &replies).await;
-                            }
-                        }
-                    }
-                }
+                // Handled above, under the lock that read it.
+                IdleFrame::Background => {}
                 IdleFrame::KeepaliveResult { active: true } => {
                     probe_deadline = None;
                     expires_at = tokio::time::Instant::now() + idle_timeout;
@@ -2019,9 +2055,11 @@ async fn complete_retained_turn(
     mut state: AdapterState,
 ) -> Result<RetainedTurnEnd> {
     let result = finish_retained_turn(adapter, request, events, &mut state).await?;
-    let carried = adapter
-        .retained_background_work(&state)
-        .then(|| Box::new(state));
+    let keep_state = adapter.retained_background_work(&state) || request.provider == Provider::Acp;
+    if request.provider == Provider::Acp {
+        state.result = TurnResult::default();
+    }
+    let carried = keep_state.then(|| Box::new(state));
     Ok(RetainedTurnEnd::Completed(result, carried))
 }
 
@@ -4426,6 +4464,11 @@ impl AgentRuntime {
             if key == "model_relay" && provider == Provider::Codex {
                 continue;
             }
+            // ACP session configuration is an opaque map validated against the
+            // agent's actual setup response before prompting, not one static choice.
+            if key == "config" && provider == Provider::Acp {
+                continue;
+            }
             if key == "service_tier" && provider == Provider::Codex {
                 continue;
             }
@@ -4952,14 +4995,11 @@ impl AgentRuntime {
             } else {
                 request.permission_mode.clone()
             },
-            harness_options: {
-                let mut options = request.harness_options.clone();
-                if claude_live.is_some() {
-                    options.remove("permission_mode");
-                    options.remove("fast_mode");
-                }
-                options
-            },
+            harness_options: retained_fingerprint_options(
+                provider,
+                &request.harness_options,
+                claude_live.is_some(),
+            ),
             launch_context: request.launch_context.clone(),
             auto_compaction: request.auto_compaction,
             required_sandbox_capabilities: request.required_sandbox_capabilities,
@@ -5425,6 +5465,9 @@ impl AgentRuntime {
             }
         } else if let Some(candidate) = existing.clone() {
             claimed_generation = candidate.claim().await;
+            if provider == Provider::Acp && claimed_generation.is_some() {
+                inherited_state = candidate.handoff.take_inherited();
+            }
             if claimed_generation.is_none() {
                 // Its idle supervisor retired it after the lookup above.
                 supervisor.remove_if_same(runtime_id, &candidate).await;
@@ -5785,7 +5828,21 @@ impl AgentRuntime {
             Ok(RetainedTurnEnd::Completed(result, carried)) => {
                 *retained.session_id.lock().await = result.session_id.clone();
                 cleanup.disarm();
-                if let Some(carried) = carried {
+                if provider == Provider::Acp {
+                    *retained
+                        .handoff
+                        .inherited
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = carried.map(|s| *s);
+                    self.retain_idle_process(
+                        adapter.clone(),
+                        supervisor,
+                        runtime_id,
+                        retained,
+                        generation,
+                        provider,
+                    );
+                } else if let Some(carried) = carried {
                     self.park_retained_process(
                         adapter.clone(),
                         supervisor,
@@ -5943,10 +6000,20 @@ impl AgentRuntime {
         // past initialization from its first moment.
         let mut saw_semantic_activity =
             request.continuation || handoff.initialized.load(Ordering::Acquire);
-        let mut turn_submitted = provider != Provider::OpenCode;
+        let mut turn_submitted = !matches!(provider, Provider::OpenCode | Provider::Acp)
+            || handoff.initialized.load(Ordering::Acquire);
         let mut last_semantic_activity = tokio::time::Instant::now();
         let mut first_text = true;
         let mut process_ready = false;
+        if provider == Provider::Acp && handoff.initialized.load(Ordering::Acquire) {
+            events
+                .emit(TurnEvent::ProviderProcessStatus {
+                    status: crate::ProviderProcessStatus::Ready,
+                    message: "Using the existing ACP session".into(),
+                })
+                .await?;
+            process_ready = true;
+        }
         // Requests background work raised while no turn owned the process.
         for interaction in parked_interactions {
             if self
@@ -6149,7 +6216,8 @@ impl AgentRuntime {
             }
             if !process_ready
                 && semantic_activity
-                && (provider != Provider::OpenCode || output.turn_submitted)
+                && (!matches!(provider, Provider::OpenCode | Provider::Acp)
+                    || output.turn_submitted)
             {
                 events
                     .emit(TurnEvent::ProviderProcessStatus {
@@ -8189,6 +8257,35 @@ mod tests {
         )
         .await
         .is_err());
+    }
+
+    #[test]
+    fn live_switchable_options_do_not_decide_on_a_new_retained_process() {
+        let mut options = std::collections::BTreeMap::new();
+        for (key, value) in [
+            ("agent", "gemini"),
+            ("config", r#"{"effort":"high"}"#),
+            ("permission_mode", "plan"),
+            ("fast_mode", "on"),
+        ] {
+            options.insert(key.to_string(), value.to_string());
+        }
+        // ACP applies a changed `config` in place; its agent still decides.
+        let acp = retained_fingerprint_options(Provider::Acp, &options, false);
+        assert!(!acp.contains_key("config"));
+        assert_eq!(acp.get("agent").map(String::as_str), Some("gemini"));
+        assert!(acp.contains_key("permission_mode"));
+
+        // Claude leaves out only what it switches live, and keeps `config`.
+        let claude = retained_fingerprint_options(Provider::Claude, &options, true);
+        assert!(!claude.contains_key("permission_mode") && !claude.contains_key("fast_mode"));
+        assert!(claude.contains_key("config") && claude.contains_key("agent"));
+
+        // Other providers are compared as given.
+        assert_eq!(
+            retained_fingerprint_options(Provider::Codex, &options, false),
+            options
+        );
     }
 
     #[tokio::test(start_paused = true)]
