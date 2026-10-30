@@ -29,6 +29,9 @@ Versioning and Keep a Changelog conventions.
   reduced to a prefix. An explicit `max_event_line_bytes` overrides both. A
   rejection logs only byte counts, and the error warns that external actions
   may already have completed and must be checked before retrying.
+  A frame whose bytes are still arriving extends the retained turn's inactivity
+  deadline (bounded at two minutes per frame), so a large record streamed
+  slowly is no longer cut off as silence.
 
 - Identified retained input with native `InputMessageState` receipts and explicit
   `read_now` foreground controls. Control acknowledgements stay separate from

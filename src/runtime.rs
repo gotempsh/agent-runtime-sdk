@@ -1110,7 +1110,14 @@ where
             bytes.extend_from_slice(chunk);
             let prefix = frame_prefix(&bytes);
             if !accept_oversized(&prefix) {
-                eprintln!("agent-runtime: protocol frame rejected: limit_bytes={limit}, observed_at_least_bytes={}; payload omitted", bytes.len());
+                // A closed stderr must not turn a rejected frame into a panic.
+                let _ = std::io::Write::write_fmt(
+                    &mut std::io::stderr(),
+                    format_args!(
+                        "agent-runtime: protocol frame rejected: limit_bytes={limit}, observed_at_least_bytes={}; payload omitted\n",
+                        bytes.len()
+                    ),
+                );
                 return Ok(Some(ProviderFrame::Rejected));
             }
             let mut tail = Vec::new();
@@ -1313,6 +1320,95 @@ impl Drop for RetainedTurnCleanup {
 const IDLE_FRAME_WAIT: Duration = Duration::from_millis(25);
 /// Upper bound for reading the rest of a frame once it has begun.
 const IDLE_FRAME_COMPLETION: Duration = Duration::from_secs(5);
+/// The longest one provider frame may take to arrive while its bytes keep
+/// coming. Arriving bytes extend the inactivity deadline, never past this.
+const FRAME_ARRIVAL_LIMIT: Duration = Duration::from_secs(120);
+
+/// Records when bytes were last available from the wrapped reader, so a
+/// deadline can tell a large frame still streaming in from a silent provider.
+struct ArrivalReader<'a, R> {
+    inner: &'a mut R,
+    arrivals: &'a FrameArrivals,
+}
+
+/// When bytes of one frame last arrived, as an offset from when the read began.
+/// An atomic, because the turn future holding it must be `Send`.
+struct FrameArrivals {
+    started: tokio::time::Instant,
+    last_offset_nanos: AtomicU64,
+}
+
+impl FrameArrivals {
+    fn new() -> Self {
+        Self {
+            started: tokio::time::Instant::now(),
+            last_offset_nanos: AtomicU64::new(u64::MAX),
+        }
+    }
+
+    fn record(&self) {
+        let offset = tokio::time::Instant::now().saturating_duration_since(self.started);
+        let nanos = u64::try_from(offset.as_nanos()).unwrap_or(u64::MAX - 1);
+        self.last_offset_nanos
+            .store(nanos.min(u64::MAX - 1), Ordering::Relaxed);
+    }
+
+    fn last_bytes(&self) -> Option<tokio::time::Instant> {
+        match self.last_offset_nanos.load(Ordering::Relaxed) {
+            u64::MAX => None,
+            nanos => Some(self.started + Duration::from_nanos(nanos)),
+        }
+    }
+}
+
+impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for ArrivalReader<'_, R> {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let before = buf.filled().len();
+        let poll = std::pin::Pin::new(&mut *this.inner).poll_read(cx, buf);
+        if matches!(poll, std::task::Poll::Ready(Ok(()))) && buf.filled().len() > before {
+            this.arrivals.record();
+        }
+        poll
+    }
+}
+
+impl<R: tokio::io::AsyncBufRead + Unpin> tokio::io::AsyncBufRead for ArrivalReader<'_, R> {
+    fn poll_fill_buf(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<&[u8]>> {
+        let this = self.get_mut();
+        let poll = std::pin::Pin::new(&mut *this.inner).poll_fill_buf(cx);
+        if let std::task::Poll::Ready(Ok(bytes)) = &poll {
+            if !bytes.is_empty() {
+                this.arrivals.record();
+            }
+        }
+        poll
+    }
+
+    fn consume(self: std::pin::Pin<&mut Self>, amount: usize) {
+        std::pin::Pin::new(&mut *self.get_mut().inner).consume(amount);
+    }
+}
+
+/// The inactivity deadline for a frame whose bytes are still arriving: the
+/// last arrival plus `inactivity`, bounded by [`FRAME_ARRIVAL_LIMIT`] from the
+/// start of the read. `None` when arrivals do not move `current` later.
+fn frame_deadline_after_arrivals(
+    current: tokio::time::Instant,
+    last_bytes: Option<tokio::time::Instant>,
+    inactivity: Duration,
+    started: tokio::time::Instant,
+) -> Option<tokio::time::Instant> {
+    let refreshed = (last_bytes? + inactivity).min(started + FRAME_ARRIVAL_LIMIT.max(inactivity));
+    (refreshed > current).then_some(refreshed)
+}
 /// Upper bound for an answer to [`AgentAdapter::retained_keepalive_probe`].
 const KEEPALIVE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -5963,11 +6059,15 @@ impl AgentRuntime {
                 // Finish a frame that has begun even if the turn is cancelled
                 // meanwhile: abandoning the read would lose its consumed prefix
                 // and corrupt the stream an interrupted process still owns.
-                let read = read_provider_frame(
-                    &mut io.reader,
-                    self.event_line_limit(provider),
-                    |prefix| adapter.accepts_oversized_frame(prefix),
-                );
+                let frame_arrivals = FrameArrivals::new();
+                let mut arrivals = ArrivalReader {
+                    inner: &mut io.reader,
+                    arrivals: &frame_arrivals,
+                };
+                let read =
+                    read_provider_frame(&mut arrivals, self.event_line_limit(provider), |prefix| {
+                        adapter.accepts_oversized_frame(prefix)
+                    });
                 tokio::pin!(read);
                 let mut frame_deadline = deadline;
                 let mut cancel_seen = false;
@@ -5979,6 +6079,19 @@ impl AgentRuntime {
                             source,
                         })?,
                         _ = tokio::time::sleep_until(frame_deadline) => {
+                            // A frame that is still arriving is progress, not
+                            // silence; a cancelled turn keeps its short bound.
+                            if !cancel_seen {
+                                if let Some(extended) = frame_deadline_after_arrivals(
+                                    frame_deadline,
+                                    frame_arrivals.last_bytes(),
+                                    inactivity_timeout,
+                                    frame_arrivals.started,
+                                ) {
+                                    frame_deadline = extended;
+                                    continue;
+                                }
+                            }
                             return Err(if cancel_seen {
                                 RuntimeError::Cancelled { provider }
                             } else {
@@ -8076,6 +8189,59 @@ mod tests {
         )
         .await
         .is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn arriving_frame_bytes_extend_the_inactivity_deadline_within_a_total_bound() {
+        use tokio::io::AsyncWriteExt;
+        let inactivity = Duration::from_secs(5);
+        let arrivals = FrameArrivals::new();
+        let started = arrivals.started;
+        let deadline = started + inactivity;
+        // No bytes yet: silence is not extended.
+        assert_eq!(
+            frame_deadline_after_arrivals(deadline, None, inactivity, started),
+            None
+        );
+
+        // A frame streamed over longer than the inactivity timeout, with
+        // bytes arriving throughout, is read through the wrapper and records
+        // the last arrival each time.
+        let (mut writer, reader) = tokio::io::duplex(64);
+        let mut reader = BufReader::new(reader);
+        let mut tracked = ArrivalReader {
+            inner: &mut reader,
+            arrivals: &arrivals,
+        };
+        let producer = tokio::spawn(async move {
+            for _ in 0..4 {
+                writer.write_all(&[b'x'; 16]).await.unwrap();
+                tokio::time::sleep(Duration::from_secs(3)).await;
+            }
+            writer.write_all(b"\n").await.unwrap();
+        });
+        let frame = read_provider_frame(&mut tracked, 1024, |_| false)
+            .await
+            .unwrap();
+        producer.await.unwrap();
+        assert!(matches!(frame, Some(ProviderFrame::Line(line)) if line.len() == 64));
+        let last = arrivals.last_bytes().expect("arrivals were recorded");
+        assert!(last - started >= Duration::from_secs(12));
+
+        // The deadline moves to the last arrival plus the inactivity timeout,
+        // never past the total bound, and never earlier than it already is.
+        let extended = frame_deadline_after_arrivals(deadline, Some(last), inactivity, started)
+            .expect("arrivals extend the deadline");
+        assert_eq!(extended, last + inactivity);
+        let late = started + FRAME_ARRIVAL_LIMIT + Duration::from_secs(30);
+        assert_eq!(
+            frame_deadline_after_arrivals(deadline, Some(late), inactivity, started),
+            Some(started + FRAME_ARRIVAL_LIMIT)
+        );
+        assert_eq!(
+            frame_deadline_after_arrivals(extended, Some(last), inactivity, started),
+            None
+        );
     }
 
     /// Read every frame, accepting all oversized ones.

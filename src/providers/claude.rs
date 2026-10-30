@@ -2537,25 +2537,21 @@ fn record_subagent_model(
 /// call it measures.
 ///
 /// Claude Code sends two shapes. A heartbeat (every 30 seconds while any tool
-/// runs) has its own `tool_use_id`, `<tool id>-heartbeat-<n>`, and the tool's
-/// id in `parent_tool_use_id`. Progress while a command prints output carries
-/// the tool's id in `tool_use_id`. The first candidate that names a tool this
-/// session announced wins, so a subagent's `parent_tool_use_id` (its Task
-/// call) is never mistaken for the running tool.
+/// runs) has its own `tool_use_id`, `<tool id>-heartbeat-<n>`, which names the
+/// tool. Progress while a command prints output carries the tool's id in
+/// `tool_use_id`. Either way the message's own id is the tool. A
+/// `parent_tool_use_id` is the enclosing call, such as the subagent's Task, and
+/// is never the running tool even when this session announced it, so a message
+/// without its own id is dropped.
 fn tool_progress(native: &ClaudeNativeState, value: &Value) -> Option<TurnEvent> {
-    let own = value.get("tool_use_id").and_then(Value::as_str);
-    let stripped = own.map(|id| id.split_once("-heartbeat-").map_or(id, |(tool, _)| tool));
-    let parent = value.get("parent_tool_use_id").and_then(Value::as_str);
-    let candidates = [stripped, own, parent];
-    let id = candidates
-        .iter()
-        .flatten()
-        .find(|id| native.tool_names.contains_key(**id))
-        .or(stripped.as_ref())
-        .filter(|id| !id.is_empty())?;
+    let own = value.get("tool_use_id").and_then(Value::as_str)?;
+    let id = own.split_once("-heartbeat-").map_or(own, |(tool, _)| tool);
+    if id.is_empty() {
+        return None;
+    }
     let name = native
         .tool_names
-        .get(*id)
+        .get(id)
         .map(String::as_str)
         .or_else(|| value.get("tool_name").and_then(Value::as_str))
         .unwrap_or("tool");
@@ -4783,6 +4779,26 @@ setTimeout(() => {
                 elapsed_seconds: 150,
             }],
             "a message naming no tool is dropped"
+        );
+    }
+
+    #[test]
+    fn progress_names_the_nested_command_not_its_known_parent_task() {
+        // The nested command was never announced to this session, but its
+        // enclosing Task call was: the Task must not be reported as running.
+        let events = progress_events(&[
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_task","name":"Task","input":{"description":"explore"}}]}}"#,
+            r#"{"type":"tool_progress","tool_use_id":"toolu_nested","tool_name":"Bash","parent_tool_use_id":"toolu_task","elapsed_time_seconds":9}"#,
+            r#"{"type":"tool_progress","tool_name":"Bash","parent_tool_use_id":"toolu_task","elapsed_time_seconds":9}"#,
+        ]);
+        assert_eq!(
+            events,
+            vec![TurnEvent::ToolProgress {
+                id: "toolu_nested".into(),
+                name: "Bash".into(),
+                elapsed_seconds: 9,
+            }],
+            "a message with no id of its own is not attributed to its parent"
         );
     }
 
