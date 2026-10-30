@@ -595,8 +595,10 @@ trusted declarations by backend implementers, not runtime attestation.
 - Captured stderr tail: 32 KiB.
 - Default turn deadline: 30 minutes.
 - Default interaction deadline: 10 minutes.
-- Unix cancellation uses a dedicated process group. Windows cancellation uses
-  `taskkill /T /F` to terminate the child tree.
+- Unix cancellation uses a dedicated process group. Local Linux/macOS launches
+  also discover detached processes using a per-launch inherited ownership
+  marker. Windows cancellation uses `taskkill /T /F` to terminate the child tree.
+  See [process cleanup limits](../how-to/keep-tool-processes-running.md#opt-into-turn-scoped-cleanup).
 - Natural provider exit preserves detached tool descendants by default. This
   behavior is configurable with `ToolProcessPolicy` and does not override a
   provider, service manager, or sandbox backend that enforces its own cleanup.

@@ -533,6 +533,27 @@ pub trait RuntimeTurnExecutor: Send + Sync {
     /// retained runtime `runtime_id`.
     ///
     /// The default cannot accept input mid-turn.
+    async fn send_identified_input(
+        &self,
+        runtime_id: &RuntimeId,
+        provider: Provider,
+        _id: String,
+        text: String,
+    ) -> crate::Result<MessageDelivery> {
+        self.send_retained_message(runtime_id, provider, text).await
+    }
+    /// Release foreground work while preserving queued input, when supported.
+    async fn control_retained_input(
+        &self,
+        _runtime_id: &RuntimeId,
+        _provider: Provider,
+        _id: String,
+        _background: bool,
+    ) -> crate::Result<MessageDelivery> {
+        Ok(MessageDelivery::Unsupported)
+    }
+
+    /// Deliver uncorrelated user input to the current retained invocation.
     async fn send_retained_message(
         &self,
         _runtime_id: &RuntimeId,
@@ -545,6 +566,28 @@ pub trait RuntimeTurnExecutor: Send + Sync {
 
 #[async_trait]
 impl RuntimeTurnExecutor for AgentRuntime {
+    async fn send_identified_input(
+        &self,
+        runtime_id: &RuntimeId,
+        provider: Provider,
+        id: String,
+        text: String,
+    ) -> crate::Result<MessageDelivery> {
+        self.send_identified_input(runtime_id, provider, id, text)
+            .await
+    }
+
+    async fn control_retained_input(
+        &self,
+        runtime_id: &RuntimeId,
+        provider: Provider,
+        id: String,
+        background: bool,
+    ) -> crate::Result<MessageDelivery> {
+        self.control_retained_input(runtime_id, provider, id, background)
+            .await
+    }
+
     fn capabilities(&self, provider: Provider) -> RuntimeDriverCapabilities {
         let permissions = self.permission_support(provider).ok();
         RuntimeDriverCapabilities {
@@ -974,10 +1017,50 @@ pub struct TurnMessageHandle {
 
 #[async_trait]
 pub(crate) trait TurnMessageBackend: Send + Sync {
+    async fn send_identified(&self, _id: String, text: String) -> RetainedRuntimeResult<()> {
+        self.send(text).await
+    }
+
+    async fn control(&self, id: String, background: bool) -> RetainedRuntimeResult<()> {
+        let _ = (id, background);
+        Err(lifecycle_failure(
+            None,
+            None,
+            RuntimeFailureKind::CapabilityUnavailable,
+            RetryAdvice::Never,
+            DeliveryState::NotSent,
+            "Foreground controls are unavailable",
+        ))
+    }
+
     async fn send(&self, text: String) -> RetainedRuntimeResult<()>;
 }
 
 impl TurnMessageHandle {
+    /// Send input with a host identity for subsequent lifecycle and controls.
+    ///
+    /// The identity correlates receipts; it is not a durable idempotency key.
+    /// Callers must persist delivery attempts and must not retry a possibly-sent
+    /// input merely because its acknowledgement was lost.
+    pub async fn send_identified(
+        &self,
+        id: impl Into<String>,
+        text: impl Into<String>,
+    ) -> RetainedRuntimeResult<()> {
+        self.backend.send_identified(id.into(), text.into()).await
+    }
+
+    /// Explicitly release the foreground step without cancelling injected messages.
+    /// This writes a control, never user text. Observe InputControl events for the
+    /// provider's acknowledgement. No automatic fallback to cancellation occurs.
+    pub async fn read_now(
+        &self,
+        id: impl Into<String>,
+        background: bool,
+    ) -> RetainedRuntimeResult<()> {
+        self.backend.control(id.into(), background).await
+    }
+
     pub(crate) fn from_backend(backend: Arc<dyn TurnMessageBackend>) -> Self {
         Self { backend }
     }
@@ -1028,7 +1111,68 @@ struct InProcessTurnMessages {
 
 #[async_trait]
 impl TurnMessageBackend for InProcessTurnMessages {
+    async fn control(&self, id: String, background: bool) -> RetainedRuntimeResult<()> {
+        let entry = &self.entry;
+        let failure = |kind, delivery, message| {
+            lifecycle_failure(
+                Some(entry.spec.runtime_id.clone()),
+                Some(self.invocation_id.clone()),
+                kind,
+                RetryAdvice::Never,
+                delivery,
+                message,
+            )
+        };
+        let state = entry.state.lock().await;
+        if entry.disposed.load(Ordering::Acquire)
+            || !state.active.as_ref().is_some_and(|active| {
+                active.invocation_id == self.invocation_id && !active.released.is_complete()
+            })
+        {
+            return Err(failure(
+                RuntimeFailureKind::InvalidRequest,
+                DeliveryState::NotSent,
+                "This turn has ended".to_string(),
+            ));
+        }
+        match entry
+            .executor
+            .control_retained_input(&entry.spec.runtime_id, entry.spec.provider, id, background)
+            .await
+        {
+            Ok(MessageDelivery::Delivered) => Ok(()),
+            Ok(MessageDelivery::NotAccepting) => Err(failure(
+                RuntimeFailureKind::InvalidRequest,
+                DeliveryState::NotSent,
+                "This turn has ended".to_string(),
+            )),
+            Ok(MessageDelivery::Withdrawn) => Err(lifecycle_failure(
+                Some(entry.spec.runtime_id.clone()),
+                Some(self.invocation_id.clone()),
+                RuntimeFailureKind::Timeout,
+                RetryAdvice::After {
+                    milliseconds: 1_000,
+                },
+                DeliveryState::NotSent,
+                "The control was not taken in time; it was not sent".to_string(),
+            )),
+            Ok(_) => Err(failure(
+                RuntimeFailureKind::CapabilityUnavailable,
+                DeliveryState::NotSent,
+                "The current step cannot be released by this runtime".to_string(),
+            )),
+            Err(error) => Err(runtime_error_to_failure(
+                error,
+                entry.spec.runtime_id.clone(),
+                self.invocation_id.clone(),
+            )),
+        }
+    }
+
     async fn send(&self, text: String) -> RetainedRuntimeResult<()> {
+        self.send_identified(String::new(), text).await
+    }
+    async fn send_identified(&self, id: String, text: String) -> RetainedRuntimeResult<()> {
         let entry = &self.entry;
         let failure = |kind, delivery, message: String| {
             lifecycle_failure(
@@ -1090,7 +1234,7 @@ impl TurnMessageBackend for InProcessTurnMessages {
         }
         let delivery = entry
             .executor
-            .send_retained_message(&entry.spec.runtime_id, entry.spec.provider, text)
+            .send_identified_input(&entry.spec.runtime_id, entry.spec.provider, id, text)
             .await;
         drop(state);
         match delivery {

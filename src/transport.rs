@@ -405,8 +405,9 @@ impl ExecutionTransport for LocalTransport {
     }
 
     async fn spawn(&self, request: TransportSpawnRequest) -> TransportResult<TransportProcess> {
-        let mut child = crate::process::spawn(&request.command, &request.working_directory)
-            .map_err(|error| TransportError::local("spawn", error))?;
+        let (mut child, process_tree) =
+            crate::process::spawn(&request.command, &request.working_directory)
+                .map_err(|error| TransportError::local("spawn", error))?;
         let pid = child.id();
         let stdin = child
             .stdin
@@ -442,7 +443,6 @@ impl ExecutionTransport for LocalTransport {
             transport: self.name().to_string(),
             native_id: pid.map_or_else(|| "unknown".to_string(), |pid| pid.to_string()),
         };
-        let process_tree = crate::process::ProcessTreeGuard::for_child(&child);
         Ok(TransportProcess::new(
             handle,
             pid,
@@ -546,8 +546,10 @@ impl TransportProcessControl for LocalProcessControl {
     }
 
     async fn terminate(&mut self) -> TransportResult<()> {
-        self.process_tree.terminate();
-        Ok(())
+        self.process_tree
+            .terminate_async()
+            .await
+            .map_err(|error| TransportError::local("terminate", std::io::Error::other(error)))
     }
 
     fn disarm(&mut self) {

@@ -16,6 +16,30 @@ Versioning and Keep a Changelog conventions.
 
 ### Added
 
+- `TurnEvent::ToolProgress { id, name, elapsed_seconds }`: a started tool
+  call is still running. The Claude adapter reports Claude Code's
+  `tool_progress` messages (a heartbeat every 30 seconds while a tool runs,
+  and progress while a command prints output), which it used to drop. An
+  application can now tell a long command apart from a harness that stopped
+  responding instead of treating both as silence.
+
+- Codex event records default to a 32 MiB limit (other providers keep 2 MiB),
+  because Codex repeats complete MCP arguments and results, including file
+  contents, in one JSON record. Complete records are parsed; none is skipped or
+  reduced to a prefix. An explicit `max_event_line_bytes` overrides both. A
+  rejection logs only byte counts, and the error warns that external actions
+  may already have completed and must be checked before retrying.
+  A frame whose bytes are still arriving extends the retained turn's inactivity
+  deadline (bounded at two minutes per frame), so a large record streamed
+  slowly is no longer cut off as silence.
+
+- Identified retained input with native `InputMessageState` receipts and explicit
+  `read_now` foreground controls. Control acknowledgements stay separate from
+  message consumption; background refusal never escalates to interruption.
+  Claude declines input after its reply has settled and waits for queued input
+  to settle before advertising a background handoff. See
+  [steering retained turns](docs/how-to/steer-retained-turns.md).
+
 - `AgentRuntime::subscribe_parked_process_ends`: announces a parked retained
   process that ended while background work it started was still running (it
   exited or was killed, it wrote output the runtime could not read, or a turn
@@ -62,6 +86,14 @@ Versioning and Keep a Changelog conventions.
   seconds of starting") instead of `Timeout` ("turn timed out"), so applications
   can tell a failed start from a turn that ran too long. Both map to
   `RuntimeFailureKind::Timeout`.
+- Codex turns (`exec` and `app-server`) now run with `--config notify=[]`, so
+  the `notify` command in the user's `~/.codex/config.toml` no longer runs when
+  an SDK turn ends. The Codex desktop app installs one that calls its "Codex
+  Computer Use" helper, which sends an Apple Event; macOS blamed the host
+  application and asked "wants access to control Codex Computer Use" on every
+  host. A user's own `notify` hook (a desktop notifier or webhook, for example)
+  stops firing for SDK turns too; turn events still reach the host through the
+  protocol. There is no opt-out yet.
 
 ### Added
 
@@ -228,6 +260,12 @@ Versioning and Keep a Changelog conventions.
   `AgentAdapter::encode_user_message`, both with defaults that decline.
 
 ### Fixed
+
+- Local Linux/macOS process cleanup now discovers detached, reparented tools
+  through a random inherited launch marker, in addition to killing the provider
+  process group. Cleanup rechecks process identity before signaling and keeps
+  separate launches isolated. `PreserveOnCompletion` remains unchanged; remote
+  cleanup and host-crash recovery still require an outer supervisor.
 
 - A Claude turn that Claude Code ended without a finished reply no longer shows
   its debug line (`[ede_diagnostic] result_type=user last_content_type=n/a

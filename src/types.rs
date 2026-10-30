@@ -230,6 +230,9 @@ pub enum ToolProcessPolicy {
     #[default]
     PreserveOnCompletion,
     /// Terminate remaining descendants in the provider process group/tree.
+    /// Local Linux/macOS launches also clean up detached processes that retain
+    /// the SDK's inherited ownership marker. See the process lifetime guide
+    /// for containment limits; this policy is not a security sandbox.
     TerminateOnCompletion,
 }
 
@@ -1081,6 +1084,25 @@ pub enum PlanEntryStatus {
 #[serde(tag = "type", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum TurnEvent {
+    /// Native lifecycle of identified user input (not inferred from output).
+    InputMessageState {
+        /// User input identity.
+        id: String,
+        /// queued, started, completed, cancelled or discarded.
+        state: String,
+    },
+    /// Provider acknowledgement of an explicit foreground control.
+    InputControl {
+        /// Host action identifier.
+        id: String,
+        /// Distinguishes background and stop requests for the same input.
+        #[serde(default)]
+        background: bool,
+        /// Whether the provider accepted the request.
+        succeeded: bool,
+        /// Human-readable outcome.
+        message: String,
+    },
     /// Session identifier became available.
     SessionStarted {
         /// Provider-native resumable identifier.
@@ -1133,6 +1155,22 @@ pub enum TurnEvent {
         /// browser screenshot), in result order. Never part of `output`.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         images: Vec<ToolImage>,
+    },
+    /// A tool call announced by [`TurnEvent::ToolCall`] is still running.
+    ///
+    /// Harnesses that measure a running tool report it periodically (Claude
+    /// Code sends a heartbeat every 30 seconds, and progress while a command
+    /// prints output). Applications use it to show how long the tool has run
+    /// and as proof that the harness is alive: a turn whose only activity is
+    /// one long command is not stuck while this keeps arriving.
+    ToolProgress {
+        /// Provider-native identifier of the running tool call; the `id` of
+        /// its `ToolCall`.
+        id: String,
+        /// Tool name.
+        name: String,
+        /// Seconds the tool has been running, as the provider measured them.
+        elapsed_seconds: u64,
     },
     /// Full replacement of the agent's execution plan.
     ///

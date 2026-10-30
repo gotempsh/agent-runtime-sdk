@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -26,6 +26,7 @@ use crate::{
 
 const CLAUDE_STATE_KEY: &str = "claude.native_tasks";
 const MAX_NATIVE_TASKS: usize = 32;
+const MAX_RETIRED_TASKS: usize = 128;
 const MAX_TASK_FIELD_CHARS: usize = 4_000;
 /// Agents kept per workflow; the rest are counted in `omitted_agents`.
 const MAX_WORKFLOW_AGENTS: usize = 100;
@@ -406,6 +407,12 @@ fn context_window_from_label(value: &str) -> Option<u64> {
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct ClaudeNativeState {
     tasks: BTreeMap<String, AgentTask>,
+    /// Recent terminal identities outlive their turn without occupying live slots.
+    #[serde(default)]
+    retired_tasks: VecDeque<AgentTask>,
+    /// Last usage emitted per tracked or recently retired task, for enrichment dedup.
+    #[serde(default)]
+    task_usage: BTreeMap<String, AgentTaskUsage>,
     background_task_ids: BTreeSet<String>,
     tool_use_to_task: BTreeMap<String, String>,
     tool_names: BTreeMap<String, String>,
@@ -437,11 +444,16 @@ struct ClaudeNativeState {
     /// Lifecycle of each user message this turn submitted, keyed by the
     /// message UUID Claude echoes in `command_lifecycle` frames.
     own_commands: BTreeMap<String, String>,
+    #[serde(default)]
+    identified_commands: BTreeSet<String>,
     /// The CLI reports `command_lifecycle`, so turn completion can wait for
     /// this turn's own messages instead of trusting the first `result`.
     lifecycle_seen: bool,
     /// Claude acknowledged the runtime's native interrupt.
     interrupting: bool,
+    #[serde(default)]
+    read_now_interrupt: bool,
+
     /// Workflow ticks since each workflow task's snapshot was last emitted.
     #[serde(default)]
     workflow_quiet_ticks: BTreeMap<String, u32>,
@@ -453,6 +465,19 @@ struct ClaudeNativeState {
     /// is written after the turn's first frame.
     #[serde(default)]
     session_title_description: Option<String>,
+}
+
+fn accept_input_receipt(previous: &str, next: &str) -> bool {
+    if !matches!(
+        next,
+        "queued" | "started" | "completed" | "cancelled" | "discarded"
+    ) {
+        return false;
+    }
+    if matches!(previous, "completed" | "cancelled" | "discarded") {
+        return previous == next;
+    }
+    !(previous == "started" && next == "queued")
 }
 
 impl ClaudeNativeState {
@@ -1135,18 +1160,37 @@ impl AgentAdapter for Claude {
     }
 
     fn encode_user_message(&self, text: &str, state: &mut AdapterState) -> Result<Option<Vec<u8>>> {
+        self.encode_identified_input(None, text, state)
+    }
+    fn encode_identified_input(
+        &self,
+        id: Option<&str>,
+        text: &str,
+        state: &mut AdapterState,
+    ) -> Result<Option<Vec<u8>>> {
         let mut native = take_native_state(state);
-        let outcome = if !native.retained_turn {
+        let outcome = if !native.retained_turn || native.answered() {
+            // The result can beat Fleet's observation of ReplyFinished. Decline
+            // before writing: the caller can durably queue the same identity
+            // and hand off a held reply without replaying accepted input.
             // A one-shot process closes stdin once it answers, so there is no
             // channel to deliver a later message on.
             Ok(None)
+        } else if id.is_some_and(|id| native.own_commands.contains_key(id)) {
+            Err(RuntimeError::InvalidRequest {
+                field: "message",
+                message: "this input identity was already submitted to the turn".to_string(),
+            })
         } else if native.own_commands.len() >= MAX_TURN_MESSAGES {
             Err(RuntimeError::InvalidRequest {
                 field: "message",
                 message: format!("a turn accepts at most {MAX_TURN_MESSAGES} user messages"),
             })
         } else {
-            let uuid = new_message_uuid();
+            let uuid = id.map_or_else(new_message_uuid, str::to_string);
+            if id.is_some() {
+                native.identified_commands.insert(uuid.clone());
+            }
             native
                 .own_commands
                 .insert(uuid.clone(), "pending".to_string());
@@ -1154,6 +1198,34 @@ impl AgentAdapter for Claude {
         };
         put_native_state(state, native);
         outcome
+    }
+
+    fn encode_input_control(
+        &self,
+        id: &str,
+        background: bool,
+        state: &mut AdapterState,
+    ) -> Result<Option<Vec<u8>>> {
+        let mut native = take_native_state(state);
+        let pending = native
+            .own_commands
+            .get(id)
+            .is_some_and(|s| matches!(s.as_str(), "pending" | "queued"));
+        let result = if !native.retained_turn || !native.lifecycle_seen || !pending {
+            Ok(None)
+        } else {
+            if !background {
+                native.read_now_interrupt = true;
+            }
+            serde_json::to_vec(&json!({
+                "type": "control_request",
+                "request_id": format!("temps-read-now:{}:{id}", if background { "background" } else { "stop" }),
+                "request": if background { json!({"subtype":"background_tasks"}) }
+                    else { json!({"subtype":"interrupt", "cancel_queued":false}) }
+            })).map(Some).map_err(|e| RuntimeError::Protocol { provider: Provider::Claude, message: e.to_string() })
+        };
+        put_native_state(state, native);
+        result
     }
 
     fn interrupt_request(&self, state: &AdapterState) -> Option<Vec<u8>> {
@@ -1245,6 +1317,23 @@ impl AgentAdapter for Claude {
         // Only live work crosses the hand-off. Finished tasks stay with the
         // turn that reported them; carrying them would let a chain of
         // hand-offs fill the bounded task table and hide new subagents.
+        native.retired_tasks = previous.retired_tasks;
+        for (id, task) in &previous.tasks {
+            if !previous.background_task_ids.contains(id) && is_terminal_task_status(&task.status) {
+                native.retired_tasks.push_back(task.clone());
+            }
+        }
+        while native.retired_tasks.len() > MAX_RETIRED_TASKS {
+            native.retired_tasks.pop_front();
+        }
+        native.task_usage = previous
+            .task_usage
+            .into_iter()
+            .filter(|(id, _)| {
+                previous.background_task_ids.contains(id)
+                    || native.retired_tasks.iter().any(|task| &task.id == id)
+            })
+            .collect();
         native.tasks = previous
             .tasks
             .into_iter()
@@ -1779,14 +1868,32 @@ impl AgentAdapter for Claude {
                 // answered by this result or by a later exchange.
                 output.terminal = !native.holds_turn_open()
                     && (!native.retained_turn || native.own_commands_done());
-                if native.holds_turn_open() {
+                if native.holds_turn_open() && native.own_commands_done() {
                     output
                         .events
                         .push(TurnEvent::ReplyFinishedWithBackgroundTasks {
                             task_ids: native.background_task_ids.iter().cloned().collect(),
                         });
                 }
-                let failed = value.get("is_error").and_then(Value::as_bool) == Some(true);
+                // A control acknowledgement is not evidence that a result's
+                // error was caused by interruption. Preserve provider failures.
+                let requested_interrupt = std::mem::take(&mut native.read_now_interrupt);
+                let interrupted = requested_interrupt
+                    && value
+                        .get("errors")
+                        .and_then(Value::as_array)
+                        .is_some_and(|errors| {
+                            !errors.is_empty()
+                                && errors
+                                    .iter()
+                                    .all(|error| error.as_str() == Some("interrupted"))
+                        });
+                let failed =
+                    !interrupted && value.get("is_error").and_then(Value::as_bool) == Some(true);
+                if interrupted {
+                    state.terminal_failure = None;
+                }
+
                 state.result.status = if failed {
                     let diagnostic = value
                         .get("result")
@@ -1865,7 +1972,19 @@ impl AgentAdapter for Claude {
                 if let (Some(command), Some(lifecycle)) = (command, lifecycle) {
                     native.lifecycle_seen = true;
                     if let Some(tracked) = native.own_commands.get_mut(command) {
+                        // Repeated/out-of-order receipts must not turn consumed
+                        // input back into queued work or reopen a terminal input.
+                        if !accept_input_receipt(tracked, lifecycle) {
+                            put_native_state(state, native);
+                            return Ok(output);
+                        }
                         *tracked = bounded(lifecycle);
+                        if native.identified_commands.contains(command) {
+                            output.events.push(TurnEvent::InputMessageState {
+                                id: command.into(),
+                                state: lifecycle.into(),
+                            });
+                        }
                         // Stopping a turn stops every message it submitted,
                         // including ones Claude had queued behind the
                         // interrupted exchange.
@@ -1878,6 +1997,15 @@ impl AgentAdapter for Claude {
                         // with a result that belongs to this turn.
                         native.follow_up_active = true;
                         native.awaiting_follow_up = false;
+                    }
+                    // A result may precede the final command receipt. Do not
+                    // offer an idle handoff while accepted input is still queued.
+                    if native.retained_turn && native.answered() && native.holds_turn_open() {
+                        output
+                            .events
+                            .push(TurnEvent::ReplyFinishedWithBackgroundTasks {
+                                task_ids: native.background_task_ids.iter().cloned().collect(),
+                            });
                     }
                     // A turn whose last own message just finished ends here,
                     // unless Claude may still answer drained background work.
@@ -1896,6 +2024,35 @@ impl AgentAdapter for Claude {
                     .pointer("/response/request_id")
                     .and_then(Value::as_str)
                 {
+                    Some(id) if id.starts_with("temps-read-now:") => {
+                        let accepted = value.pointer("/response/subtype").and_then(Value::as_str)
+                            == Some("success");
+                        let action = id.trim_start_matches("temps-read-now:");
+                        let (background, input_id) =
+                            if let Some(input) = action.strip_prefix("background:") {
+                                (true, input)
+                            } else {
+                                (false, action.strip_prefix("stop:").unwrap_or(action))
+                            };
+                        let no_background_task = background
+                            && accepted
+                            && value
+                                .pointer("/response/response/backgrounded")
+                                .and_then(Value::as_bool)
+                                == Some(false);
+                        let succeeded = accepted && !no_background_task;
+                        if !succeeded && !background {
+                            native.read_now_interrupt = false;
+                        }
+                        output.events.push(TurnEvent::InputControl {
+                            id: input_id.to_string(),
+                            background,
+                            succeeded,
+                            message: if succeeded { "Claude acknowledged the control request. Waiting for confirmation that the original message has started.".into() }
+                                else if no_background_task { "Claude found no eligible foreground task to background. Refresh delivery status; the original message has not been resent.".into() }
+                                else { value.pointer("/response/error").and_then(Value::as_str).unwrap_or("Claude refused the action. Wait for the step to finish or try Read it now.").to_string() },
+                        });
+                    }
                     Some(INTERRUPT_REQUEST_ID) => native.interrupting = true,
                     // A failed request leaves the session untitled; the
                     // caller asks again on a later turn.
@@ -1908,6 +2065,11 @@ impl AgentAdapter for Claude {
                         }
                     }
                     _ => {}
+                }
+            }
+            "tool_progress" => {
+                if let Some(progress) = tool_progress(&native, &value) {
+                    output.events.push(progress);
                 }
             }
             "rate_limit_event" => {
@@ -2371,6 +2533,40 @@ fn record_subagent_model(
     true
 }
 
+/// A `tool_progress` message as a [`TurnEvent::ToolProgress`] for the tool
+/// call it measures.
+///
+/// Claude Code sends two shapes. A heartbeat (every 30 seconds while any tool
+/// runs) has its own `tool_use_id`, `<tool id>-heartbeat-<n>`, which names the
+/// tool. Progress while a command prints output carries the tool's id in
+/// `tool_use_id`. Either way the message's own id is the tool. A
+/// `parent_tool_use_id` is the enclosing call, such as the subagent's Task, and
+/// is never the running tool even when this session announced it, so a message
+/// without its own id is dropped.
+fn tool_progress(native: &ClaudeNativeState, value: &Value) -> Option<TurnEvent> {
+    let own = value.get("tool_use_id").and_then(Value::as_str)?;
+    let id = own.split_once("-heartbeat-").map_or(own, |(tool, _)| tool);
+    if id.is_empty() {
+        return None;
+    }
+    let name = native
+        .tool_names
+        .get(id)
+        .map(String::as_str)
+        .or_else(|| value.get("tool_name").and_then(Value::as_str))
+        .unwrap_or("tool");
+    // Claude Code declares this an integer.
+    let elapsed_seconds = value
+        .get("elapsed_time_seconds")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    Some(TurnEvent::ToolProgress {
+        id: bounded(id),
+        name: bounded(name),
+        elapsed_seconds,
+    })
+}
+
 fn task_id_for(native: &ClaudeNativeState, tool_use_id: Option<&str>) -> Option<String> {
     tool_use_id.map(|id| {
         native
@@ -2656,8 +2852,27 @@ fn task_usage(value: Option<&Value>) -> Option<AgentTaskUsage> {
 fn is_terminal_task_status(status: &str) -> bool {
     matches!(
         status,
-        "completed" | "failed" | "killed" | "stopped" | "ended" | "cancelled" | "interrupted"
+        "completed"
+            | "failed"
+            | "killed"
+            | "stopped"
+            | "ended"
+            | "cancelled"
+            | "interrupted"
+            | "timed_out"
+            | "timeout"
     )
+}
+
+/// Map an explicit provider status to an activity without inferring success
+/// from an unknown status or the absence of a task in a background snapshot.
+fn task_activity_kind(status: &str) -> AgentTaskActivityKind {
+    match status {
+        "completed" => AgentTaskActivityKind::Completed,
+        "failed" | "timed_out" | "timeout" => AgentTaskActivityKind::Failed,
+        "stopped" | "killed" | "cancelled" | "interrupted" => AgentTaskActivityKind::Stopped,
+        _ => AgentTaskActivityKind::Updated,
+    }
 }
 
 /// Finish a turn whose background work just drained after its result.
@@ -2688,7 +2903,38 @@ fn can_track(native: &ClaudeNativeState, task_id: &str) -> bool {
     native.tasks.contains_key(task_id) || native.tasks.len() < MAX_NATIVE_TASKS
 }
 
+/// Reconcile one native task frame into the bounded task registry and events.
+/// Terminal identities cannot be revived by replay; an unknown `ended` outcome
+/// may still be enriched by an explicit terminal receipt arriving later.
 fn translate_system_task(
+    value: &Value,
+    native: &mut ClaudeNativeState,
+    output: &mut AdapterOutput,
+) {
+    let retired = value
+        .get("task_id")
+        .and_then(Value::as_str)
+        .and_then(|id| native.retired_tasks.iter().position(|task| task.id == id));
+    if let Some(index) = retired {
+        let task = native
+            .retired_tasks
+            .remove(index)
+            .expect("known retired task");
+        let id = task.id.clone();
+        native.tasks.insert(id.clone(), task);
+        translate_system_task_frame(value, native, output);
+        let task = native
+            .tasks
+            .remove(&id)
+            .expect("reconciliation preserves identity");
+        native.retired_tasks.insert(index, task);
+    } else {
+        translate_system_task_frame(value, native, output);
+    }
+}
+
+/// Apply a native frame with any retired identity temporarily available for enrichment.
+fn translate_system_task_frame(
     value: &Value,
     native: &mut ClaudeNativeState,
     output: &mut AdapterOutput,
@@ -2745,6 +2991,30 @@ fn translate_system_task(
                     .unwrap_or("Background task"),
             );
             let task_type = value.get("task_type").and_then(Value::as_str);
+            if let Some(known) = native
+                .tasks
+                .get(task_id)
+                .filter(|task| is_terminal_task_status(&task.status))
+                .cloned()
+            {
+                let mut task = known.clone();
+                if task_type.is_some() {
+                    task.kind = task_kind(task_type, agent_type.as_deref());
+                }
+                if task.description == fallback_task(task_id).description
+                    || task.description.is_empty()
+                {
+                    task.description.clone_from(&description);
+                }
+                if task.agent_type.is_none() {
+                    task.agent_type = agent_type;
+                }
+                if task != known {
+                    native.tasks.insert(task_id.to_string(), task);
+                    emit_tasks(native, output);
+                }
+                return;
+            }
             // The Workflow tool's result can arrive first and already record
             // where the run writes its transcripts.
             let known = native.tasks.get(task_id);
@@ -2805,6 +3075,15 @@ fn translate_system_task(
                 .get(task_id)
                 .cloned()
                 .unwrap_or_else(|| fallback_task(task_id));
+            if is_terminal_task_status(&task.status)
+                && !(task.status == "ended"
+                    && patch
+                        .and_then(|patch| patch.get("status"))
+                        .and_then(Value::as_str)
+                        .is_some_and(is_terminal_task_status))
+            {
+                return;
+            }
             let description = patch
                 .and_then(|patch| patch.get("description"))
                 .and_then(Value::as_str)
@@ -2854,7 +3133,9 @@ fn translate_system_task(
             output.events.push(TurnEvent::TaskActivity {
                 activity: AgentTaskActivity {
                     task_id: task_id.to_string(),
-                    kind: AgentTaskActivityKind::Updated,
+                    kind: status
+                        .as_deref()
+                        .map_or(AgentTaskActivityKind::Updated, task_activity_kind),
                     description,
                     status,
                     agent_type,
@@ -3001,12 +3282,21 @@ fn translate_system_task(
                 .get(task_id)
                 .cloned()
                 .unwrap_or_else(|| fallback_task(task_id));
+            let previous = task.clone();
+            let was_terminal = is_terminal_task_status(&task.status);
             let status = bounded(
                 value
                     .get("status")
                     .and_then(Value::as_str)
                     .unwrap_or(&task.status),
             );
+            // An empty background snapshot only says "ended", not why.
+            // The explicit terminal receipt may arrive after that snapshot.
+            let resolves_unknown_end =
+                task.status == "ended" && is_terminal_task_status(&status) && status != "ended";
+            if was_terminal && status != task.status && !resolves_unknown_end {
+                return;
+            }
             let summary = optional_bounded(value.get("summary").and_then(Value::as_str));
             task.status.clone_from(&status);
             if let Some(summary) = &summary {
@@ -3015,14 +3305,26 @@ fn translate_system_task(
             if status == "failed" && task.error.is_none() {
                 task.error.clone_from(&summary);
             }
+            let usage = task_usage(value.get("usage"));
+            let new_usage = usage
+                .as_ref()
+                .is_some_and(|usage| native.task_usage.get(task_id) != Some(usage));
+            if let Some(usage) = &usage {
+                native.task_usage.insert(task_id.to_string(), usage.clone());
+            }
+            if task == previous && was_terminal && !new_usage {
+                return;
+            }
             let agent_type = task.agent_type.clone();
             native.tasks.insert(task_id.to_string(), task);
-            let ended = native.background_task_ids.remove(task_id);
-            background_work_drained(native, output, ended);
-            let kind = match status.as_str() {
-                "failed" => AgentTaskActivityKind::Failed,
-                "stopped" | "killed" => AgentTaskActivityKind::Stopped,
-                _ => AgentTaskActivityKind::Completed,
+            if is_terminal_task_status(&status) {
+                let ended = native.background_task_ids.remove(task_id);
+                background_work_drained(native, output, ended);
+            }
+            let kind = if was_terminal && !resolves_unknown_end {
+                AgentTaskActivityKind::Updated
+            } else {
+                task_activity_kind(&status)
             };
             output.events.push(TurnEvent::TaskActivity {
                 activity: AgentTaskActivity {
@@ -3034,7 +3336,7 @@ fn translate_system_task(
                     summary,
                     last_tool_name: None,
                     spawn_depth: None,
-                    usage: task_usage(value.get("usage")),
+                    usage,
                     workflow_agent: None,
                 },
             });
@@ -3048,6 +3350,16 @@ fn translate_system_task(
                         continue;
                     };
                     if task_id.is_empty() || !can_track(native, task_id) {
+                        continue;
+                    }
+                    if native.retired_tasks.iter().any(|task| task.id == task_id) {
+                        continue;
+                    }
+                    if native
+                        .tasks
+                        .get(task_id)
+                        .is_some_and(|task| is_terminal_task_status(&task.status))
+                    {
                         continue;
                     }
                     live_ids.insert(task_id.to_string());
@@ -3287,6 +3599,17 @@ fn explain_ede_diagnostic(fields: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn input_receipts_never_regress_consumption_or_accept_unknown_states() {
+        assert!(accept_input_receipt("pending", "queued"));
+        assert!(accept_input_receipt("queued", "started"));
+        assert!(accept_input_receipt("started", "completed"));
+        assert!(!accept_input_receipt("started", "queued"));
+        assert!(!accept_input_receipt("completed", "started"));
+        assert!(!accept_input_receipt("cancelled", "completed"));
+        assert!(!accept_input_receipt("pending", "anything"));
+    }
 
     #[test]
     fn account_profiles_usage_never_reads_default_keychain_or_credential_file() {
@@ -4379,6 +4702,106 @@ setTimeout(() => {
         );
     }
 
+    fn progress_events(lines: &[&str]) -> Vec<TurnEvent> {
+        let adapter = Claude::default();
+        let mut state = AdapterState::default();
+        let mut events = Vec::new();
+        for line in lines {
+            let output = adapter.parse_line(line, &mut state).unwrap();
+            events.extend(
+                output
+                    .events
+                    .into_iter()
+                    .filter(|event| matches!(event, TurnEvent::ToolProgress { .. })),
+            );
+        }
+        events
+    }
+
+    const BASH_TOOL_USE: &str = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_bash","name":"Bash","input":{"command":"ls -la ~/Downloads"}}]}}"#;
+
+    #[test]
+    fn reports_a_heartbeat_for_the_running_tool() {
+        // Captured from Claude Code 2.1.310 while a silent Bash command ran.
+        let events = progress_events(&[
+            BASH_TOOL_USE,
+            r#"{"type":"tool_progress","tool_use_id":"toolu_bash-heartbeat-0","tool_name":"Bash","parent_tool_use_id":"toolu_bash","elapsed_time_seconds":30,"heartbeat":true,"session_id":"s","uuid":"u0"}"#,
+            r#"{"type":"tool_progress","tool_use_id":"toolu_bash-heartbeat-1","tool_name":"Bash","parent_tool_use_id":"toolu_bash","elapsed_time_seconds":60,"heartbeat":true,"session_id":"s","uuid":"u1"}"#,
+        ]);
+        assert_eq!(
+            events,
+            vec![
+                TurnEvent::ToolProgress {
+                    id: "toolu_bash".into(),
+                    name: "Bash".into(),
+                    elapsed_seconds: 30,
+                },
+                TurnEvent::ToolProgress {
+                    id: "toolu_bash".into(),
+                    name: "Bash".into(),
+                    elapsed_seconds: 60,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn reports_output_progress_without_taking_a_subagent_for_the_tool() {
+        // Progress for a command a subagent runs names the command in
+        // `tool_use_id` and the subagent's Task call in `parent_tool_use_id`.
+        let events = progress_events(&[
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_task","name":"Task","input":{"description":"explore"}}]}}"#,
+            r#"{"type":"assistant","parent_tool_use_id":"toolu_task","message":{"content":[{"type":"tool_use","id":"toolu_inner","name":"Bash","input":{"command":"cargo test"}}]}}"#,
+            r#"{"type":"tool_progress","tool_use_id":"toolu_inner","tool_name":"Bash","parent_tool_use_id":"toolu_task","elapsed_time_seconds":12,"task_id":"b1","session_id":"s","uuid":"u"}"#,
+        ]);
+        assert_eq!(
+            events,
+            vec![TurnEvent::ToolProgress {
+                id: "toolu_inner".into(),
+                name: "Bash".into(),
+                elapsed_seconds: 12,
+            }]
+        );
+    }
+
+    #[test]
+    fn reports_progress_for_a_tool_it_did_not_see_start() {
+        // A resumed process can report a tool announced before this turn.
+        let events = progress_events(&[
+            r#"{"type":"tool_progress","tool_use_id":"toolu_old-heartbeat-4","tool_name":"Read","parent_tool_use_id":"toolu_old","elapsed_time_seconds":150,"heartbeat":true}"#,
+            r#"{"type":"tool_progress","tool_name":"Bash","elapsed_time_seconds":5}"#,
+        ]);
+        assert_eq!(
+            events,
+            vec![TurnEvent::ToolProgress {
+                id: "toolu_old".into(),
+                name: "Read".into(),
+                elapsed_seconds: 150,
+            }],
+            "a message naming no tool is dropped"
+        );
+    }
+
+    #[test]
+    fn progress_names_the_nested_command_not_its_known_parent_task() {
+        // The nested command was never announced to this session, but its
+        // enclosing Task call was: the Task must not be reported as running.
+        let events = progress_events(&[
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_task","name":"Task","input":{"description":"explore"}}]}}"#,
+            r#"{"type":"tool_progress","tool_use_id":"toolu_nested","tool_name":"Bash","parent_tool_use_id":"toolu_task","elapsed_time_seconds":9}"#,
+            r#"{"type":"tool_progress","tool_name":"Bash","parent_tool_use_id":"toolu_task","elapsed_time_seconds":9}"#,
+        ]);
+        assert_eq!(
+            events,
+            vec![TurnEvent::ToolProgress {
+                id: "toolu_nested".into(),
+                name: "Bash".into(),
+                elapsed_seconds: 9,
+            }],
+            "a message with no id of its own is not attributed to its parent"
+        );
+    }
+
     #[test]
     fn bounds_the_title_description_like_claude_code() {
         let adapter = Claude::default();
@@ -4701,6 +5124,29 @@ setTimeout(() => {
             .events
             .iter()
             .any(|event| matches!(event, TurnEvent::ReplyFinishedWithBackgroundTasks { .. })));
+    }
+
+    #[test]
+    fn live_input_after_native_reply_is_declined_before_writing() {
+        let adapter = Claude::default();
+        let mut state = AdapterState::default();
+        let mut native = ClaudeNativeState {
+            retained_turn: true,
+            result_seen: true,
+            lifecycle_seen: true,
+            ..Default::default()
+        };
+        native
+            .own_commands
+            .insert("original".into(), "completed".into());
+        put_native_state(&mut state, native);
+        assert!(adapter
+            .encode_identified_input(Some("next"), "do not duplicate", &mut state)
+            .unwrap()
+            .is_none());
+        let native = peek_native_state(&state).unwrap();
+        assert!(!native.own_commands.contains_key("next"));
+        assert!(!native.interrupting);
     }
 
     #[test]
@@ -5067,6 +5513,183 @@ setTimeout(() => {
     const FOLLOW_UP_RESULT: &str =
         r#"{"type":"result","subtype":"success","is_error":false,"result":"The build finished."}"#;
 
+    /// Unknown and intermediate notifications preserve ownership of pending work.
+    #[test]
+    fn nonterminal_notification_does_not_finish_background_work() {
+        let adapter = Claude::default();
+        for status in ["running", "queued", "unknown"] {
+            let mut state = retained_state(&adapter);
+            adapter.parse_line(BACKGROUND_STARTED, &mut state).unwrap();
+            adapter.parse_line(PARENT_RESULT, &mut state).unwrap();
+            let line = format!(
+                r#"{{"type":"system","subtype":"task_notification","task_id":"agent-bg-1","status":"{status}"}}"#
+            );
+            let output = adapter.parse_line(&line, &mut state).unwrap();
+            assert!(adapter.retained_completion_grace(&state).is_none());
+            assert!(output.events.iter().any(|event| matches!(event,
+                TurnEvent::TaskActivity { activity } if activity.kind == AgentTaskActivityKind::Updated
+            )));
+        }
+    }
+
+    /// Replayed start, patch, and snapshot frames never reopen a finished task.
+    #[test]
+    fn completed_task_is_not_revived_by_late_start_or_update() {
+        let adapter = Claude::default();
+        let mut state = retained_state(&adapter);
+        for line in [
+            BACKGROUND_STARTED,
+            BACKGROUND_FINISHED,
+            BACKGROUND_STARTED,
+            r#"{"type":"system","subtype":"task_updated","task_id":"agent-bg-1","patch":{"status":"running","is_backgrounded":true}}"#,
+            r#"{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"agent-bg-1","task_type":"local_agent"}]}"#,
+        ] {
+            adapter.parse_line(line, &mut state).unwrap();
+        }
+        let result = adapter.parse_line(PARENT_RESULT, &mut state).unwrap();
+        assert!(!result
+            .events
+            .iter()
+            .any(|event| matches!(event, TurnEvent::ReplyFinishedWithBackgroundTasks { .. })));
+    }
+
+    /// Each terminal notification retains its outcome and emits at most once.
+    #[test]
+    fn task_notifications_preserve_outcomes_and_ignore_duplicates() {
+        let adapter = Claude::default();
+        for (status, kind) in [
+            ("completed", AgentTaskActivityKind::Completed),
+            ("failed", AgentTaskActivityKind::Failed),
+            ("timed_out", AgentTaskActivityKind::Failed),
+            ("cancelled", AgentTaskActivityKind::Stopped),
+            ("interrupted", AgentTaskActivityKind::Stopped),
+            ("ended", AgentTaskActivityKind::Updated),
+        ] {
+            let mut state = retained_state(&adapter);
+            adapter.parse_line(BACKGROUND_STARTED, &mut state).unwrap();
+            let line = format!(
+                r#"{{"type":"system","subtype":"task_notification","task_id":"agent-bg-1","status":"{status}","summary":"Watcher ended; readiness not established"}}"#
+            );
+            let output = adapter.parse_line(&line, &mut state).unwrap();
+            assert!(output.events.iter().any(|event| matches!(event,
+                TurnEvent::TaskActivity { activity } if activity.kind == kind && activity.status.as_deref() == Some(status)
+            )));
+            let duplicate = adapter.parse_line(&line, &mut state).unwrap();
+            assert_eq!(duplicate.events, Vec::new());
+        }
+    }
+
+    /// A terminal patch emits the outcome even when its notification adds nothing.
+    #[test]
+    fn terminal_patch_emits_the_outcome_once_before_its_notification() {
+        let adapter = Claude::default();
+        for status in ["failed", "completed", "timed_out", "cancelled"] {
+            let mut state = retained_state(&adapter);
+            adapter.parse_line(BACKGROUND_STARTED, &mut state).unwrap();
+            let patch = format!(
+                r#"{{"type":"system","subtype":"task_updated","task_id":"agent-bg-1","patch":{{"status":"{status}"}}}}"#
+            );
+            let output = adapter.parse_line(&patch, &mut state).unwrap();
+            let kind = task_activity_kind(status);
+            assert_eq!(
+                output
+                    .events
+                    .iter()
+                    .filter(|event| matches!(event,
+                        TurnEvent::TaskActivity { activity } if activity.kind == kind
+                    ))
+                    .count(),
+                1
+            );
+            let notification = format!(
+                r#"{{"type":"system","subtype":"task_notification","task_id":"agent-bg-1","status":"{status}"}}"#
+            );
+            assert_eq!(
+                adapter
+                    .parse_line(&notification, &mut state)
+                    .unwrap()
+                    .events,
+                Vec::new()
+            );
+        }
+    }
+
+    /// Completed work cannot return after a retained process changes turns.
+    #[test]
+    fn terminal_identity_survives_handoff_without_filling_live_tasks() {
+        let adapter = Claude::default();
+        let mut previous = retained_state(&adapter);
+        for line in [
+            BACKGROUND_STARTED,
+            BACKGROUND_FINISHED,
+            r#"{"type":"system","subtype":"task_started","task_id":"still-live","task_type":"local_agent","is_backgrounded":true}"#,
+            PARENT_RESULT,
+        ] {
+            adapter.parse_line(line, &mut previous).unwrap();
+        }
+        let mut next = retained_state(&adapter);
+        adapter.inherit_retained_handoff(previous, &mut next);
+        adapter.parse_line(BACKGROUND_STARTED, &mut next).unwrap();
+        adapter.parse_line(r#"{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"agent-bg-1","task_type":"local_agent"},{"task_id":"still-live","task_type":"local_agent"}]}"#, &mut next).unwrap();
+        let native = peek_native_state(&next).unwrap();
+        assert_eq!(
+            native.background_task_ids,
+            BTreeSet::from(["still-live".into()])
+        );
+        assert_eq!(native.tasks.len(), 1);
+        assert_eq!(
+            adapter
+                .parse_line(BACKGROUND_FINISHED, &mut next)
+                .unwrap()
+                .events,
+            Vec::new()
+        );
+        adapter.parse_line(r#"{"type":"system","subtype":"task_notification","task_id":"still-live","status":"completed"}"#, &mut next).unwrap();
+        let result = adapter.parse_line(PARENT_RESULT, &mut next).unwrap();
+        assert!(!result
+            .events
+            .iter()
+            .any(|event| matches!(event, TurnEvent::ReplyFinishedWithBackgroundTasks { .. })));
+    }
+
+    /// A receipt may precede its first start; metadata still belongs to that task.
+    #[test]
+    fn late_start_enriches_terminal_task_without_reviving_it() {
+        let adapter = Claude::default();
+        let mut state = retained_state(&adapter);
+        adapter.parse_line(BACKGROUND_FINISHED, &mut state).unwrap();
+        adapter.parse_line(BACKGROUND_STARTED, &mut state).unwrap();
+        let native = peek_native_state(&state).unwrap();
+        let task = &native.tasks["agent-bg-1"];
+        assert_eq!(task.status, "completed");
+        assert_eq!(task.kind, "subagent");
+        assert_eq!(task.description, "Wait for the build");
+        assert_eq!(
+            native
+                .tool_use_to_task
+                .get("toolu_agent")
+                .map(String::as_str),
+            Some("agent-bg-1")
+        );
+        assert_eq!(native.background_task_ids, BTreeSet::new());
+    }
+
+    /// Usage arriving after the outcome is an enrichment, never a second completion.
+    #[test]
+    fn terminal_usage_is_reported_once_after_a_patch() {
+        let adapter = Claude::default();
+        let mut state = retained_state(&adapter);
+        adapter.parse_line(BACKGROUND_STARTED, &mut state).unwrap();
+        adapter.parse_line(r#"{"type":"system","subtype":"task_updated","task_id":"agent-bg-1","patch":{"status":"completed"}}"#, &mut state).unwrap();
+        let receipt = r#"{"type":"system","subtype":"task_notification","task_id":"agent-bg-1","status":"completed","usage":{"total_tokens":42,"tool_uses":2,"duration_ms":300}}"#;
+        let result = adapter.parse_line(receipt, &mut state).unwrap();
+        assert!(result.events.iter().any(|event| matches!(event, TurnEvent::TaskActivity { activity } if activity.kind == AgentTaskActivityKind::Updated && activity.usage.as_ref().is_some_and(|usage| usage.total_tokens == 42))));
+        assert_eq!(
+            adapter.parse_line(receipt, &mut state).unwrap().events,
+            Vec::new()
+        );
+    }
+
     fn retained_state(adapter: &Claude) -> AdapterState {
         let mut state = AdapterState::default();
         adapter.mark_retained_turn(&mut state);
@@ -5294,7 +5917,7 @@ setTimeout(() => {
         }
         // A long-running subagent keeps every turn open while each turn
         // starts and finishes another one, then hands off.
-        for turn in 0..(MAX_NATIVE_TASKS * 2) {
+        for turn in 0..(MAX_RETIRED_TASKS * 2) {
             let mut next = retained_state(&adapter);
             adapter.inherit_retained_handoff(state, &mut next);
             state = next;
@@ -5341,6 +5964,8 @@ setTimeout(() => {
             adapter.parse_line(PARENT_RESULT, &mut state).unwrap();
         }
         let native = peek_native_state(&state).unwrap();
+        assert!(native.retired_tasks.len() <= MAX_RETIRED_TASKS);
+        assert!(native.task_usage.len() <= MAX_RETIRED_TASKS + MAX_NATIVE_TASKS);
         assert!(native.tasks.len() <= 2, "{:?}", native.tasks.keys());
         assert!(native.tool_use_to_task.len() <= 2);
         assert!(
@@ -5705,6 +6330,224 @@ setTimeout(() => {
     }
 
     #[test]
+    fn read_now_retains_injected_messages_exactly_once() {
+        for background in [false, true] {
+            let adapter = Claude::default();
+            let (mut state, prompt) = retained_turn_with_prompt(&adapter);
+            adapter
+                .parse_line(&lifecycle(&prompt, "started"), &mut state)
+                .unwrap();
+            for id in ["message-one", "message-two"] {
+                let frame = adapter
+                    .encode_identified_input(Some(id), id, &mut state)
+                    .unwrap()
+                    .unwrap();
+                let frame: Value = serde_json::from_slice(&frame).unwrap();
+                assert_eq!(frame["uuid"], id);
+                adapter
+                    .parse_line(&lifecycle(id, "queued"), &mut state)
+                    .unwrap();
+            }
+            let control = adapter
+                .encode_input_control("message-one", background, &mut state)
+                .unwrap()
+                .unwrap();
+            let control: Value = serde_json::from_slice(&control).unwrap();
+            assert_eq!(control["type"], "control_request");
+            assert!(
+                control.get("message").is_none(),
+                "never sends the text a second time"
+            );
+            assert_eq!(
+                control["request"]["subtype"],
+                if background {
+                    "background_tasks"
+                } else {
+                    "interrupt"
+                }
+            );
+            if !background {
+                assert_eq!(control["request"]["cancel_queued"], false);
+            }
+            adapter.parse_line(&json!({"type":"control_response","response":{"subtype":"success","request_id":control["request_id"]}}).to_string(), &mut state).unwrap();
+            assert!(!peek_native_state(&state).unwrap().interrupting);
+            if !background {
+                adapter
+                    .parse_line(
+                        r#"{"type":"result","is_error":true,"errors":["interrupted"]}"#,
+                        &mut state,
+                    )
+                    .unwrap();
+                assert!(state.terminal_failure.is_none());
+            }
+            adapter
+                .parse_line(&lifecycle(&prompt, "cancelled"), &mut state)
+                .unwrap();
+            for id in ["message-one", "message-two"] {
+                let output = adapter
+                    .parse_line(&lifecycle(id, "started"), &mut state)
+                    .unwrap();
+                assert!(
+                    output.writes.is_empty(),
+                    "injected messages are not interrupted or replayed"
+                );
+                assert!(
+                    adapter
+                        .encode_input_control(id, false, &mut state)
+                        .unwrap()
+                        .is_none(),
+                    "read messages cannot interrupt later work"
+                );
+                adapter
+                    .parse_line(&lifecycle(id, "completed"), &mut state)
+                    .unwrap();
+            }
+            assert_eq!(peek_native_state(&state).unwrap().own_commands.len(), 3);
+        }
+    }
+
+    #[test]
+    fn background_ack_with_false_result_is_actionable_refusal_without_stop() {
+        let adapter = Claude::default();
+        let (mut state, prompt) = retained_turn_with_prompt(&adapter);
+        adapter
+            .parse_line(&lifecycle(&prompt, "started"), &mut state)
+            .unwrap();
+        adapter
+            .encode_identified_input(Some("original"), "fixture", &mut state)
+            .unwrap();
+        let control: Value = serde_json::from_slice(
+            &adapter
+                .encode_input_control("original", true, &mut state)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        let output = adapter.parse_line(&json!({"type":"control_response","response":{"subtype":"success","request_id":control["request_id"],"response":{"backgrounded":false}}}).to_string(), &mut state).unwrap();
+        assert_eq!(output.writes, Vec::<Vec<u8>>::new());
+        assert!(
+            matches!(output.events.last(), Some(TurnEvent::InputControl {background:true,succeeded:false,message,..}) if message.contains("no eligible foreground task"))
+        );
+        assert!(!peek_native_state(&state).unwrap().read_now_interrupt);
+    }
+
+    #[test]
+    fn duplicate_identified_input_preserves_consumed_state() {
+        let adapter = Claude::default();
+        let (mut state, prompt) = retained_turn_with_prompt(&adapter);
+        adapter
+            .parse_line(&lifecycle(&prompt, "started"), &mut state)
+            .unwrap();
+        assert!(adapter
+            .encode_identified_input(Some(&prompt), "duplicate prompt", &mut state)
+            .is_err());
+        adapter
+            .encode_identified_input(Some("same"), "first", &mut state)
+            .unwrap();
+        adapter
+            .parse_line(&lifecycle("same", "started"), &mut state)
+            .unwrap();
+        assert!(adapter
+            .encode_identified_input(Some("same"), "retry", &mut state)
+            .is_err());
+        assert_eq!(
+            peek_native_state(&state).unwrap().own_commands["same"],
+            "started"
+        );
+    }
+
+    #[test]
+    fn interrupt_request_does_not_mask_provider_failure() {
+        let adapter = Claude::default();
+        let (mut state, prompt) = retained_turn_with_prompt(&adapter);
+        adapter
+            .parse_line(&lifecycle(&prompt, "started"), &mut state)
+            .unwrap();
+        adapter
+            .encode_identified_input(Some("waiting"), "next", &mut state)
+            .unwrap();
+        adapter
+            .encode_input_control("waiting", false, &mut state)
+            .unwrap();
+        adapter
+            .parse_line(
+                &json!({"type":"result","is_error":true,"result":"authentication failed"})
+                    .to_string(),
+                &mut state,
+            )
+            .unwrap();
+        assert!(state.terminal_failure.is_some());
+    }
+
+    #[test]
+    fn late_background_refusal_does_not_clear_explicit_foreground_stop() {
+        let adapter = Claude::default();
+        let (mut state, prompt) = retained_turn_with_prompt(&adapter);
+        adapter
+            .parse_line(&lifecycle(&prompt, "started"), &mut state)
+            .unwrap();
+        adapter
+            .encode_identified_input(Some("original"), "fixture", &mut state)
+            .unwrap();
+        let background: Value = serde_json::from_slice(
+            &adapter
+                .encode_input_control("original", true, &mut state)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        let stop: Value = serde_json::from_slice(
+            &adapter
+                .encode_input_control("original", false, &mut state)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_ne!(background["request_id"], stop["request_id"]);
+        let output = adapter.parse_line(&json!({"type":"control_response","response":{"subtype":"error","request_id":background["request_id"],"error":"late refusal"}}).to_string(), &mut state).unwrap();
+        assert!(peek_native_state(&state).unwrap().read_now_interrupt);
+        assert!(matches!(
+            output.events.last(),
+            Some(TurnEvent::InputControl {
+                background: true,
+                succeeded: false,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn read_now_refusal_is_reported_and_never_falls_back_to_stop() {
+        let adapter = Claude::default();
+        let (mut state, prompt) = retained_turn_with_prompt(&adapter);
+        adapter
+            .parse_line(&lifecycle(&prompt, "started"), &mut state)
+            .unwrap();
+        adapter
+            .encode_identified_input(Some("waiting"), "text", &mut state)
+            .unwrap();
+        let control = adapter
+            .encode_input_control("waiting", true, &mut state)
+            .unwrap()
+            .unwrap();
+        let control: Value = serde_json::from_slice(&control).unwrap();
+        let output = adapter.parse_line(&json!({"type":"control_response","response":{"subtype":"error","request_id":control["request_id"],"error":"unsupported"}}).to_string(),&mut state).unwrap();
+        assert_eq!(output.writes, Vec::<Vec<u8>>::new());
+        assert!(output.events.iter().any(|e| matches!(
+            e,
+            TurnEvent::InputControl {
+                succeeded: false,
+                ..
+            }
+        )));
+        assert!(!peek_native_state(&state).unwrap().interrupting);
+        assert!(adapter
+            .encode_input_control("missing", false, &mut state)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
     fn message_uuids_are_unique_version_four_uuids() {
         let first = new_message_uuid();
         assert_ne!(first, new_message_uuid());
@@ -5770,13 +6613,18 @@ setTimeout(() => {
             lifecycle(&prompt, "queued"),
             lifecycle(&prompt, "started"),
             PARENT_RESULT.to_string(),
-            lifecycle(&prompt, "completed"),
         ] {
             adapter.parse_line(&line, &mut state).unwrap();
         }
         // Written, but Claude has not reported it yet when another result
         // (for example its answer to a finished task) arrives.
-        adapter.encode_user_message("next", &mut state).unwrap();
+        assert!(adapter
+            .encode_user_message("next", &mut state)
+            .unwrap()
+            .is_some());
+        adapter
+            .parse_line(&lifecycle(&prompt, "completed"), &mut state)
+            .unwrap();
         assert!(
             !adapter
                 .parse_line(PARENT_RESULT, &mut state)
