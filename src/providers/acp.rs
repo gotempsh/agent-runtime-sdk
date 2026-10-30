@@ -2472,7 +2472,7 @@ mod tests {
             adapter.classify_idle_frame(&notice),
             crate::adapter::IdleFrame::Background
         );
-        assert!(adapter.idle_frame_writes(&notice).is_empty());
+        assert_eq!(adapter.idle_frame_writes(&notice), Vec::<Vec<u8>>::new());
         let permission =
             json!({"jsonrpc":"2.0","id":"p","method":"session/request_permission","params":{}})
                 .to_string();
@@ -2489,10 +2489,10 @@ mod tests {
         assert_eq!(options[0].id, "choose-model");
         assert_eq!(options[0].options[0].value, "vendor/a");
         assert_eq!(options[1].category.as_deref(), Some("mode"));
-        assert!(session_config_options(&json!({})).is_empty());
-        assert!(
-            session_config_options(&json!({"configOptions":[{"id":"bad","type":"unknown"}]}))
-                .is_empty()
+        assert_eq!(session_config_options(&json!({})), Vec::new());
+        assert_eq!(
+            session_config_options(&json!({"configOptions":[{"id":"bad","type":"unknown"}]})),
+            Vec::new()
         );
     }
 
