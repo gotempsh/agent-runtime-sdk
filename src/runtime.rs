@@ -29,6 +29,9 @@ use crate::{
 
 const DEFAULT_MAX_PROMPT_BYTES: usize = 256 * 1024;
 const DEFAULT_MAX_EVENT_LINE_BYTES: usize = 2 * 1024 * 1024;
+// Codex repeats complete MCP arguments/results in one JSON record (including
+// file contents). Keep complete protocol records, with a finite transport cap.
+const DEFAULT_CODEX_MAX_EVENT_LINE_BYTES: usize = 32 * 1024 * 1024;
 const STDERR_TAIL_BYTES: usize = 32 * 1024;
 /// How long a finished process's stderr may stay open before the reader is
 /// stopped. A descendant that outlived the process can hold the pipe, and the
@@ -1107,6 +1110,7 @@ where
             bytes.extend_from_slice(chunk);
             let prefix = frame_prefix(&bytes);
             if !accept_oversized(&prefix) {
+                eprintln!("agent-runtime: protocol frame rejected: limit_bytes={limit}, observed_at_least_bytes={}; payload omitted", bytes.len());
                 return Ok(Some(ProviderFrame::Rejected));
             }
             let mut tail = Vec::new();
@@ -2170,6 +2174,7 @@ pub struct AgentRuntimeBuilder {
     concurrency_limit: usize,
     max_prompt_bytes: usize,
     max_event_line_bytes: usize,
+    codex_max_event_line_bytes: usize,
     startup_observer: Option<Arc<StartupObserverState>>,
     codex_process_retention: Option<CodexProcessRetention>,
     provider_process_retention: Option<ProviderProcessRetention>,
@@ -2185,6 +2190,7 @@ impl AgentRuntimeBuilder {
             concurrency_limit: 2,
             max_prompt_bytes: DEFAULT_MAX_PROMPT_BYTES,
             max_event_line_bytes: DEFAULT_MAX_EVENT_LINE_BYTES,
+            codex_max_event_line_bytes: DEFAULT_CODEX_MAX_EVENT_LINE_BYTES,
             startup_observer: None,
             codex_process_retention: None,
             provider_process_retention: None,
@@ -2233,6 +2239,7 @@ impl AgentRuntimeBuilder {
     /// Limit one provider NDJSON record.
     pub fn max_event_line_bytes(mut self, limit: usize) -> Self {
         self.max_event_line_bytes = limit;
+        self.codex_max_event_line_bytes = limit;
         self
     }
 
@@ -2298,6 +2305,7 @@ impl AgentRuntimeBuilder {
             permits: Arc::new(Semaphore::new(self.concurrency_limit)),
             max_prompt_bytes: self.max_prompt_bytes,
             max_event_line_bytes: self.max_event_line_bytes,
+            codex_max_event_line_bytes: self.codex_max_event_line_bytes,
             startup_observer: self.startup_observer,
             codex_process_retention: retention.map(CodexProcessSupervisor::new),
             provider_process_retention: self.provider_process_retention,
@@ -2641,12 +2649,21 @@ pub struct AgentRuntime {
     permits: Arc<Semaphore>,
     max_prompt_bytes: usize,
     max_event_line_bytes: usize,
+    codex_max_event_line_bytes: usize,
     startup_observer: Option<Arc<StartupObserverState>>,
     codex_process_retention: Option<CodexProcessSupervisor>,
     provider_process_retention: Option<ProviderProcessRetention>,
 }
 
 impl AgentRuntime {
+    fn event_line_limit(&self, provider: Provider) -> usize {
+        if provider == Provider::Codex {
+            self.codex_max_event_line_bytes
+        } else {
+            self.max_event_line_bytes
+        }
+    }
+
     /// Create a runtime builder.
     pub fn builder() -> AgentRuntimeBuilder {
         AgentRuntimeBuilder::new()
@@ -5033,7 +5050,7 @@ impl AgentRuntime {
                         &candidate,
                         generation,
                         requests,
-                        self.max_event_line_bytes,
+                        self.event_line_limit(provider),
                     )
                     .await;
                     match switched {
@@ -5056,7 +5073,7 @@ impl AgentRuntime {
                                     generation,
                                     provider,
                                     supervisor.inner.config.idle_timeout,
-                                    self.max_event_line_bytes,
+                                    self.event_line_limit(provider),
                                 ));
                                 return Err(RuntimeError::RestartWouldStopBackgroundWork {
                                     provider,
@@ -5149,13 +5166,18 @@ impl AgentRuntime {
                                 "health probe",
                             )
                             .await?;
-                            read_bounded_retained_line(&mut io.reader, self.max_event_line_bytes)
-                                .await
-                                .map_err(|source| RuntimeError::ProcessIo {
+                            read_bounded_retained_line(
+                                &mut io.reader,
+                                self.event_line_limit(provider),
+                            )
+                            .await
+                            .map_err(|source| {
+                                RuntimeError::ProcessIo {
                                     provider,
                                     stream: "stdout read",
                                     source,
-                                })
+                                }
+                            })
                         };
                         tokio::time::timeout(health_timeout, exchange)
                             .await
@@ -5242,18 +5264,20 @@ impl AgentRuntime {
                     let mut reader = BufReader::new(streams.reader);
                     let mut pending_events = Vec::new();
                     loop {
-                        let line =
-                            read_bounded_retained_line(&mut reader, self.max_event_line_bytes)
-                                .await
-                                .map_err(|source| RuntimeError::ProcessIo {
-                                    provider,
-                                    stream: "HTTP bridge read",
-                                    source,
-                                })?
-                                .ok_or_else(|| RuntimeError::Protocol {
-                                    provider,
-                                    message: "OpenCode's pre-prompt bridge closed".to_string(),
-                                })?;
+                        let line = read_bounded_retained_line(
+                            &mut reader,
+                            self.event_line_limit(provider),
+                        )
+                        .await
+                        .map_err(|source| RuntimeError::ProcessIo {
+                            provider,
+                            stream: "HTTP bridge read",
+                            source,
+                        })?
+                        .ok_or_else(|| RuntimeError::Protocol {
+                            provider,
+                            message: "OpenCode's pre-prompt bridge closed".to_string(),
+                        })?;
                         let kind = serde_json::from_str::<serde_json::Value>(&line)
                             .ok()
                             .and_then(|frame| {
@@ -5721,7 +5745,7 @@ impl AgentRuntime {
                 generation,
                 provider,
                 idle_timeout,
-                self.max_event_line_bytes,
+                self.event_line_limit(provider),
             ));
         }
     }
@@ -5753,7 +5777,7 @@ impl AgentRuntime {
             generation,
             provider,
             idle_timeout,
-            self.max_event_line_bytes,
+            self.event_line_limit(provider),
         ));
     }
 
@@ -5939,10 +5963,11 @@ impl AgentRuntime {
                 // Finish a frame that has begun even if the turn is cancelled
                 // meanwhile: abandoning the read would lose its consumed prefix
                 // and corrupt the stream an interrupted process still owns.
-                let read =
-                    read_provider_frame(&mut io.reader, self.max_event_line_bytes, |prefix| {
-                        adapter.accepts_oversized_frame(prefix)
-                    });
+                let read = read_provider_frame(
+                    &mut io.reader,
+                    self.event_line_limit(provider),
+                    |prefix| adapter.accepts_oversized_frame(prefix),
+                );
                 tokio::pin!(read);
                 let mut frame_deadline = deadline;
                 let mut cancel_seen = false;
@@ -5985,7 +6010,7 @@ impl AgentRuntime {
                 trace.record(StartupStage::FirstOutput);
             }
             let output = match frame {
-                ProviderFrame::Line(line) if line.len() <= self.max_event_line_bytes => {
+                ProviderFrame::Line(line) if line.len() <= self.event_line_limit(provider) => {
                     adapter.parse_line(&line, &mut state)?
                 }
                 ProviderFrame::Oversized { prefix, suffix } => adapter
@@ -5993,7 +6018,7 @@ impl AgentRuntime {
                 ProviderFrame::Line(_) | ProviderFrame::Rejected => {
                     return Err(RuntimeError::Protocol {
                         provider,
-                        message: format!("event line exceeded {} bytes", self.max_event_line_bytes),
+                        message: format!("event line exceeded the {} byte safety limit. The provider may already have completed external actions. Check their outcome before continuing; do not repeat a push, publish, or pull-request creation blindly.", self.event_line_limit(provider)),
                     });
                 }
             };
@@ -6178,7 +6203,7 @@ impl AgentRuntime {
         if !delivered || adapter.retained_interrupt_settled(&state).is_none() {
             return Err(RuntimeError::Cancelled { provider });
         }
-        let max_event_line_bytes = self.max_event_line_bytes;
+        let max_event_line_bytes = self.event_line_limit(provider);
         let settled = tokio::time::timeout(INTERRUPT_SETTLE_TIMEOUT, async {
             while adapter.retained_interrupt_settled(&state) != Some(true) {
                 let Ok(Some(line)) =
@@ -6404,7 +6429,7 @@ impl AgentRuntime {
                     stderr_task.abort();
                     return Err(error);
                 }
-                frame = read_provider_frame(&mut reader, self.max_event_line_bytes, |prefix| adapter.accepts_oversized_frame(prefix)) => frame.map_err(|source| RuntimeError::ProcessIo {
+                frame = read_provider_frame(&mut reader, self.event_line_limit(provider), |prefix| adapter.accepts_oversized_frame(prefix)) => frame.map_err(|source| RuntimeError::ProcessIo {
                     provider,
                     stream: "stdout read",
                     source,
@@ -6424,7 +6449,7 @@ impl AgentRuntime {
                     stderr_task.abort();
                     return Err(RuntimeError::Protocol {
                         provider,
-                        message: format!("event line exceeded {} bytes", self.max_event_line_bytes),
+                        message: format!("event line exceeded the {} byte safety limit. The provider may already have completed external actions. Check their outcome before continuing; do not repeat a push, publish, or pull-request creation blindly.", self.event_line_limit(provider)),
                     });
                 }
             };
@@ -7969,6 +7994,88 @@ mod tests {
         reader.read_to_string(&mut written).await.unwrap();
         assert!(written.contains("queued"), "{written}");
         assert!(!written.contains("withdrawn"), "{written}");
+    }
+
+    #[tokio::test]
+    async fn codex_large_mcp_frames_remain_complete_and_aligned() {
+        let runtime = AgentRuntimeBuilder::new().build().unwrap();
+        assert_eq!(
+            runtime.event_line_limit(Provider::Claude),
+            DEFAULT_MAX_EVENT_LINE_BYTES
+        );
+        let explicit = AgentRuntimeBuilder::new()
+            .max_event_line_bytes(1024)
+            .build()
+            .unwrap();
+        assert_eq!(explicit.event_line_limit(Provider::Codex), 1024);
+        for frame in [
+            serde_json::json!({"type":"item.started","item":{"type":"mcp_tool_call","id":"call","server":"github","tool":"push_files","arguments":{"contents":"x".repeat(3*1024*1024)},"status":"in_progress"}}),
+            serde_json::json!({"method":"item/started","params":{"threadId":"thread","turnId":"turn","item":{"type":"mcpToolCall","id":"call","server":"github","tool":"push_files","arguments":{"contents":"x".repeat(3*1024*1024)},"status":"inProgress"}}}),
+        ] {
+            let input = format!("{frame}\n{{\"type\":\"next\"}}\n");
+            let mut reader = BufReader::new(input.as_bytes());
+            let first = read_provider_frame(
+                &mut reader,
+                runtime.event_line_limit(Provider::Codex),
+                |_| false,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let ProviderFrame::Line(line) = first else {
+                panic!("legitimate MCP frame rejected")
+            };
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&line).unwrap(),
+                frame
+            );
+            if frame.get("type").is_some() {
+                if let Some(adapter) = runtime.adapters.get(&Provider::Codex) {
+                    let output = adapter
+                        .parse_line(&line, &mut AdapterState::default())
+                        .unwrap();
+                    assert!(output.events.iter().any(|event| matches!(event,TurnEvent::ToolCall { id:Some(id), .. } if id=="call")));
+                    assert!(adapter
+                        .parse_line("{", &mut AdapterState::default())
+                        .is_err());
+                }
+            }
+            assert_eq!(
+                read_provider_frame(
+                    &mut reader,
+                    runtime.event_line_limit(Provider::Codex),
+                    |_| false
+                )
+                .await
+                .unwrap(),
+                Some(ProviderFrame::Line("{\"type\":\"next\"}".into()))
+            );
+            let mut small = BufReader::new(input.as_bytes());
+            assert_eq!(
+                read_provider_frame(&mut small, DEFAULT_MAX_EVENT_LINE_BYTES, |_| false)
+                    .await
+                    .unwrap(),
+                Some(ProviderFrame::Rejected)
+            );
+        }
+        let oversized = "x".repeat(DEFAULT_CODEX_MAX_EVENT_LINE_BYTES + 3);
+        assert_eq!(
+            read_provider_frame(
+                &mut BufReader::new(oversized.as_bytes()),
+                DEFAULT_CODEX_MAX_EVENT_LINE_BYTES,
+                |_| false
+            )
+            .await
+            .unwrap(),
+            Some(ProviderFrame::Rejected)
+        );
+        assert!(read_provider_frame(
+            &mut BufReader::new(&b"\xff\n"[..]),
+            DEFAULT_CODEX_MAX_EVENT_LINE_BYTES,
+            |_| false
+        )
+        .await
+        .is_err());
     }
 
     /// Read every frame, accepting all oversized ones.

@@ -2067,6 +2067,11 @@ impl AgentAdapter for Claude {
                     _ => {}
                 }
             }
+            "tool_progress" => {
+                if let Some(progress) = tool_progress(&native, &value) {
+                    output.events.push(progress);
+                }
+            }
             "rate_limit_event" => {
                 if let Some(usage) = claude_account_usage(&value) {
                     output.events.push(TurnEvent::AccountUsageUpdated { usage });
@@ -2526,6 +2531,44 @@ fn record_subagent_model(
     }
     task.model = Some(bounded(model));
     true
+}
+
+/// A `tool_progress` message as a [`TurnEvent::ToolProgress`] for the tool
+/// call it measures.
+///
+/// Claude Code sends two shapes. A heartbeat (every 30 seconds while any tool
+/// runs) has its own `tool_use_id`, `<tool id>-heartbeat-<n>`, and the tool's
+/// id in `parent_tool_use_id`. Progress while a command prints output carries
+/// the tool's id in `tool_use_id`. The first candidate that names a tool this
+/// session announced wins, so a subagent's `parent_tool_use_id` (its Task
+/// call) is never mistaken for the running tool.
+fn tool_progress(native: &ClaudeNativeState, value: &Value) -> Option<TurnEvent> {
+    let own = value.get("tool_use_id").and_then(Value::as_str);
+    let stripped = own.map(|id| id.split_once("-heartbeat-").map_or(id, |(tool, _)| tool));
+    let parent = value.get("parent_tool_use_id").and_then(Value::as_str);
+    let candidates = [stripped, own, parent];
+    let id = candidates
+        .iter()
+        .flatten()
+        .find(|id| native.tool_names.contains_key(**id))
+        .or(stripped.as_ref())
+        .filter(|id| !id.is_empty())?;
+    let name = native
+        .tool_names
+        .get(*id)
+        .map(String::as_str)
+        .or_else(|| value.get("tool_name").and_then(Value::as_str))
+        .unwrap_or("tool");
+    // Claude Code declares this an integer.
+    let elapsed_seconds = value
+        .get("elapsed_time_seconds")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    Some(TurnEvent::ToolProgress {
+        id: bounded(id),
+        name: bounded(name),
+        elapsed_seconds,
+    })
 }
 
 fn task_id_for(native: &ClaudeNativeState, tool_use_id: Option<&str>) -> Option<String> {
@@ -4660,6 +4703,86 @@ setTimeout(() => {
             later.optional_writes.len(),
             0,
             "the title is requested once per turn"
+        );
+    }
+
+    fn progress_events(lines: &[&str]) -> Vec<TurnEvent> {
+        let adapter = Claude::default();
+        let mut state = AdapterState::default();
+        let mut events = Vec::new();
+        for line in lines {
+            let output = adapter.parse_line(line, &mut state).unwrap();
+            events.extend(
+                output
+                    .events
+                    .into_iter()
+                    .filter(|event| matches!(event, TurnEvent::ToolProgress { .. })),
+            );
+        }
+        events
+    }
+
+    const BASH_TOOL_USE: &str = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_bash","name":"Bash","input":{"command":"ls -la ~/Downloads"}}]}}"#;
+
+    #[test]
+    fn reports_a_heartbeat_for_the_running_tool() {
+        // Captured from Claude Code 2.1.310 while a silent Bash command ran.
+        let events = progress_events(&[
+            BASH_TOOL_USE,
+            r#"{"type":"tool_progress","tool_use_id":"toolu_bash-heartbeat-0","tool_name":"Bash","parent_tool_use_id":"toolu_bash","elapsed_time_seconds":30,"heartbeat":true,"session_id":"s","uuid":"u0"}"#,
+            r#"{"type":"tool_progress","tool_use_id":"toolu_bash-heartbeat-1","tool_name":"Bash","parent_tool_use_id":"toolu_bash","elapsed_time_seconds":60,"heartbeat":true,"session_id":"s","uuid":"u1"}"#,
+        ]);
+        assert_eq!(
+            events,
+            vec![
+                TurnEvent::ToolProgress {
+                    id: "toolu_bash".into(),
+                    name: "Bash".into(),
+                    elapsed_seconds: 30,
+                },
+                TurnEvent::ToolProgress {
+                    id: "toolu_bash".into(),
+                    name: "Bash".into(),
+                    elapsed_seconds: 60,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn reports_output_progress_without_taking_a_subagent_for_the_tool() {
+        // Progress for a command a subagent runs names the command in
+        // `tool_use_id` and the subagent's Task call in `parent_tool_use_id`.
+        let events = progress_events(&[
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_task","name":"Task","input":{"description":"explore"}}]}}"#,
+            r#"{"type":"assistant","parent_tool_use_id":"toolu_task","message":{"content":[{"type":"tool_use","id":"toolu_inner","name":"Bash","input":{"command":"cargo test"}}]}}"#,
+            r#"{"type":"tool_progress","tool_use_id":"toolu_inner","tool_name":"Bash","parent_tool_use_id":"toolu_task","elapsed_time_seconds":12,"task_id":"b1","session_id":"s","uuid":"u"}"#,
+        ]);
+        assert_eq!(
+            events,
+            vec![TurnEvent::ToolProgress {
+                id: "toolu_inner".into(),
+                name: "Bash".into(),
+                elapsed_seconds: 12,
+            }]
+        );
+    }
+
+    #[test]
+    fn reports_progress_for_a_tool_it_did_not_see_start() {
+        // A resumed process can report a tool announced before this turn.
+        let events = progress_events(&[
+            r#"{"type":"tool_progress","tool_use_id":"toolu_old-heartbeat-4","tool_name":"Read","parent_tool_use_id":"toolu_old","elapsed_time_seconds":150,"heartbeat":true}"#,
+            r#"{"type":"tool_progress","tool_name":"Bash","elapsed_time_seconds":5}"#,
+        ]);
+        assert_eq!(
+            events,
+            vec![TurnEvent::ToolProgress {
+                id: "toolu_old".into(),
+                name: "Read".into(),
+                elapsed_seconds: 150,
+            }],
+            "a message naming no tool is dropped"
         );
     }
 

@@ -1156,6 +1156,22 @@ pub enum TurnEvent {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         images: Vec<ToolImage>,
     },
+    /// A tool call announced by [`TurnEvent::ToolCall`] is still running.
+    ///
+    /// Harnesses that measure a running tool report it periodically (Claude
+    /// Code sends a heartbeat every 30 seconds, and progress while a command
+    /// prints output). Applications use it to show how long the tool has run
+    /// and as proof that the harness is alive: a turn whose only activity is
+    /// one long command is not stuck while this keeps arriving.
+    ToolProgress {
+        /// Provider-native identifier of the running tool call; the `id` of
+        /// its `ToolCall`.
+        id: String,
+        /// Tool name.
+        name: String,
+        /// Seconds the tool has been running, as the provider measured them.
+        elapsed_seconds: u64,
+    },
     /// Full replacement of the agent's execution plan.
     ///
     /// Agents that publish a plan (ACP `plan` updates) send every entry on

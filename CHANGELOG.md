@@ -16,6 +16,20 @@ Versioning and Keep a Changelog conventions.
 
 ### Added
 
+- `TurnEvent::ToolProgress { id, name, elapsed_seconds }`: a started tool
+  call is still running. The Claude adapter reports Claude Code's
+  `tool_progress` messages (a heartbeat every 30 seconds while a tool runs,
+  and progress while a command prints output), which it used to drop. An
+  application can now tell a long command apart from a harness that stopped
+  responding instead of treating both as silence.
+
+- Codex event records default to a 32 MiB limit (other providers keep 2 MiB),
+  because Codex repeats complete MCP arguments and results, including file
+  contents, in one JSON record. Complete records are parsed; none is skipped or
+  reduced to a prefix. An explicit `max_event_line_bytes` overrides both. A
+  rejection logs only byte counts, and the error warns that external actions
+  may already have completed and must be checked before retrying.
+
 - Identified retained input with native `InputMessageState` receipts and explicit
   `read_now` foreground controls. Control acknowledgements stay separate from
   message consumption; background refusal never escalates to interruption.
