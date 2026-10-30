@@ -350,9 +350,9 @@ impl Acp {
         timeout: Duration,
         progress: impl Fn(&'static str) + Send + Sync,
     ) -> std::result::Result<AcpAgentProbe, AcpProbeError> {
-        progress("Starting the agent and negotiating ACP capabilities");
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
+        progress("Starting the agent and negotiating ACP capabilities");
         agent
             .validate()
             .map_err(|error| AcpProbeError::new(AcpProbeErrorKind::Invalid, error.to_string()))?;
