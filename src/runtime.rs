@@ -1542,6 +1542,18 @@ async fn supervise_idle_retained_process(
                     // Work an earlier turn left pending can still answer; the
                     // adapter may need to clean up what it opened.
                     let replies = adapter.idle_frame_writes(&line);
+                    {
+                        // What the frame says about the process belongs in the
+                        // state the next turn inherits.
+                        let mut inherited = retained
+                            .handoff
+                            .inherited
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if let Some(state) = inherited.as_mut() {
+                            adapter.observe_idle_frame(&line, state);
+                        }
+                    }
                     if !replies.is_empty() {
                         let mut io = retained.io.lock().await;
                         if current(&retained) {

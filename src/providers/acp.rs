@@ -1094,6 +1094,30 @@ impl AgentAdapter for Acp {
         }
     }
 
+    fn observe_idle_frame(&self, line: &str, inherited: &mut AdapterState) {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            return;
+        };
+        let is_notification = matches!(value.get("id"), None | Some(Value::Null));
+        if !is_notification || value.get("method").and_then(Value::as_str) != Some("session/update")
+        {
+            return;
+        }
+        let mut turn = load(inherited);
+        let params = &value["params"];
+        if let (Some(ours), Some(theirs)) = (
+            turn.session_id.as_deref(),
+            params.get("sessionId").and_then(Value::as_str),
+        ) {
+            if ours != theirs {
+                return;
+            }
+        }
+        if apply_setting_update(&params["update"], &mut turn) {
+            store(inherited, &turn);
+        }
+    }
+
     fn idle_frame_writes(&self, line: &str) -> Vec<Vec<u8>> {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             return Vec::new();
@@ -2149,6 +2173,25 @@ fn advance(
     Ok(())
 }
 
+/// Apply a session update that changes the agent's own settings to the
+/// snapshot later turns compare their requested settings against. Returns
+/// whether `update` was one.
+fn apply_setting_update(update: &Value, turn: &mut TurnState) -> bool {
+    match update.get("sessionUpdate").and_then(Value::as_str) {
+        Some("config_option_update") => {
+            turn.session_config = session_snapshot(update);
+            true
+        }
+        Some("current_mode_update") => {
+            if let Some(mode) = update.get("currentModeId") {
+                turn.session_config["modes"]["currentModeId"] = mode.clone();
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
 fn session_update(
     value: &Value,
     state: &mut AdapterState,
@@ -2224,13 +2267,8 @@ fn session_update(
                 .unwrap_or_default();
             output.events.push(TurnEvent::PlanUpdated { entries });
         }
-        "config_option_update" => {
-            turn.session_config = session_snapshot(update);
-        }
-        "current_mode_update" => {
-            if let Some(mode) = update.get("currentModeId") {
-                turn.session_config["modes"]["currentModeId"] = mode.clone();
-            }
+        "config_option_update" | "current_mode_update" => {
+            apply_setting_update(update, turn);
         }
         "usage_update" => {
             let used = update.get("used").and_then(Value::as_u64);
@@ -2571,6 +2609,66 @@ mod tests {
             .events
             .iter()
             .any(|e| matches!(e, TurnEvent::SessionStarted { .. })));
+    }
+
+    #[test]
+    fn a_setting_the_agent_changed_while_idle_is_not_skipped_as_already_current() {
+        let adapter = Acp::new(agents());
+        let session = json!({"sessionId":"s","configOptions":[{"id":"effort","name":"Effort","category":"thought_level","type":"select","currentValue":"low","options":[{"value":"low","name":"Low"},{"value":"high","name":"High"}]}]});
+        let finished = || {
+            let (mut state, _) = opened(&adapter, &turn("first"), session.clone());
+            feed(
+                &adapter,
+                &mut state,
+                json!({"jsonrpc":"2.0","id":ID_PROMPT,"result":{"stopReason":"end_turn"}}),
+            );
+            state
+        };
+        let mut request = turn("second");
+        request.session_id = Some("s".into());
+        request
+            .harness_options
+            .insert("config".into(), r#"{"effort":"low"}"#.into());
+        let update = |value: &str, id: &str| {
+            json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":id,
+                "update":{"sessionUpdate":"config_option_update","configOptions":[
+                    {"id":"effort","name":"Effort","category":"thought_level","type":"select","currentValue":value,
+                     "options":[{"value":"low","name":"Low"},{"value":"high","name":"High"}]}]}}})
+            .to_string()
+        };
+
+        // Nothing changed while idle: `low` is already current, so the next
+        // turn goes straight to the prompt.
+        let mut next = started(&adapter, &request);
+        adapter.inherit_retained_handoff(finished(), &mut next);
+        let first: Value =
+            serde_json::from_slice(&adapter.retained_turn_start(&next).unwrap().unwrap()).unwrap();
+        assert_eq!(first["method"], "session/prompt");
+
+        // The agent switched itself to `high` while idle: `low` is requested again.
+        let mut inherited = finished();
+        adapter.observe_idle_frame(&update("high", "s"), &mut inherited);
+        let mut next = started(&adapter, &request);
+        adapter.inherit_retained_handoff(inherited, &mut next);
+        let first: Value =
+            serde_json::from_slice(&adapter.retained_turn_start(&next).unwrap().unwrap()).unwrap();
+        assert_eq!(first["method"], "session/set_config_option");
+        assert_eq!(first["params"]["value"], "low");
+
+        // A frame for another session, a request, or other noise changes nothing.
+        let mut inherited = finished();
+        adapter.observe_idle_frame(&update("high", "other"), &mut inherited);
+        adapter.observe_idle_frame(
+            &json!({"jsonrpc":"2.0","id":9,"method":"session/update","params":{"sessionId":"s"}})
+                .to_string(),
+            &mut inherited,
+        );
+        adapter.observe_idle_frame("not json", &mut inherited);
+        let mut next = started(&adapter, &request);
+        adapter.inherit_retained_handoff(inherited, &mut next);
+        let first: Value =
+            serde_json::from_slice(&adapter.retained_turn_start(&next).unwrap().unwrap()).unwrap();
+        assert_eq!(first["method"], "session/prompt");
     }
 
     #[test]
