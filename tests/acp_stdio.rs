@@ -85,6 +85,8 @@ while IFS= read -r line; do
       if [ "$MOCK_ACP_MODE" = stall ]; then continue; fi
       case "$line" in
         *'"optionId":"allow"'*)
+          # Lets a test tell a refreshed inactivity deadline from an expired one.
+          sleep "${MOCK_ACP_ALLOW_DELAY:-0}"
           if [ "$MOCK_ACP_MODE" = split ]; then
             update '{"sessionUpdate":"tool_call_update","toolCallId":"call-1","status":"in_progress","content":[{"type":"content","content":{"type":"text","text":"12 passed"}}]}'
             update '{"sessionUpdate":"tool_call_update","toolCallId":"call-1","status":"completed"}'
@@ -789,7 +791,14 @@ async fn an_approval_that_outlasts_the_inactivity_timeout_does_not_time_out_the_
     use temps_agent_runtime::ProviderProcessRetention;
     let fixture = Fixture::new();
     let agents = AcpAgents::new();
-    agents.insert(fixture.agent("ok")).unwrap();
+    // The agent answers one second after the approval, so the turn only lives
+    // if the deadline restarted when the person answered: an expired deadline
+    // fires first.
+    let mut agent = fixture.agent("ok");
+    agent
+        .environment
+        .insert("MOCK_ACP_ALLOW_DELAY".into(), "1".into());
+    agents.insert(agent).unwrap();
     let mut builder =
         AgentRuntime::builder().provider_process_retention(ProviderProcessRetention {
             max_processes: 1,

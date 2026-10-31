@@ -116,6 +116,15 @@ for line in sys.stdin:
     emit({'type':'unknown_noop'});time.sleep(.01)
   if prompt=='hang':
    while True:time.sleep(1)
+  if prompt=='heartbeats':
+   # A tool that never returns while the harness keeps heartbeating, as Claude
+   # Code does every 30 seconds (compressed here).
+   emit({'type':'assistant','parent_tool_use_id':None,'message':{'content':[{'type':'tool_use','id':'toolu_hang','name':'Bash','input':{'command':'sleep infinity'}}]}})
+   beat=0
+   while True:
+    beat+=1
+    emit({'type':'tool_progress','tool_use_id':'toolu_hang-heartbeat-%d'%beat,'tool_name':'Bash','parent_tool_use_id':'toolu_hang','elapsed_time_seconds':beat,'heartbeat':True})
+    time.sleep(.2)
   if prompt in('spawn-bg','spawn-bg-silent'):
    emit({'type':'system','subtype':'task_started','task_id':'bg-1','tool_use_id':'toolu_bg','description':'Background work','subagent_type':'general-purpose','task_type':'local_agent','is_backgrounded':True})
    emit({'type':'system','subtype':'background_tasks_changed','tasks':[{'task_id':'bg-1','task_type':'local_agent','description':'Background work'}]})
@@ -528,6 +537,42 @@ async fn claude_noop_frames_do_not_hide_a_stalled_turn() {
     let f = Fixture::new(true, Duration::from_secs(30)).await;
     assert!(f.turn("one", "chatter").await.is_err());
     assert_eq!(f.turn("two", "second").await.unwrap().text, "reply:second");
+    f.dispose().await;
+}
+
+#[tokio::test]
+async fn claude_heartbeats_alone_do_not_hold_a_stalled_turn_open() {
+    let f = Fixture::new(true, Duration::from_secs(30)).await;
+    let turn = f
+        .handle
+        .start_turn(Fixture::input("one", "heartbeats"))
+        .await
+        .unwrap();
+    // The tool never returns, but its harness keeps heartbeating: the turn
+    // still ends at the inactivity timeout, and the application still sees
+    // every heartbeat.
+    let (heartbeats, outcome) = tokio::time::timeout(Duration::from_secs(15), async {
+        let (mut stream, completion) = turn.into_parts();
+        let mut heartbeats = 0;
+        while let Some(envelope) = stream.next().await {
+            if let RuntimeEvent::ProviderEvent {
+                event: TurnEvent::ToolProgress { id, .. },
+            } = envelope.event
+            {
+                assert_eq!(id, "toolu_hang");
+                heartbeats += 1;
+            }
+        }
+        (heartbeats, completion.wait().await)
+    })
+    .await
+    .expect("a heartbeating turn must still be bounded by the inactivity timeout");
+    let failure = outcome.expect_err("a tool that never returns times the turn out");
+    assert_eq!(failure.kind, RuntimeFailureKind::Timeout, "{failure:?}");
+    assert!(
+        heartbeats >= 3,
+        "heartbeats stay visible to the application: {heartbeats}"
+    );
     f.dispose().await;
 }
 
