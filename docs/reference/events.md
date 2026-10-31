@@ -107,11 +107,13 @@ status transition.
 running. `id` is the `ToolCall` it measures. Claude Code sends one every 30
 seconds while any tool runs, and more while a command prints output; the other
 adapters don't send it yet. Use it to show how long a tool has run, and as
-proof the harness is alive: a turn whose only activity is one long command is
-not stuck while it keeps arriving. Heartbeats stop when the harness itself stops
-responding, so a tool that has reported progress and then goes quiet for
-minutes points at a stuck harness, not a slow command. It is not a durable
-transition; keep the latest value on the tool-call record.
+proof the harness is alive. It does not count as activity for a retained turn's
+`active_inactivity_timeout` or `held_task_quiet_timeout`, so a turn whose only
+activity is one long command still times out while heartbeats arrive; set the
+timeout to cover the longest command you allow. Heartbeats stop when the
+harness itself stops responding, so a tool that has reported progress and then
+goes quiet for minutes points at a stuck harness, not a slow command. It is not
+a durable transition; keep the latest value on the tool-call record.
 
 ## Native tasks and subagents
 
