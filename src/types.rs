@@ -1161,8 +1161,12 @@ pub enum TurnEvent {
     /// Harnesses that measure a running tool report it periodically (Claude
     /// Code sends a heartbeat every 30 seconds, and progress while a command
     /// prints output). Applications use it to show how long the tool has run
-    /// and as proof that the harness is alive: a turn whose only activity is
-    /// one long command is not stuck while this keeps arriving.
+    /// and as proof that the harness is alive.
+    ///
+    /// It does not count as activity for a retained turn's
+    /// `active_inactivity_timeout` or `held_task_quiet_timeout`: a turn whose
+    /// only activity is one long command still times out while heartbeats keep
+    /// arriving, so set the timeout to cover the longest command you allow.
     ToolProgress {
         /// Provider-native identifier of the running tool call; the `id` of
         /// its `ToolCall`.

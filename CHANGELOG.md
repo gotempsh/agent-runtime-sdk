@@ -22,6 +22,12 @@ Versioning and Keep a Changelog conventions.
   and progress while a command prints output), which it used to drop. An
   application can now tell a long command apart from a harness that stopped
   responding instead of treating both as silence.
+  The heartbeat is delivered but does not count as activity for
+  `active_inactivity_timeout` or `held_task_quiet_timeout`, so a tool that never
+  returns still times out while the harness keeps heartbeating.
+  A person's answer to an approval or question restarts that deadline, so a
+  decision slower than `active_inactivity_timeout` no longer times the turn out
+  before the provider can act on it.
 
 - Codex event records default to a 32 MiB limit (other providers keep 2 MiB),
   because Codex repeats complete MCP arguments and results, including file

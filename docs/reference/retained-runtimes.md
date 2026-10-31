@@ -48,6 +48,8 @@ Three deadlines bound a retained turn's silence:
   active limits below, not reported as a failed start.
 - `active_inactivity_timeout` bounds silence while a submitted turn is active and
   fails the turn with `RuntimeError::Timeout`.
+  A `TurnEvent::ToolProgress` heartbeat is delivered but is not activity, so one
+  long command still times out while its heartbeats arrive.
 - `held_task_quiet_timeout` bounds how long a turn that has already answered keeps
   waiting for background work (such as Claude subagents) that reports nothing.
   Any task progress resets it. When it elapses the turn completes successfully

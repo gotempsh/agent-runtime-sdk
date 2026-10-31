@@ -8,7 +8,8 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex, Notify, OwnedSemaphorePermit, Semaphore};
 
 use crate::adapter::{
-    AdapterState, AgentAdapter, CommandSpec, IdleFrame, InteractionRequest, OversizedFrame,
+    AdapterOutput, AdapterState, AgentAdapter, CommandSpec, IdleFrame, InteractionRequest,
+    OversizedFrame,
 };
 use crate::error::classify_provider_failure;
 use crate::startup::{StartupObserver, StartupObserverState, StartupStage, StartupTrace};
@@ -91,6 +92,11 @@ pub struct ProviderProcessRetention {
     /// Maximum time for a retained provider to become ready for a turn.
     pub initialization_timeout: Duration,
     /// Optional maximum silence while a submitted turn is active.
+    ///
+    /// Silence means no model output, tool call or result, or other progress.
+    /// A tool progress heartbeat ([`TurnEvent::ToolProgress`]) is delivered but
+    /// does not end it: a tool that never returns still times out while its
+    /// harness keeps heartbeating.
     pub active_inactivity_timeout: Option<Duration>,
     /// Optional maximum silence once a turn has answered and only background
     /// work (such as Claude subagents) keeps it open.
@@ -1417,6 +1423,26 @@ fn retained_fingerprint_options(
         options.remove("config");
     }
     options
+}
+
+/// Whether provider output is progress on the turn, restarting its inactivity
+/// deadline and the quiet timeout for held background work.
+///
+/// A [`TurnEvent::ToolProgress`] heartbeat alone is not: it says the harness is
+/// alive, not that the tool is getting anywhere, and Claude Code sends one every
+/// 30 seconds for as long as a tool runs. Counting it would let a tool that
+/// never returns hold the turn, its concurrency permit and its process open
+/// past `active_inactivity_timeout`. The heartbeat is still delivered to the
+/// application, which can use it to tell a slow command from a stalled harness.
+fn counts_as_semantic_activity(output: &AdapterOutput) -> bool {
+    output
+        .events
+        .iter()
+        .any(|event| !matches!(event, TurnEvent::ToolProgress { .. }))
+        || !output.writes.is_empty()
+        || output.interaction.is_some()
+        || output.terminal
+        || output.turn_submitted
 }
 
 /// The inactivity deadline for a frame whose bytes are still arriving: the
@@ -6032,6 +6058,8 @@ impl AgentRuntime {
                     .settle_retained_interrupt(adapter, request, events, io, state)
                     .await;
             }
+            // The answer is progress, and the provider needs time to act on it.
+            last_semantic_activity = tokio::time::Instant::now();
         }
         loop {
             let inactivity_timeout = if !saw_semantic_activity || !turn_submitted {
@@ -6202,11 +6230,7 @@ impl AgentRuntime {
                     });
                 }
             };
-            let semantic_activity = !output.events.is_empty()
-                || !output.writes.is_empty()
-                || output.interaction.is_some()
-                || output.terminal
-                || output.turn_submitted;
+            let semantic_activity = counts_as_semantic_activity(&output);
             if output.turn_submitted {
                 turn_submitted = true;
             }
@@ -6262,6 +6286,9 @@ impl AgentRuntime {
                         .settle_retained_interrupt(adapter, request, events, io, state)
                         .await;
                 }
+                // Waiting for a person can outlast the inactivity timeout. The
+                // answer is progress, and the provider needs time to act on it.
+                last_semantic_activity = tokio::time::Instant::now();
             }
             if output.terminal {
                 return complete_retained_turn(adapter, request, events, state).await;
@@ -8286,6 +8313,50 @@ mod tests {
             retained_fingerprint_options(Provider::Codex, &options, false),
             options
         );
+    }
+
+    #[test]
+    fn tool_progress_heartbeats_do_not_count_as_turn_activity() {
+        let heartbeat = TurnEvent::ToolProgress {
+            id: "toolu_bash".into(),
+            name: "Bash".into(),
+            elapsed_seconds: 30,
+        };
+        let silent = AdapterOutput::default();
+        assert!(!counts_as_semantic_activity(&silent));
+
+        // A heartbeat alone, however many arrive, never restarts the deadline.
+        let only_heartbeats = AdapterOutput {
+            events: vec![heartbeat.clone(), heartbeat.clone()],
+            ..AdapterOutput::default()
+        };
+        assert!(!counts_as_semantic_activity(&only_heartbeats));
+
+        // Real progress still does, with or without a heartbeat beside it.
+        let text = TurnEvent::TextDelta { text: "x".into() };
+        for events in [vec![text.clone()], vec![heartbeat, text]] {
+            let output = AdapterOutput {
+                events,
+                ..AdapterOutput::default()
+            };
+            assert!(counts_as_semantic_activity(&output));
+        }
+        for output in [
+            AdapterOutput {
+                writes: vec![b"{}".to_vec()],
+                ..AdapterOutput::default()
+            },
+            AdapterOutput {
+                terminal: true,
+                ..AdapterOutput::default()
+            },
+            AdapterOutput {
+                turn_submitted: true,
+                ..AdapterOutput::default()
+            },
+        ] {
+            assert!(counts_as_semantic_activity(&output));
+        }
     }
 
     #[tokio::test(start_paused = true)]

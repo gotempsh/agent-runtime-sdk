@@ -85,6 +85,8 @@ while IFS= read -r line; do
       if [ "$MOCK_ACP_MODE" = stall ]; then continue; fi
       case "$line" in
         *'"optionId":"allow"'*)
+          # Lets a test tell a refreshed inactivity deadline from an expired one.
+          sleep "${MOCK_ACP_ALLOW_DELAY:-0}"
           if [ "$MOCK_ACP_MODE" = split ]; then
             update '{"sessionUpdate":"tool_call_update","toolCallId":"call-1","status":"in_progress","content":[{"type":"content","content":{"type":"text","text":"12 passed"}}]}'
             update '{"sessionUpdate":"tool_call_update","toolCallId":"call-1","status":"completed"}'
@@ -759,6 +761,82 @@ async fn retained_acp_turns_use_one_process_and_one_session() {
     assert_eq!(methods.iter().filter(|m| *m == "session/prompt").count(), 2);
     client
         .dispose(&RuntimeId::new("acp-reuse").unwrap())
+        .await
+        .unwrap();
+}
+
+/// Answers an approval only after `delay`, as a person deciding would.
+struct SlowResponder {
+    delay: Duration,
+}
+
+#[async_trait]
+impl InteractionHandler for SlowResponder {
+    async fn approve(&self, _request: ApprovalRequest) -> ApprovalDecision {
+        tokio::time::sleep(self.delay).await;
+        ApprovalDecision::Allow
+    }
+
+    async fn answer(&self, _request: QuestionRequest) -> Option<QuestionAnswer> {
+        None
+    }
+}
+
+#[tokio::test]
+async fn an_approval_that_outlasts_the_inactivity_timeout_does_not_time_out_the_turn() {
+    use temps_agent_runtime::lifecycle::{InvocationId, RuntimeId};
+    use temps_agent_runtime::retained::{
+        InProcessRuntimeClient, RuntimeClient, RuntimeSpec, TurnInput,
+    };
+    use temps_agent_runtime::ProviderProcessRetention;
+    let fixture = Fixture::new();
+    let agents = AcpAgents::new();
+    // The agent answers one second after the approval, so the turn only lives
+    // if the deadline restarted when the person answered: an expired deadline
+    // fires first.
+    let mut agent = fixture.agent("ok");
+    agent
+        .environment
+        .insert("MOCK_ACP_ALLOW_DELAY".into(), "1".into());
+    agents.insert(agent).unwrap();
+    let mut builder =
+        AgentRuntime::builder().provider_process_retention(ProviderProcessRetention {
+            max_processes: 1,
+            idle_timeout: Duration::from_secs(30),
+            initialization_timeout: Duration::from_secs(10),
+            active_inactivity_timeout: Some(Duration::from_secs(2)),
+            held_task_quiet_timeout: None,
+        });
+    builder.register(Acp::new(agents));
+    let client = InProcessRuntimeClient::new(builder.build().unwrap());
+    let mut spec = RuntimeSpec::new(
+        RuntimeId::new("acp-slow-approval").unwrap(),
+        Provider::Acp,
+        &fixture.workspace,
+    );
+    spec.permission_mode = PermissionMode::Default;
+    spec.harness_options
+        .insert(AGENT_OPTION.into(), "mock".into());
+    let handle = client.acquire(spec).await.unwrap();
+    // The person takes longer to decide than the inactivity timeout allows
+    // silence: waiting for them is not the agent going quiet.
+    let slow = Arc::new(SlowResponder {
+        delay: Duration::from_secs(3),
+    });
+    let turn = handle
+        .start_turn_with_interactions(
+            TurnInput::new(InvocationId::new("slow").unwrap(), "test"),
+            slow,
+        )
+        .await
+        .unwrap();
+    let result = turn
+        .wait()
+        .await
+        .expect("the turn outlives a slow approval");
+    assert!(result.text.contains("All green"), "{result:?}");
+    client
+        .dispose(&RuntimeId::new("acp-slow-approval").unwrap())
         .await
         .unwrap();
 }
