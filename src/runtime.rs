@@ -6058,6 +6058,8 @@ impl AgentRuntime {
                     .settle_retained_interrupt(adapter, request, events, io, state)
                     .await;
             }
+            // The answer is progress, and the provider needs time to act on it.
+            last_semantic_activity = tokio::time::Instant::now();
         }
         loop {
             let inactivity_timeout = if !saw_semantic_activity || !turn_submitted {
@@ -6284,6 +6286,9 @@ impl AgentRuntime {
                         .settle_retained_interrupt(adapter, request, events, io, state)
                         .await;
                 }
+                // Waiting for a person can outlast the inactivity timeout. The
+                // answer is progress, and the provider needs time to act on it.
+                last_semantic_activity = tokio::time::Instant::now();
             }
             if output.terminal {
                 return complete_retained_turn(adapter, request, events, state).await;
