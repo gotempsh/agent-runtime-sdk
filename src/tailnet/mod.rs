@@ -59,7 +59,7 @@ const MAX_HOSTNAME_LEN: usize = 63;
 const LOGIN_URL_WAIT: Duration = Duration::from_secs(20);
 /// The `tailscale up` helper is killed after this if nobody completes the
 /// browser login; the host can start a new one.
-const LOGIN_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+const LOGIN_TIMEOUT: Duration = Duration::from_mins(15);
 const SOCKET_WAIT: Duration = Duration::from_secs(10);
 const STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(20);
 const CLI_TIMEOUT: Duration = Duration::from_secs(10);
