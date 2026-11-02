@@ -75,7 +75,7 @@ APIs, own credentials, or silently fall back to an unsandboxed process.
 
 ## Install
 
-Requires Rust 1.88 or newer. Normal library tests use fake provider processes and
+Requires Rust 1.95 or newer. Normal library tests use fake provider processes and
 do not require provider accounts or a running Temps installation.
 
 Until the first crates.io release, place the crate beside your application and

@@ -64,6 +64,7 @@ Versioning and Keep a Changelog conventions.
 
 ### Changed
 
+- The minimum supported Rust version is now 1.95, required by `sysinfo` 0.39.
 - A retained Claude process switches ultracode (reasoning `ultracode`) on and
   off in place with `apply_flag_settings`, like effort and Fast mode, instead
   of being replaced. A turn on another effort after a workflow started under

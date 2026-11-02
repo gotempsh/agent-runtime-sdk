@@ -4,7 +4,7 @@ Thanks for helping improve `temps-agent-runtime`.
 
 ## Development setup
 
-Install stable Rust (minimum supported version: 1.88). Provider CLIs are not required for unit tests. Nono is
+Install stable Rust (minimum supported version: 1.95). Provider CLIs are not required for unit tests. Nono is
 needed only for the ignored live compatibility test.
 
 ```bash

@@ -10,7 +10,7 @@ opinion, or a claim that every provider integration has been tested live.
   listing, with regression tests for nested README matches, local artifacts,
   credentials, and missing source files. This is a path-boundary check, not a
   substitute for secret scanning of file contents.
-- Rust 1.88 is the advertised and CI-checked minimum, matching locked dependencies.
+- Rust 1.95 is the advertised and CI-checked minimum, matching locked dependencies.
 - CI checks independent feature builds, all-feature tests, strict Clippy and
   Rustdoc, package boundaries, and compilation of the standalone crate archive.
 - Codex model relay credentials default to HTTPS except on loopback. Trusted
@@ -33,7 +33,7 @@ cargo fmt --all -- --check
 cargo check --locked --lib
 cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --locked --all-features
-cargo +1.88.0 check --locked --all-targets --all-features
+cargo +1.95.0 check --locked --all-targets --all-features
 RUSTDOCFLAGS='-D warnings' cargo doc --locked --all-features --no-deps
 python3 scripts/check-package.py --self-test
 python3 scripts/check-package.py

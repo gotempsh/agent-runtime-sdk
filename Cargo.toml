@@ -2,7 +2,7 @@
 name = "temps-agent-runtime"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.88"
+rust-version = "1.95"
 license = "MIT OR Apache-2.0"
 authors = ["temps-agent-runtime contributors"]
 description = "Run Claude Code, Codex, OpenCode, and pi from Rust through one typed, sandbox-aware event stream"
@@ -61,7 +61,7 @@ url = "2"
 nix = { version = "0.31", features = ["process", "signal"] }
 
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
-# 0.37 retains the SDK's Rust 1.88 minimum; only process inspection is needed.
+# Only process inspection is needed. sysinfo 0.39 requires Rust 1.95, the SDK minimum.
 sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
 
 [dev-dependencies]

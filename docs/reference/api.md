@@ -604,4 +604,4 @@ trusted declarations by backend implementers, not runtime attestation.
   provider, service manager, or sandbox backend that enforces its own cleanup.
 - Managed-process state and log buffers are in memory. Persist their events in
   the embedding application and reconcile a host crash as an interruption.
-- Minimum supported Rust version: 1.88 (checked in CI with the committed lockfile).
+- Minimum supported Rust version: 1.95 (checked in CI with the committed lockfile).
