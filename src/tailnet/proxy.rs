@@ -294,10 +294,18 @@ async fn serve_connection(
                     }
                 };
                 if accepted {
-                    tokio::select! {
-                        result = tokio::io::copy(&mut input, &mut origin_write) => { result?; }
-                        result = tokio::io::copy(&mut origin_read, &mut client_write) => { result?; }
-                    }
+                    // Preserve TCP half-close: a client can finish its upload
+                    // and still wait for a final reply from the upgraded peer.
+                    tokio::try_join!(
+                        async {
+                            tokio::io::copy(&mut input, &mut origin_write).await?;
+                            origin_write.shutdown().await
+                        },
+                        async {
+                            tokio::io::copy(&mut origin_read, &mut client_write).await?;
+                            client_write.shutdown().await
+                        }
+                    )?;
                 }
                 return Ok(());
             }
@@ -478,7 +486,7 @@ fn parse_request(head: &[u8]) -> Result<ProxyRequest, &'static str> {
         return Err("ambiguous request body framing");
     }
     origin_head.extend_from_slice(if upgrade {
-        b"Connection: Upgrade\r\n\r\n"
+        b"Connection: Upgrade, close\r\n\r\n"
     } else {
         b"Connection: close\r\n\r\n"
     });
@@ -1027,7 +1035,7 @@ mod tests {
                 let server = tokio::spawn(async move {
                     let (mut stream, _) = listener.accept().await.unwrap();
                     let (head, extra) = read_head(&mut stream).await.unwrap();
-                    assert!(String::from_utf8(head).unwrap().contains("Connection: Upgrade\r\n"));
+                    assert!(String::from_utf8(head).unwrap().contains("Connection: Upgrade, close\r\n"));
                     assert!(extra.is_empty(), "protocol data must wait for acceptance");
                     let mut byte = [0; 1];
                     assert!(tokio::time::timeout(std::time::Duration::from_millis(30), stream.read(&mut byte)).await.is_err(), "no early FIN or protocol bytes");
@@ -1036,6 +1044,7 @@ mod tests {
                         let mut data = [0; 4];
                         stream.read_exact(&mut data).await.unwrap();
                         assert_eq!(&data, b"ping");
+                        assert_eq!(stream.read(&mut byte).await.unwrap(), 0);
                         stream.write_all(b"pong").await.unwrap();
                     } else {
                         stream.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
@@ -1044,6 +1053,7 @@ mod tests {
                 let proxy = SplitProxy::start(SocksUpstream { addr }, RouteTable::default()).await.unwrap();
                 let mut client = TcpStream::connect(proxy.local_addr()).await.unwrap();
                 client.write_all(format!("GET http://{addr}/ HTTP/1.1\r\nConnection: Upgrade\r\nUpgrade: fixture\r\n\r\nping").as_bytes()).await.unwrap();
+                client.shutdown().await.unwrap();
                 let mut result = String::new();
                 client.read_to_string(&mut result).await.unwrap();
                 assert!(if accepted { result.ends_with("hellopong") } else { result.starts_with("HTTP/1.1 403") });
