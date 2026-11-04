@@ -2238,7 +2238,7 @@ mod tests {
             &mut state,
             json!({"method":"item/agentMessage/delta","params":{"threadId":"other-thread","turnId":"turn-2","delta":"foreign"}}),
         );
-        assert!(foreign.events.is_empty());
+        assert_eq!(foreign.events, [] as [TurnEvent; 0]);
     }
     #[test]
     fn active_goal_waits_across_idle_status_until_a_later_turn() {
@@ -2284,12 +2284,7 @@ mod tests {
 
     #[test]
     fn hidden_goal_continuation_must_not_finish_at_first_completion() {
-        let mut state = AdapterState::default();
-        let mut turn = TurnState::default();
-        turn.retained = true;
-        turn.thread_id = Some("thread-1".into());
-        turn.turn_id = Some("turn-1".into());
-        store(&mut state, &turn);
+        let mut state = continuation_state();
         let completed = feed(
             &mut state,
             json!({"method":"turn/completed", "params":{

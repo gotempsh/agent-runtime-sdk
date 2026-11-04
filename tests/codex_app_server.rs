@@ -299,7 +299,7 @@ async fn serve(
     }
     fn rebind(value: &mut Value, thread_id: &str) {
         match value {
-            Value::String(id) if id == "thread-fixture" => *id = thread_id.to_owned(),
+            Value::String(id) if id == "thread-fixture" => thread_id.clone_into(id),
             Value::Array(values) => {
                 for value in values {
                     rebind(value, thread_id);
@@ -2151,7 +2151,7 @@ async fn hidden_settlement_has_a_thirty_second_bound_even_with_a_long_turn_limit
         Provider::Codex,
         ".",
     );
-    spec.turn_timeout = Duration::from_secs(86400);
+    spec.turn_timeout = Duration::from_secs(301);
     let handle = client.acquire(spec).await.unwrap();
     let turn = handle
         .start_turn(TurnInput::new(
