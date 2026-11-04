@@ -1039,6 +1039,7 @@ struct RetainedCodexIo {
     stderr_task: Option<crate::process::StderrCapture>,
     // Lifetime-scoped: continuations can omit or rotate their environment.
     launch_secrets: Vec<crate::SecretString>,
+    launch_environment_cleared: bool,
     stdout_task: Option<tokio::task::JoinHandle<std::io::Result<String>>>,
 }
 
@@ -5675,6 +5676,7 @@ impl AgentRuntime {
                             crate::SecretString::new(value.to_string_lossy().into_owned())
                         }))
                         .collect(),
+                    launch_environment_cleared: spec.clear_environment,
                     stdout_task,
                 })),
                 generation: AtomicU64::new(0),
@@ -6220,17 +6222,24 @@ impl AgentRuntime {
                     Some(capture) => capture.finish(STDERR_DRAIN_GRACE).await.unwrap_or_default(),
                     None => String::new(),
                 };
-                let diagnostic = crate::diagnostic_scrub::scrub(
-                    &diagnostic,
-                    io.launch_secrets
-                        .iter()
-                        .chain(request.environment.values())
-                        .map(crate::SecretString::expose),
-                )
-                .trim()
-                .chars()
-                .take(STDERR_TAIL_BYTES)
-                .collect::<String>();
+                let diagnostic = if !io.launch_environment_cleared && !diagnostic.is_empty() {
+                    // Inherited values belong to the transport's host and may
+                    // be absent from both explicit secret maps. Keep this
+                    // supported launch mode, but do not publish unknown stderr.
+                    "Launcher diagnostic withheld to protect credentials from its inherited environment.".to_owned()
+                } else {
+                    crate::diagnostic_scrub::scrub(
+                        &diagnostic,
+                        io.launch_secrets
+                            .iter()
+                            .chain(request.environment.values())
+                            .map(crate::SecretString::expose),
+                    )
+                    .trim()
+                    .chars()
+                    .take(STDERR_TAIL_BYTES)
+                    .collect::<String>()
+                };
                 return Err(RuntimeError::ProcessFailed {
                     provider,
                     kind: ProviderProcessErrorKind::Unknown,
@@ -10242,6 +10251,7 @@ mod tests {
                     STDERR_TAIL_BYTES,
                 )),
                 launch_secrets: Vec::new(),
+                launch_environment_cleared: true,
                 stdout_task: None,
             })),
             generation: AtomicU64::new(0),

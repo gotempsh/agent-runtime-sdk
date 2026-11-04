@@ -27,6 +27,8 @@ pub struct CommandSpec {
     /// Explicit environment additions.
     pub environment: BTreeMap<OsString, OsString>,
     /// Remove the host environment before applying the runtime allowlist.
+    /// Retained EOF diagnostics are withheld when false: the selected transport
+    /// may inherit credential values absent from the explicit environment map.
     pub clear_environment: bool,
     /// Initial bytes written to stdin, followed by a newline.
     pub initial_stdin: Option<Vec<u8>>,
