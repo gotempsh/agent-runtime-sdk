@@ -106,14 +106,20 @@ fn credential_ranges(text: &str, values: &[String]) -> Vec<(usize, usize)> {
                 .filter_map(|quoted| quoted.get(1).or_else(|| quoted.get(2)))
                 .map(|quoted| quoted.as_str()),
         )
-        .map(|token| {
-            // Compare the credential bytes, but redact the diagnostic's whole
-            // fragment, including the marker that says it was truncated.
-            let value = token
-                .strip_suffix("...")
-                .or_else(|| token.strip_suffix('…'))
-                .unwrap_or(token);
-            (token, value)
+        .flat_map(|token| {
+            // Compare the credential bytes, but redact the original fragment,
+            // including a diagnostic field label and any truncation marker.
+            // Keep candidate fan-out bounded, independent of input length.
+            std::iter::once(token)
+                .chain(token.split_once(':').map(|(_, value)| value))
+                .chain(token.split_once('=').map(|(_, value)| value))
+                .map(move |value| {
+                    let value = value
+                        .strip_suffix("...")
+                        .or_else(|| value.strip_suffix('…'))
+                        .unwrap_or(value);
+                    (token, value)
+                })
         })
         .filter(|(_, value)| value.len() >= 8)
         .collect();
@@ -397,6 +403,27 @@ mod tests {
                     "password={quote}opaque{newline}private{quote}\npermission denied /workspace"
                 );
                 assert_eq!(scrub(&text, []), "[REDACTED]\npermission denied /workspace");
+            }
+        }
+    }
+    #[test]
+    fn diagnostic_scrub_labelled_known_fragments() {
+        for delimiter in [':', '='] {
+            for ellipsis in ["...", "…"] {
+                let text = format!("failed: error{delimiter}synthetic-private{ellipsis}");
+                assert_eq!(
+                    scrub(&text, ["synthetic-private-value"]),
+                    "failed: [REDACTED]"
+                );
+                let short = format!("error{delimiter}abcdefg{ellipsis}");
+                assert_eq!(scrub(&short, ["abcdefgh-private-value"]), short);
+                assert_eq!(
+                    scrub(
+                        &format!("error{delimiter}abcdefgh{ellipsis}"),
+                        ["abcdefgh-private-value"]
+                    ),
+                    "[REDACTED]"
+                );
             }
         }
     }
