@@ -1036,7 +1036,9 @@ struct RetainedCodexIo {
     process: crate::TransportProcess,
     stdin: FrameWriter,
     reader: BufReader<crate::TransportReader>,
-    stderr_task: tokio::task::JoinHandle<std::io::Result<String>>,
+    stderr_task: Option<crate::process::StderrCapture>,
+    // Lifetime-scoped: continuations can omit or rotate their environment.
+    launch_secrets: Vec<crate::SecretString>,
     stdout_task: Option<tokio::task::JoinHandle<std::io::Result<String>>>,
 }
 
@@ -1276,7 +1278,9 @@ impl RetainedCodexProcess {
         self.usable.store(false, Ordering::Release);
         self.generation.fetch_add(1, Ordering::AcqRel);
         if let Some(mut io) = self.io.lock().await.take() {
-            io.stderr_task.abort();
+            if let Some(stderr) = &io.stderr_task {
+                stderr.abort();
+            }
             if let Some(stdout_task) = io.stdout_task.take() {
                 stdout_task.abort();
             }
@@ -4153,7 +4157,7 @@ impl AgentRuntime {
             let diagnostic = if stderr.trim().is_empty() {
                 format!("{provider} metadata command exited unsuccessfully")
             } else {
-                redact_secrets(stderr.trim(), &context.environment)
+                redact_secrets(&stderr, &context.environment)
             };
             return (
                 static_controls,
@@ -5659,10 +5663,18 @@ impl AgentRuntime {
                     process,
                     stdin,
                     reader,
-                    stderr_task: tokio::spawn(crate::process::bounded_stderr(
+                    stderr_task: Some(crate::process::StderrCapture::spawn(
                         stderr,
                         STDERR_TAIL_BYTES,
                     )),
+                    launch_secrets: request
+                        .environment
+                        .values()
+                        .cloned()
+                        .chain(spec.environment.values().map(|value| {
+                            crate::SecretString::new(value.to_string_lossy().into_owned())
+                        }))
+                        .collect(),
                     stdout_task,
                 })),
                 generation: AtomicU64::new(0),
@@ -6202,13 +6214,32 @@ impl AgentRuntime {
                 }
             };
             let Some(frame) = frame else {
+                // stdout EOF is often the sandbox launcher rejecting startup.
+                // Keep its bounded stderr even when a descendant holds the pipe.
+                let diagnostic = match io.stderr_task.take() {
+                    Some(capture) => capture.finish(STDERR_DRAIN_GRACE).await.unwrap_or_default(),
+                    None => String::new(),
+                };
+                let diagnostic = crate::diagnostic_scrub::scrub(
+                    &diagnostic,
+                    io.launch_secrets
+                        .iter()
+                        .chain(request.environment.values())
+                        .map(crate::SecretString::expose),
+                )
+                .trim()
+                .chars()
+                .take(STDERR_TAIL_BYTES)
+                .collect::<String>();
                 return Err(RuntimeError::ProcessFailed {
                     provider,
                     kind: ProviderProcessErrorKind::Unknown,
                     exit_code: None,
-                    stderr: format!(
-                        "retained {provider} process exited before completing the turn"
-                    ),
+                    stderr: if diagnostic.is_empty() {
+                        format!("retained {provider} process exited before completing the turn")
+                    } else {
+                        diagnostic
+                    },
                     provider_code: None,
                     delivery: crate::lifecycle::DeliveryState::PossiblySent,
                 });
@@ -6925,18 +6956,7 @@ fn redact_secrets(
     value: &str,
     environment: &std::collections::BTreeMap<String, crate::SecretString>,
 ) -> String {
-    let mut secrets = environment
-        .values()
-        .map(crate::SecretString::expose)
-        .filter(|secret| !secret.is_empty() && value.contains(secret))
-        .collect::<Vec<_>>();
-    secrets.sort_unstable_by_key(|secret| std::cmp::Reverse(secret.len()));
-    secrets.dedup();
-    secrets
-        .into_iter()
-        .fold(value.to_string(), |redacted, secret| {
-            redacted.replace(secret, "[REDACTED]")
-        })
+    crate::diagnostic_scrub::scrub(value, environment.values().map(crate::SecretString::expose))
 }
 
 const fn provider_order(provider: Provider) -> u8 {
@@ -10217,7 +10237,11 @@ mod tests {
                 process,
                 stdin: FrameWriter::new(Box::new(tokio::io::sink())),
                 reader: BufReader::new(output),
-                stderr_task: tokio::spawn(async { Ok(String::new()) }),
+                stderr_task: Some(crate::process::StderrCapture::spawn(
+                    tokio::io::empty(),
+                    STDERR_TAIL_BYTES,
+                )),
+                launch_secrets: Vec::new(),
                 stdout_task: None,
             })),
             generation: AtomicU64::new(0),

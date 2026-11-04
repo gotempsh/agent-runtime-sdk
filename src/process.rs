@@ -270,6 +270,7 @@ pub(crate) async fn bounded_stderr<R>(mut stderr: R, capacity: usize) -> std::io
 where
     R: tokio::io::AsyncRead + Unpin,
 {
+    let mut overflow = false;
     let mut tail = VecDeque::with_capacity(capacity);
     let mut buffer = [0_u8; 4096];
     loop {
@@ -279,10 +280,14 @@ where
         }
         for byte in &buffer[..read] {
             if tail.len() == capacity {
+                overflow = true;
                 tail.pop_front();
             }
             tail.push_back(*byte);
         }
+    }
+    if overflow {
+        return Ok("Launcher diagnostic exceeded the capture limit; content withheld to protect credentials.".into());
     }
     Ok(String::from_utf8_lossy(&tail.into_iter().collect::<Vec<_>>()).into_owned())
 }
@@ -309,6 +314,9 @@ pub(crate) struct StderrCapture {
     task: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
     tail: Arc<Mutex<VecDeque<u8>>>,
     detached: bool,
+    overflow: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(test)]
+    before_snapshot_lock: Option<Box<dyn FnOnce() + Send + Sync>>,
 }
 
 impl StderrCapture {
@@ -318,6 +326,8 @@ impl StderrCapture {
     {
         let tail = Arc::new(Mutex::new(VecDeque::new()));
         let shared = Arc::clone(&tail);
+        let overflow = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let overflow_task = Arc::clone(&overflow);
         let task = tokio::spawn(async move {
             let mut buffer = [0_u8; 4096];
             loop {
@@ -330,6 +340,7 @@ impl StderrCapture {
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 for byte in &buffer[..read] {
                     if tail.len() == capacity {
+                        overflow_task.store(true, std::sync::atomic::Ordering::Relaxed);
                         tail.pop_front();
                     }
                     tail.push_back(*byte);
@@ -340,6 +351,9 @@ impl StderrCapture {
             task: Some(task),
             tail,
             detached: false,
+            overflow,
+            #[cfg(test)]
+            before_snapshot_lock: None,
         }
     }
 
@@ -379,10 +393,19 @@ impl StderrCapture {
             // or stops it according to `detach`.
             Err(_) => {}
         }
+        // Test-only scheduling point immediately before acquiring the snapshot
+        // lock, so a reader update in this window can be exercised deterministically.
+        #[cfg(test)]
+        if let Some(before_lock) = self.before_snapshot_lock.take() {
+            before_lock();
+        }
         let tail = self
             .tail
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.overflow.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok("Launcher diagnostic exceeded the capture limit; content withheld to protect credentials.".into());
+        }
         let bytes = tail.iter().copied().collect::<Vec<_>>();
         Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
@@ -708,9 +731,48 @@ mod tests {
         // The writer stays open, as a descendant holding stderr would.
         let started = std::time::Instant::now();
         let tail = capture.finish(Duration::from_millis(200)).await.unwrap();
-        assert_eq!(tail, "23456789");
+        assert!(tail.contains("content withheld"));
         assert!(started.elapsed() < Duration::from_secs(5));
         drop(writer);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stderr_capture_checks_overflow_after_the_snapshot_lock() {
+        use std::sync::atomic::Ordering;
+
+        let (reader, mut writer) = tokio::io::duplex(64);
+        let mut capture = StderrCapture::spawn(reader, 8);
+        let overflow = Arc::clone(&capture.overflow);
+        let write_now = Arc::new(tokio::sync::Notify::new());
+        let writer_ready = Arc::clone(&write_now);
+        let (overflowed_tx, overflowed_rx) = std::sync::mpsc::sync_channel(1);
+        let writer_task = tokio::spawn(async move {
+            writer_ready.notified().await;
+            writer.write_all(b"synthetic-private-tail").await.unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !overflow.load(Ordering::Relaxed) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("reader must overflow before the snapshot resumes");
+            overflowed_tx.send(()).unwrap();
+        });
+        let overflowed_rx = Mutex::new(overflowed_rx);
+        capture.before_snapshot_lock = Some(Box::new(move || {
+            // The old ordering would already have read `overflow == false`.
+            // Let the real reader overflow under `tail` before finish locks it.
+            write_now.notify_one();
+            overflowed_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(5))
+                .expect("reader update must finish before snapshot locking");
+        }));
+        let diagnostic = capture.finish(Duration::ZERO).await.unwrap();
+        writer_task.await.unwrap();
+        assert!(diagnostic.contains("content withheld"), "{diagnostic}");
+        assert!(!diagnostic.contains("ate-tail"));
     }
 
     #[tokio::test]

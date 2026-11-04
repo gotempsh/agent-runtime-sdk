@@ -1374,3 +1374,158 @@ async fn claude_reused_process_busy_past_the_startup_deadline_is_not_a_startup_f
     assert_eq!(f.spawns().len(), 1, "{:?}", f.events());
     f.dispose().await;
 }
+
+#[tokio::test]
+async fn retained_launcher_failure_preserves_redacted_stderr_without_waiting_for_descendants() {
+    for diagnostic in [
+        "nono: Sandbox initialization failed",
+        "docker: Cannot connect to the Docker daemon",
+    ] {
+        let f = Fixture::new(true, Duration::from_secs(30)).await;
+        fs::write(f.dir.path().join("claude-fixture"), format!(
+            "#!/bin/sh\nread line\nprintf '%s\\n' '{diagnostic}: diagnostic-secret\nAuthorization: Bearer synthetic-file-token\nhttps://synthetic-user:synthetic-pass@example.test\napi_key=synthetic-cut\nfailed: {{synthetic-private...}}\nfailed: (abcdefg!): detail' >&2\nprintf '%s' 'alpha bravo charlie delta' >&2\nsleep 5 >&2 &\nexit 1\n"
+        )).unwrap();
+        let mut input = Fixture::input("launcher-failed", "hello");
+        input.environment.insert(
+            "DIAGNOSTIC_SECRET".into(),
+            temps_agent_runtime::SecretString::new("diagnostic-secret"),
+        );
+        input.environment.insert(
+            "MULTIWORD_SECRET".into(),
+            temps_agent_runtime::SecretString::new("alpha bravo charlie delta echo"),
+        );
+        input.environment.insert(
+            "WRAPPED_SECRET".into(),
+            temps_agent_runtime::SecretString::new("synthetic-private-value"),
+        );
+        input.environment.insert(
+            "PUNCTUATED_SECRET".into(),
+            temps_agent_runtime::SecretString::new("abcdefg!private-value"),
+        );
+        let started = std::time::Instant::now();
+        let failure = tokio::time::timeout(Duration::from_secs(4), async {
+            f.handle
+                .start_turn(input)
+                .await
+                .unwrap()
+                .wait()
+                .await
+                .unwrap_err()
+        })
+        .await
+        .expect("failure must not wait for the descendant");
+        assert!(failure.message.contains(diagnostic), "{}", failure.message);
+        assert!(
+            !failure.message.contains("diagnostic-secret")
+                && !failure.message.contains("synthetic")
+                && !failure.message.contains("alpha bravo")
+                && !failure.message.contains("abcdefg"),
+            "{}",
+            failure.message
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "stderr held by descendants must not stall failure"
+        );
+        f.dispose().await;
+    }
+}
+
+#[tokio::test]
+async fn retained_launcher_failure_bounds_stderr_and_handles_empty_diagnostics() {
+    for oversized in [false, true] {
+        let f = Fixture::new(true, Duration::from_secs(30)).await;
+        let script = if oversized {
+            "#!/usr/bin/env python3\nimport sys\nsys.stdin.readline()\nsys.stderr.write('discarded-prefix' + 'x' * 65536 + 'tail-marker\\n')\nsys.exit(1)\n"
+        } else {
+            "#!/bin/sh\nread line\nexit 1\n"
+        };
+        fs::write(f.dir.path().join("claude-fixture"), script).unwrap();
+        let failure = f
+            .handle
+            .start_turn(Fixture::input("launcher-failed", "hello"))
+            .await
+            .unwrap()
+            .wait()
+            .await
+            .unwrap_err();
+        if oversized {
+            assert!(failure.message.contains("content withheld"));
+            assert!(!failure.message.contains("discarded-prefix"));
+            // RuntimeFailure adds a small display prefix to the bounded diagnostic.
+            assert!(failure.message.len() < 33 * 1024);
+        } else {
+            assert!(failure
+                .message
+                .contains("process exited before completing the turn"));
+        }
+        f.dispose().await;
+    }
+}
+
+#[tokio::test]
+async fn retained_continuation_scrubs_original_launch_secrets() {
+    for rotate in [false, true] {
+        let f = Fixture::new(true, Duration::from_secs(30)).await;
+        let path = f.dir.path().join("claude-fixture");
+        let script = fs::read_to_string(&path).unwrap().replace(
+            "  result('SHELL-FOLLOWUP')",
+            "  while not os.path.exists(RELEASE+'-eof'):time.sleep(.01)\n  sys.stderr.write('nono: permission denied '+os.environ['LAUNCH_ONLY']+'\\n');sys.stderr.flush()\n  os._exit(2)",
+        );
+        fs::write(path, script).unwrap();
+        let mut first = Fixture::input("launch", "spawn-shell");
+        let secret = "v7Q2m9R4p6T8n3L5";
+        first.environment.insert(
+            "LAUNCH_ONLY".into(),
+            temps_agent_runtime::SecretString::new(secret),
+        );
+        let mut follow_ups = f.runtime.subscribe_background_follow_ups();
+        assert_eq!(
+            f.handle
+                .start_turn(first)
+                .await
+                .unwrap()
+                .wait()
+                .await
+                .unwrap()
+                .text,
+            "SERVING"
+        );
+        f.wait_for_log("shell-start").await;
+        f.release_background();
+        tokio::time::timeout(Duration::from_secs(10), follow_ups.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut continuation = Fixture::continuation("continue");
+        if rotate {
+            continuation.environment.insert(
+                "LAUNCH_ONLY".into(),
+                temps_agent_runtime::SecretString::new("replacement-opaque-value"),
+            );
+        }
+        let turn = f.handle.start_turn(continuation).await.unwrap();
+        let (mut events, completion) = turn.into_parts();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(envelope) = events.next().await {
+                if matches!(envelope.event, RuntimeEvent::ProviderEvent { event: TurnEvent::TextDelta { text } } if text.contains("SHELL-FOLLOWUP")) {
+                    return;
+                }
+            }
+            panic!("continuation must claim its pending answer before EOF");
+        }).await.unwrap();
+        fs::write(f.dir.path().join("release-eof"), "go").unwrap();
+        let failure = tokio::time::timeout(Duration::from_secs(10), completion.wait())
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            failure.message.contains("permission denied"),
+            "{}",
+            failure.message
+        );
+        assert!(!failure.message.contains(secret), "{}", failure.message);
+        assert_eq!(f.spawns().len(), 1);
+        f.dispose().await;
+    }
+}

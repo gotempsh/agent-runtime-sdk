@@ -5,7 +5,21 @@ Versioning and Keep a Changelog conventions.
 
 ## [Unreleased]
 
+### Fixed
+
+- Retained provider processes now preserve startup stderr on unexpected stdout
+  EOF, so sandbox launcher failures carry their actual diagnostic. Capture keeps
+  up to 32 KiB and waits at most two seconds for inherited stderr pipes. Overflow
+  is withheld rather than exposing credential fragments. Diagnostics scrub known
+  values and common credential patterns before trimming and display truncation;
+  unknown opaque secrets without recognizable markers remain a limitation.
+
 ### Security
+
+- Retained stderr redaction keeps the process launch environment across
+  continuations, including when the new request omits or rotates credentials.
+  Unknown secret-key assignments and escaped quotes in credential values are
+  scrubbed before diagnostics are returned.
 
 - `opencode serve` now requires HTTP Basic credentials
   (`OPENCODE_SERVER_USERNAME`/`OPENCODE_SERVER_PASSWORD`, a per-process

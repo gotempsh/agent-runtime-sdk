@@ -13,6 +13,7 @@
 
 mod adapter;
 mod chat;
+mod diagnostic_scrub;
 mod discovery;
 mod error;
 mod extensions;
