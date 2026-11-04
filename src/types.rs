@@ -309,7 +309,7 @@ impl SecretString {
                 name.to_ascii_uppercase().as_str(),
                 "HTTP_PROXY" | "HTTPS_PROXY" | "ALL_PROXY"
             )
-            || (name == "GIT_CONFIG_VALUE_0" && self.expose() != "*")
+            || (name.eq_ignore_ascii_case("GIT_CONFIG_VALUE_0") && self.expose() != "*")
         {
             return true;
         }
