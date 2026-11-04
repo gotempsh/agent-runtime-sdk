@@ -98,7 +98,16 @@ fn credential_ranges(text: &str, values: &[String]) -> Vec<(usize, usize)> {
     let mut ranges = Vec::new();
     let mut fragments: Vec<(&str, &str)> = text
         .split_whitespace()
-        .map(|token| token.trim_matches(|c: char| "\"'(),;[]:".contains(c)))
+        .flat_map(|token| {
+            // Normalization must add candidates, never replace an original:
+            // punctuation may be part of the known credential itself.
+            [
+                token,
+                token.trim_matches(|c: char| {
+                    c.is_ascii_punctuation() && !matches!(c, '.' | '-' | '_')
+                }),
+            ]
+        })
         .chain(
             [&*QUOTED_VALUES, &*UNFINISHED_QUOTED_VALUES]
                 .into_iter()
@@ -113,12 +122,12 @@ fn credential_ranges(text: &str, values: &[String]) -> Vec<(usize, usize)> {
             std::iter::once(token)
                 .chain(token.split_once(':').map(|(_, value)| value))
                 .chain(token.split_once('=').map(|(_, value)| value))
-                .map(move |value| {
-                    let value = value
+                .flat_map(move |value| {
+                    let without_ellipsis = value
                         .strip_suffix("...")
                         .or_else(|| value.strip_suffix('…'))
                         .unwrap_or(value);
-                    (token, value)
+                    [(token, value), (token, without_ellipsis)]
                 })
         })
         .filter(|(_, value)| value.len() >= 8)
@@ -548,6 +557,52 @@ mod tests {
             scrub("failed: alpha%20bravo%0D%0A", ["alpha bravo charlie"]),
             "failed: [REDACTED]%0D%0A"
         );
+    }
+    #[test]
+    fn diagnostic_scrub_wrapped_known_fragments() {
+        for (open, close) in [
+            ("{", "}"),
+            ("<", ">"),
+            ("`", "`"),
+            ("[", "]"),
+            ("(", ")"),
+            ("\"", "\""),
+            ("'", "'"),
+        ] {
+            for ellipsis in ["...", "…"] {
+                for punctuation in ["", ":", ";", ",", "!", "?"] {
+                    let input = format!(
+                        "failed: {open}synthetic-private{ellipsis}{close}{punctuation} detail"
+                    );
+                    assert_eq!(
+                        scrub(&input, ["synthetic-private-value"]),
+                        format!("failed: {open}[REDACTED]{close}{punctuation} detail")
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            scrub(
+                "failed: %7Bsynthetic-private...%7D detail",
+                ["synthetic-private-value"]
+            ),
+            "failed: %7B[REDACTED]%7D detail"
+        );
+    }
+    #[test]
+    fn diagnostic_scrub_preserves_original_fragment_candidates() {
+        for punctuation in [
+            ":", "{", "}", "<", ">", "`", "!", "?", "/", "+", "=", "%", "...",
+        ] {
+            let secret = format!("abcdefg{punctuation}private-value");
+            assert_eq!(
+                scrub(
+                    &format!("failed: abcdefg{punctuation} detail"),
+                    [secret.as_str()]
+                ),
+                "failed: [REDACTED] detail"
+            );
+        }
     }
     #[test]
     fn diagnostic_scrub_explicit_before_trimming_and_truncation() {
