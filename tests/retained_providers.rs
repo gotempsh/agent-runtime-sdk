@@ -1383,7 +1383,7 @@ async fn retained_launcher_failure_preserves_redacted_stderr_without_waiting_for
     ] {
         let f = Fixture::new(true, Duration::from_secs(30)).await;
         fs::write(f.dir.path().join("claude-fixture"), format!(
-            "#!/bin/sh\nread line\nprintf '%s\\n' '{diagnostic}: diagnostic-secret' >&2\nsleep 5 >&2 &\nexit 1\n"
+            "#!/bin/sh\nread line\nprintf '%s\\n' '{diagnostic}: diagnostic-secret\nAuthorization: Bearer synthetic-file-token\nhttps://synthetic-user:synthetic-pass@example.test\napi_key=synthetic-cut' >&2\nsleep 5 >&2 &\nexit 1\n"
         )).unwrap();
         let mut input = Fixture::input("launcher-failed", "hello");
         input.environment.insert(
@@ -1404,7 +1404,8 @@ async fn retained_launcher_failure_preserves_redacted_stderr_without_waiting_for
         .expect("failure must not wait for the descendant");
         assert!(failure.message.contains(diagnostic), "{}", failure.message);
         assert!(
-            !failure.message.contains("diagnostic-secret"),
+            !failure.message.contains("diagnostic-secret")
+                && !failure.message.contains("synthetic"),
             "{}",
             failure.message
         );
@@ -1435,7 +1436,7 @@ async fn retained_launcher_failure_bounds_stderr_and_handles_empty_diagnostics()
             .await
             .unwrap_err();
         if oversized {
-            assert!(failure.message.contains("tail-marker"));
+            assert!(failure.message.contains("content withheld"));
             assert!(!failure.message.contains("discarded-prefix"));
             // RuntimeFailure adds a small display prefix to the bounded diagnostic.
             assert!(failure.message.len() < 33 * 1024);

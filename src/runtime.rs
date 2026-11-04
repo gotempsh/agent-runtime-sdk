@@ -4155,7 +4155,7 @@ impl AgentRuntime {
             let diagnostic = if stderr.trim().is_empty() {
                 format!("{provider} metadata command exited unsuccessfully")
             } else {
-                redact_secrets(stderr.trim(), &context.environment)
+                redact_secrets(&stderr, &context.environment)
             };
             return (
                 static_controls,
@@ -6210,7 +6210,8 @@ impl AgentRuntime {
                     Some(capture) => capture.finish(STDERR_DRAIN_GRACE).await.unwrap_or_default(),
                     None => String::new(),
                 };
-                let diagnostic = redact_secrets(diagnostic.trim(), &request.environment)
+                let diagnostic = redact_secrets(&diagnostic, &request.environment)
+                    .trim()
                     .chars()
                     .take(STDERR_TAIL_BYTES)
                     .collect::<String>();
@@ -6939,18 +6940,7 @@ fn redact_secrets(
     value: &str,
     environment: &std::collections::BTreeMap<String, crate::SecretString>,
 ) -> String {
-    let mut secrets = environment
-        .values()
-        .map(crate::SecretString::expose)
-        .filter(|secret| !secret.is_empty() && value.contains(secret))
-        .collect::<Vec<_>>();
-    secrets.sort_unstable_by_key(|secret| std::cmp::Reverse(secret.len()));
-    secrets.dedup();
-    secrets
-        .into_iter()
-        .fold(value.to_string(), |redacted, secret| {
-            redacted.replace(secret, "[REDACTED]")
-        })
+    crate::diagnostic_scrub::scrub(value, environment.values().map(crate::SecretString::expose))
 }
 
 const fn provider_order(provider: Provider) -> u8 {

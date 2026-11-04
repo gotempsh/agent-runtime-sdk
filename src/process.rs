@@ -270,6 +270,7 @@ pub(crate) async fn bounded_stderr<R>(mut stderr: R, capacity: usize) -> std::io
 where
     R: tokio::io::AsyncRead + Unpin,
 {
+    let mut overflow = false;
     let mut tail = VecDeque::with_capacity(capacity);
     let mut buffer = [0_u8; 4096];
     loop {
@@ -279,10 +280,14 @@ where
         }
         for byte in &buffer[..read] {
             if tail.len() == capacity {
+                overflow = true;
                 tail.pop_front();
             }
             tail.push_back(*byte);
         }
+    }
+    if overflow {
+        return Ok("Launcher diagnostic exceeded the capture limit; content withheld to protect credentials.".into());
     }
     Ok(String::from_utf8_lossy(&tail.into_iter().collect::<Vec<_>>()).into_owned())
 }
@@ -309,6 +314,7 @@ pub(crate) struct StderrCapture {
     task: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
     tail: Arc<Mutex<VecDeque<u8>>>,
     detached: bool,
+    overflow: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl StderrCapture {
@@ -318,6 +324,8 @@ impl StderrCapture {
     {
         let tail = Arc::new(Mutex::new(VecDeque::new()));
         let shared = Arc::clone(&tail);
+        let overflow = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let overflow_task = Arc::clone(&overflow);
         let task = tokio::spawn(async move {
             let mut buffer = [0_u8; 4096];
             loop {
@@ -330,6 +338,7 @@ impl StderrCapture {
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 for byte in &buffer[..read] {
                     if tail.len() == capacity {
+                        overflow_task.store(true, std::sync::atomic::Ordering::Relaxed);
                         tail.pop_front();
                     }
                     tail.push_back(*byte);
@@ -340,6 +349,7 @@ impl StderrCapture {
             task: Some(task),
             tail,
             detached: false,
+            overflow,
         }
     }
 
@@ -378,6 +388,9 @@ impl StderrCapture {
             // The reader is still running; dropping `self` below leaves it
             // or stops it according to `detach`.
             Err(_) => {}
+        }
+        if self.overflow.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok("Launcher diagnostic exceeded the capture limit; content withheld to protect credentials.".into());
         }
         let tail = self
             .tail
@@ -708,7 +721,7 @@ mod tests {
         // The writer stays open, as a descendant holding stderr would.
         let started = std::time::Instant::now();
         let tail = capture.finish(Duration::from_millis(200)).await.unwrap();
-        assert_eq!(tail, "23456789");
+        assert!(tail.contains("content withheld"));
         assert!(started.elapsed() < Duration::from_secs(5));
         drop(writer);
     }

@@ -9,8 +9,10 @@ Versioning and Keep a Changelog conventions.
 
 - Retained provider processes now preserve startup stderr on unexpected stdout
   EOF, so sandbox launcher failures carry their actual diagnostic. Capture keeps
-  the last 32 KiB, waits at most two seconds for inherited stderr pipes, and uses
-  the same explicit-environment secret redaction as other process failures.
+  up to 32 KiB and waits at most two seconds for inherited stderr pipes. Overflow
+  is withheld rather than exposing credential fragments. Diagnostics scrub known
+  values and common credential patterns before trimming and display truncation;
+  unknown opaque secrets without recognizable markers remain a limitation.
 
 ### Security
 
