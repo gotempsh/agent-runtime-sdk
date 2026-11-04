@@ -990,6 +990,10 @@ impl TailnetDaemon {
         let status = match queried {
             Ok(status) => status,
             Err(error) => {
+                let _commit = self.inner.lifecycle.lock().await;
+                if self.routing_generation().await != before {
+                    return Err(error);
+                }
                 let mut state = self.inner.state.write().await;
                 state.unreachable = Some(error.to_string());
                 state.updated_at_ms = now_ms();
@@ -1951,6 +1955,39 @@ echo '{"BackendState":"Running","Peer":{"old":{"HostName":"old-peer"}}}'
         assert!(stale.socks_addr.is_none());
         daemon.refresh().await.unwrap();
         assert!(daemon.routing_snapshot().await.available);
+
+        // A failing response from an old incarnation must not poison a
+        // successful refresh performed by the explicit restart itself.
+        std::fs::write(
+            &tailscale,
+            r#"#!/bin/sh
+root=$(dirname "$0")
+if mkdir "$root/failing-query" 2>/dev/null; then
+  touch "$root/failing-query-started"
+  while [ ! -e "$root/release-failing-query" ]; do sleep 0.01; done
+  echo 'old daemon failed' >&2
+  exit 1
+fi
+echo '{"BackendState":"Running","Peer":{"new":{"HostName":"new-peer"}}}'
+"#,
+        )
+        .unwrap();
+        let old = daemon.clone();
+        let query = tokio::spawn(async move { old.refresh().await });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !temp.path().join("failing-query-started").exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        daemon.restart().await.unwrap();
+        assert!(daemon.routing_snapshot().await.available);
+        std::fs::write(temp.path().join("release-failing-query"), "").unwrap();
+        assert!(query.await.unwrap().is_err());
+        assert!(daemon.routing_snapshot().await.available);
+        assert_eq!(daemon.status().await.state, TailnetState::Running);
+        assert!(daemon.access().await.is_ok());
 
         // A daemon that stops answering is no longer reported as connected.
         std::fs::write(&tailscale, "#!/bin/sh\necho \"$1\" >&2\nexit 1\n").unwrap();
