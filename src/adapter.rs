@@ -562,6 +562,23 @@ pub trait AgentAdapter: Send + Sync {
         None
     }
 
+    /// A reply completed, but provider-wide idleness is still being reconciled.
+    /// The runtime bounds this phase independently of activity/heartbeats.
+    fn completion_pending(&self, _state: &AdapterState) -> bool {
+        false
+    }
+
+    /// If the transport dies during settlement, a completed reply can be
+    /// returned only after the provider process tree has been retired.
+    fn can_finish_after_retirement(&self, _state: &AdapterState) -> bool {
+        false
+    }
+
+    /// A late request after completion requires retiring this connection.
+    fn retire_after_completion(&self, _state: &AdapterState) -> bool {
+        false
+    }
+
     /// Encode another user message for a turn that is still running.
     ///
     /// The adapter records the message as belonging to the turn, so the turn

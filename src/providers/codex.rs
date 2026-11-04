@@ -1057,6 +1057,16 @@ impl AgentAdapter for Codex {
         }
     }
 
+    fn completion_pending(&self, state: &AdapterState) -> bool {
+        self.app_server_mode() && codex_app_server::completion_pending(state)
+    }
+    fn can_finish_after_retirement(&self, state: &AdapterState) -> bool {
+        self.app_server_mode() && codex_app_server::can_finish_after_retirement(state)
+    }
+    fn retire_after_completion(&self, state: &AdapterState) -> bool {
+        self.app_server_mode() && codex_app_server::retire_after_completion(state)
+    }
+
     fn retained_keepalive_probe(&self, session_id: &str) -> Option<Vec<u8>> {
         self.app_server_mode()
             .then(|| codex_app_server::keepalive_probe(session_id))

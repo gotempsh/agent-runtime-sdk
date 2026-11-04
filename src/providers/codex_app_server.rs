@@ -80,6 +80,15 @@ struct TurnState {
     /// Whether this turn resumes an existing Codex thread.
     resume: bool,
     retained: bool,
+    /// A provider turn ended; retain ownership until a state read confirms idle.
+    completion_pending: bool,
+    completion_settled: bool,
+    completion_epoch: u64,
+    completion_probe: Option<String>,
+    retire: bool,
+    goal_active: bool,
+    completed_turn_ids: std::collections::BTreeSet<String>,
+
     /// Model requested for this turn, used to label context-window usage
     /// before the app server reports the thread's resolved model.
     model: Option<String>,
@@ -161,6 +170,18 @@ struct TitleFlow {
     response: Option<String>,
     /// The user's thread was named some other way meanwhile; that name wins.
     superseded: bool,
+}
+
+pub(super) fn completion_pending(state: &AdapterState) -> bool {
+    let turn = load(state);
+    turn.completion_pending && !turn.completion_settled
+}
+pub(super) fn can_finish_after_retirement(state: &AdapterState) -> bool {
+    let turn = load(state);
+    turn.completion_pending && !turn.completion_settled && !turn.goal_active
+}
+pub(super) fn retire_after_completion(state: &AdapterState) -> bool {
+    load(state).retire
 }
 
 pub(super) fn mark_retained(state: &mut AdapterState) {
@@ -366,6 +387,15 @@ pub(super) fn classify_idle_frame(line: &str) -> IdleFrame {
         return IdleFrame::Unexpected;
     };
     let has_method = value.get("method").is_some();
+    // Work that appears after an idle read is not a background terminal log.
+    // There is no owning invocation now; retire instead of silently running
+    // a new provider turn behind the application's Ready state.
+    if value.get("method").and_then(Value::as_str) == Some("turn/started")
+        || (value.get("method").and_then(Value::as_str) == Some("thread/status/changed")
+            && value.pointer("/params/status/type").and_then(Value::as_str) == Some("active"))
+    {
+        return IdleFrame::Unexpected;
+    }
     match value.get("id") {
         None if has_method => IdleFrame::Background,
         Some(id) if !has_method && id.as_str() == Some(ID_KEEPALIVE) => {
@@ -407,10 +437,163 @@ pub(super) fn parse_line(line: &str, state: &mut AdapterState) -> Result<Adapter
         store(state, &turn);
         return Ok(output);
     }
+    // Completion probes are correlated separately from the handshake. A new
+    // provider turn invalidates old responses before it emits any activity.
+    let own_thread = turn.thread_id.is_some()
+        && value.pointer("/params/threadId").and_then(Value::as_str) == turn.thread_id.as_deref();
+    if turn.completion_settled && !method.is_empty() && method != "thread/name/updated" {
+        if own_thread
+            && (method == "turn/started"
+                || (method == "thread/status/changed"
+                    && value.pointer("/params/status/type").and_then(Value::as_str)
+                        == Some("active")))
+        {
+            return Err(protocol(
+                "Codex started unowned work after confirming idle; the provider was stopped",
+            ));
+        }
+        if value.get("id").is_some() {
+            turn.retire = true;
+            output.terminal = true;
+        }
+        store(state, &turn);
+        return Ok(output);
+    }
+    if own_thread && method == "turn/started" && turn.completion_pending {
+        if let Some(id) = reported_turn_id(&value) {
+            if turn.completed_turn_ids.contains(id) {
+                return Ok(output);
+            }
+            if turn.completed_turn_ids.len() >= 1024 {
+                return Err(protocol("Codex exceeded 1024 automatic continuations; the provider was stopped. Resume explicitly to continue."));
+            }
+            if turn.turn_id.as_deref() != Some(id) {
+                turn.turn_id = Some(id.to_owned());
+                turn.completion_pending = false;
+                turn.completion_settled = false;
+                turn.completion_probe = None;
+                turn.streamed.clear();
+                turn.error_message = None;
+            }
+        }
+    }
+    if own_thread
+        && matches!(
+            method.as_str(),
+            "thread/goal/updated" | "thread/goal/cleared" | "thread/status/changed"
+        )
+    {
+        if method == "thread/goal/updated" {
+            turn.goal_active =
+                value.pointer("/params/goal/status").and_then(Value::as_str) == Some("active");
+        } else if method == "thread/goal/cleared" {
+            turn.goal_active = false;
+        }
+        if turn.completion_pending
+            && (turn.completion_probe.is_none() || method.starts_with("thread/goal/"))
+        {
+            begin_completion_probe(&mut turn, &mut output)?;
+        }
+        store(state, &turn);
+        return Ok(output);
+    }
+    if value
+        .get("id")
+        .and_then(Value::as_str)
+        .is_some_and(|id| id.starts_with("sdk-completion-"))
+    {
+        if value.get("id").and_then(Value::as_str) == turn.completion_probe.as_deref() {
+            let id = turn.completion_probe.take().unwrap();
+            let unsupported_goal = id.ends_with("-goal")
+                && value.pointer("/error/code").and_then(Value::as_i64) == Some(-32601);
+            if value.get("error").is_some() && !unsupported_goal {
+                return Err(protocol(
+                    "Codex could not confirm provider idleness; stop and retry the turn",
+                ));
+            }
+            if id.ends_with("-goal") {
+                let goal = value.pointer("/result/goal");
+                if !unsupported_goal && !matches!(goal, Some(Value::Null)) {
+                    let valid = goal
+                        .and_then(|g| g.get("status"))
+                        .and_then(Value::as_str)
+                        .is_some_and(|s| {
+                            matches!(
+                                s,
+                                "active"
+                                    | "paused"
+                                    | "blocked"
+                                    | "usageLimited"
+                                    | "budgetLimited"
+                                    | "complete"
+                            )
+                        });
+                    if !valid {
+                        return Err(protocol(
+                            "Codex returned no usable goal state; stop and retry the turn",
+                        ));
+                    }
+                    if goal
+                        .and_then(|g| g.get("threadId"))
+                        .and_then(Value::as_str)
+                        .is_some_and(|id| Some(id) != turn.thread_id.as_deref())
+                    {
+                        return Err(protocol("Codex returned goal state for a different thread"));
+                    }
+                }
+                turn.goal_active =
+                    value.pointer("/result/goal/status").and_then(Value::as_str) == Some("active");
+                if !turn.goal_active {
+                    let probe = format!("sdk-completion-{}-thread", turn.completion_epoch);
+                    output.writes.push(encode(
+                        &json!({"jsonrpc":"2.0","id":probe,"method":"thread/read",
+                        "params":{"threadId":turn.thread_id,"includeTurns":false}}),
+                    )?);
+                    turn.completion_probe = Some(probe);
+                }
+            } else {
+                if value.pointer("/result/thread/id").and_then(Value::as_str)
+                    != turn.thread_id.as_deref()
+                {
+                    return Err(protocol("Codex returned idle state for a different thread"));
+                }
+                match value
+                    .pointer("/result/thread/status/type")
+                    .and_then(Value::as_str)
+                {
+                    Some("idle") => {
+                        turn.completion_settled = true;
+                        output.terminal = true;
+                    }
+                    Some("active") => {}
+                    _ => {
+                        return Err(protocol(
+                            "Codex returned no usable idle state; stop and retry the turn",
+                        ))
+                    }
+                }
+            }
+        }
+        store(state, &turn);
+        return Ok(output);
+    }
     // A rename names its thread but no turn, so a retained connection would
     // otherwise drop it as uncorrelated.
     if method == "thread/name/updated" && value.get("id").is_none() {
         notification(&value, &method, &mut turn, state, &mut output);
+        store(state, &turn);
+        return Ok(output);
+    }
+    if turn.completion_pending && !method.is_empty() {
+        // Once the segment ended, its late output is stale. A request from
+        // that segment cannot safely be answered: retire before returning.
+        if value.get("id").is_some() {
+            if turn.goal_active {
+                return Err(protocol("Codex requested input after ending a goal segment without starting its continuation; the provider was stopped. Resume the goal explicitly."));
+            }
+            turn.retire = true;
+            output.terminal = true;
+        }
         store(state, &turn);
         return Ok(output);
     }
@@ -439,7 +622,8 @@ pub(super) fn parse_line(line: &str, state: &mut AdapterState) -> Result<Adapter
         store(state, &turn);
         return Ok(output);
     }
-    if turn.retained
+    let needs_turn_correlation = turn.retained || !turn.completed_turn_ids.is_empty();
+    if needs_turn_correlation
         && !method.is_empty()
         && value.get("id").is_none()
         && reported_turn_id(&value).is_none()
@@ -449,7 +633,7 @@ pub(super) fn parse_line(line: &str, state: &mut AdapterState) -> Result<Adapter
         // its dedicated APIs instead of leaking into the active turn stream.
         return Ok(output);
     }
-    if turn.retained
+    if needs_turn_correlation
         && reported_turn_id(&value)
             .is_some_and(|reported| turn.turn_id.as_deref() != Some(reported))
     {
@@ -468,7 +652,7 @@ pub(super) fn parse_line(line: &str, state: &mut AdapterState) -> Result<Adapter
     } else {
         notification(&value, &method, &mut turn, state, &mut output);
     }
-    if output.terminal {
+    if output.terminal || turn.completion_pending {
         // The title is lost for this turn; the next one asks again. Detach a
         // hidden thread a retained connection would otherwise keep loaded.
         if let Some(flow) = turn.title.as_mut() {
@@ -477,6 +661,20 @@ pub(super) fn parse_line(line: &str, state: &mut AdapterState) -> Result<Adapter
     }
     store(state, &turn);
     Ok(output)
+}
+
+fn begin_completion_probe(turn: &mut TurnState, output: &mut AdapterOutput) -> Result<()> {
+    // Parser state is fresh for each invocation, but the connection can be
+    // reused. Never let a delayed old response match a new invocation.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    turn.completion_epoch = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let id = format!("sdk-completion-{}-goal", turn.completion_epoch);
+    output.writes.push(encode(
+        &json!({"jsonrpc":"2.0","id":id,"method":"thread/goal/get",
+        "params":{"threadId":turn.thread_id}}),
+    )?);
+    turn.completion_probe = Some(id);
+    Ok(())
 }
 
 fn turn_scoped_method(method: &str) -> bool {
@@ -499,7 +697,15 @@ fn turn_scoped_method(method: &str) -> bool {
 }
 
 fn belongs_to_active_turn(value: &Value, turn: &TurnState) -> bool {
-    if !turn.retained {
+    if value
+        .pointer("/params/threadId")
+        .and_then(Value::as_str)
+        .is_some_and(|id| Some(id) != turn.thread_id.as_deref())
+        && turn.thread_id.is_some()
+    {
+        return false;
+    }
+    if !turn.retained && turn.completed_turn_ids.is_empty() {
         return true;
     }
     let reported = reported_turn_id(value);
@@ -1434,7 +1640,22 @@ fn notification(
                     return;
                 }
             }
-            output.terminal = true;
+            let succeeded = matches!(
+                completed.get("status").and_then(Value::as_str),
+                Some("completed" | "succeeded")
+            );
+            if succeeded && !turn.manual_compaction && turn.thread_id.is_some() {
+                turn.completion_pending = true;
+                if let Some(id) = &turn.turn_id {
+                    turn.completed_turn_ids.insert(id.clone());
+                }
+                // Encoding these fixed JSON values cannot fail.
+                if let Err(error) = begin_completion_probe(turn, output) {
+                    fail(turn, state, output, &error.to_string(), None);
+                }
+            } else {
+                output.terminal = true;
+            }
             if turn.open_compaction.take().is_some() {
                 // A turn cannot end with its compaction still running; the
                 // application must see it close instead of spinning forever.
@@ -1974,6 +2195,243 @@ mod tests {
                 }]
             }
         })
+    }
+
+    fn continuation_state() -> AdapterState {
+        let mut state = AdapterState::default();
+        store(
+            &mut state,
+            &TurnState {
+                retained: true,
+                thread_id: Some("thread-1".into()),
+                turn_id: Some("turn-1".into()),
+                ..TurnState::default()
+            },
+        );
+        state
+    }
+    fn segment_end(state: &mut AdapterState, id: &str) -> AdapterOutput {
+        feed(
+            state,
+            json!({"method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":id,"status":"completed"}}}),
+        )
+    }
+    fn segment_start(state: &mut AdapterState, thread: &str, id: &str) -> AdapterOutput {
+        feed(
+            state,
+            json!({"method":"turn/started","params":{"threadId":thread,"turn":{"id":id}}}),
+        )
+    }
+    #[test]
+    fn idle_provider_turns_are_retired_not_discarded_as_background_logs() {
+        for frame in [
+            json!({"method":"turn/started","params":{"threadId":"t","turn":{"id":"new"}}}),
+            json!({"method":"thread/status/changed","params":{"threadId":"t","status":{"type":"active"}}}),
+        ] {
+            assert_eq!(
+                classify_idle_frame(&frame.to_string()),
+                IdleFrame::Unexpected
+            );
+        }
+        let terminal =
+            json!({"method":"item/commandExecution/outputDelta","params":{"delta":"log"}});
+        assert_eq!(
+            classify_idle_frame(&terminal.to_string()),
+            IdleFrame::Background
+        );
+    }
+
+    #[test]
+    fn continuation_rejects_stale_probes_and_previous_or_foreign_turns() {
+        let mut state = continuation_state();
+        let first = segment_end(&mut state, "turn-1");
+        let goal_probe = writes(&first)[0].clone();
+        let read = answer(&mut state, &goal_probe, json!({"goal":null}));
+        let idle_probe = writes(&read)[0].clone();
+        segment_start(&mut state, "other-thread", "turn-x");
+        assert_eq!(load(&state).turn_id.as_deref(), Some("turn-1"));
+        segment_start(&mut state, "thread-1", "turn-2");
+        assert!(
+            !answer(
+                &mut state,
+                &idle_probe,
+                json!({"thread":{"id":"thread-1","status":{"type":"idle"}}})
+            )
+            .terminal
+        );
+        segment_end(&mut state, "turn-2");
+        segment_start(&mut state, "thread-1", "turn-1");
+        assert_eq!(load(&state).turn_id.as_deref(), Some("turn-2"));
+        let foreign = feed(
+            &mut state,
+            json!({"method":"item/agentMessage/delta","params":{"threadId":"other-thread","turnId":"turn-2","delta":"foreign"}}),
+        );
+        assert_eq!(foreign.events, [] as [TurnEvent; 0]);
+    }
+    #[test]
+    fn continuation_filters_previous_segment_events_in_both_execution_modes() {
+        for retained in [false, true] {
+            let mut state = continuation_state();
+            let mut turn = load(&state);
+            turn.retained = retained;
+            store(&mut state, &turn);
+            segment_end(&mut state, "turn-1");
+            segment_start(&mut state, "thread-1", "turn-2");
+            let previous_output = feed(
+                &mut state,
+                json!({"method":"item/agentMessage/delta",
+                "params":{"threadId":"thread-1","turnId":"turn-1","delta":"stale"}}),
+            );
+            assert_eq!(previous_output.events, [] as [TurnEvent; 0]);
+            let stale_end = segment_end(&mut state, "turn-1");
+            assert!(!stale_end.terminal && no_writes(&stale_end));
+            assert!(!completion_pending(&state));
+            let current = feed(
+                &mut state,
+                json!({"method":"item/agentMessage/delta",
+                "params":{"threadId":"thread-1","turnId":"turn-2","delta":"current"}}),
+            );
+            assert!(current
+                .events
+                .iter()
+                .any(|e| matches!(e, TurnEvent::TextDelta { text } if text == "current")));
+        }
+    }
+
+    #[test]
+    fn completion_probe_ids_do_not_repeat_across_invocations() {
+        let mut earlier = continuation_state();
+        let first = segment_end(&mut earlier, "turn-1");
+        let old_goal = writes(&first)[0].clone();
+        let read = answer(&mut earlier, &old_goal, json!({"goal":null}));
+        let old_idle = writes(&read)[0].clone();
+        let mut current = continuation_state();
+        let next = segment_end(&mut current, "turn-1");
+        let new_goal = writes(&next)[0].clone();
+        assert_ne!(old_goal["id"], new_goal["id"]);
+        let stale_goal = answer(&mut current, &old_goal, json!({"goal":null}));
+        assert!(!stale_goal.terminal && no_writes(&stale_goal));
+        let stale_idle = answer(
+            &mut current,
+            &old_idle,
+            json!({"thread":{"id":"thread-1","status":{"type":"idle"}}}),
+        );
+        assert!(!stale_idle.terminal && no_writes(&stale_idle));
+        assert_eq!(
+            load(&current).completion_probe.as_deref(),
+            new_goal["id"].as_str()
+        );
+    }
+
+    #[test]
+    fn session_rename_is_delivered_while_completion_is_pending() {
+        let mut state = continuation_state();
+        segment_end(&mut state, "turn-1");
+        let foreign = feed(
+            &mut state,
+            json!({"method":"thread/name/updated", "params":{"threadId":"other", "threadName":"wrong"}}),
+        );
+        assert_eq!(foreign.events, [] as [TurnEvent; 0]);
+        let renamed = feed(
+            &mut state,
+            json!({"method":"thread/name/updated", "params":{"threadId":"thread-1", "threadName":"New title"}}),
+        );
+        assert!(renamed.events.iter().any(
+            |event| matches!(event, TurnEvent::SessionTitle { title } if title == "New title")
+        ));
+        assert!(completion_pending(&state));
+        assert!(!renamed.terminal);
+    }
+
+    #[test]
+    fn confirmed_idle_disarms_settlement_without_accepting_late_work() {
+        let mut state = continuation_state();
+        let completed = segment_end(&mut state, "turn-1");
+        let read = answer(&mut state, &writes(&completed)[0], json!({"goal":null}));
+        let idle = answer(
+            &mut state,
+            &writes(&read)[0],
+            json!({"thread":{"id":"thread-1","status":{"type":"idle"}}}),
+        );
+        assert!(idle.terminal);
+        assert!(!completion_pending(&state));
+        assert!(!can_finish_after_retirement(&state));
+        let late = feed(
+            &mut state,
+            json!({"method":"item/agentMessage/delta","params":{"threadId":"thread-1","turnId":"turn-1","delta":"late"}}),
+        );
+        assert_eq!(late.events, [] as [TurnEvent; 0]);
+        assert!(parse_line(&json!({"method":"turn/started","params":{"threadId":"thread-1","turn":{"id":"unowned"}}}).to_string(), &mut state).is_err());
+    }
+
+    #[test]
+    fn active_goal_waits_across_idle_status_until_a_later_turn() {
+        let mut state = continuation_state();
+        let done = segment_end(&mut state, "turn-1");
+        let active = answer(
+            &mut state,
+            &writes(&done)[0],
+            json!({"goal":{"status":"active"}}),
+        );
+        assert!(!active.terminal && no_writes(&active));
+        assert!(completion_pending(&state));
+        assert!(!can_finish_after_retirement(&state));
+        let idle = feed(
+            &mut state,
+            json!({"method":"thread/status/changed","params":{"threadId":"thread-1","status":{"type":"idle"}}}),
+        );
+        assert!(!idle.terminal);
+        segment_start(&mut state, "thread-1", "turn-2");
+        assert!(!completion_pending(&state));
+    }
+    #[test]
+    fn missing_goal_api_falls_back_but_malformed_state_does_not_claim_idle() {
+        let mut state = continuation_state();
+        let done = segment_end(&mut state, "turn-1");
+        let probe = writes(&done)[0].clone();
+        let read = feed(
+            &mut state,
+            json!({"id":probe["id"],"error":{"code":-32601,"message":"Method not found"}}),
+        );
+        assert_eq!(writes(&read)[0]["method"], "thread/read");
+        let idle = answer(
+            &mut state,
+            &writes(&read)[0],
+            json!({"thread":{"id":"thread-1","status":{"type":"idle"}}}),
+        );
+        assert!(idle.terminal);
+        let mut state = continuation_state();
+        let done = segment_end(&mut state, "turn-1");
+        let value = json!({"id":writes(&done)[0]["id"],"result":{}});
+        assert!(parse_line(&value.to_string(), &mut state).is_err());
+    }
+
+    #[test]
+    fn hidden_goal_continuation_must_not_finish_at_first_completion() {
+        let mut state = continuation_state();
+        let completed = feed(
+            &mut state,
+            json!({"method":"turn/completed", "params":{
+            "threadId":"thread-1", "turn":{"id":"turn-1", "status":"completed"}}}),
+        );
+        assert!(
+            !completed.terminal,
+            "an individual completion is not provider idleness"
+        );
+        feed(
+            &mut state,
+            json!({"method":"turn/started", "params":{
+            "threadId":"thread-1", "turn":{"id":"turn-2"}}}),
+        );
+        let activity = feed(
+            &mut state,
+            json!({"method":"item/agentMessage/delta", "params":{
+            "threadId":"thread-1", "turnId":"turn-2", "itemId":"message-2", "delta":"still working"}}),
+        );
+        assert!(activity.events.iter().any(|event| matches!(event,
+            TurnEvent::TextDelta { text } if text == "still working")));
+        let stop: Value = serde_json::from_slice(&interrupt(&state).unwrap()).unwrap();
+        assert_eq!(stop["params"]["turnId"], "turn-2");
     }
 
     #[test]
@@ -2984,6 +3442,7 @@ mod tests {
                 json!({"jsonrpc": "2.0", "method": "turn/completed", "params": {
                     "threadId": "thread-1", "turn": {"id": "turn-1", "status": "completed"}}}),
             );
+            let end = settle_completion(&mut state, end);
             assert!(end.terminal);
             assert_eq!(state.result.status, RunStatus::Succeeded);
             assert_eq!(
@@ -3126,6 +3585,7 @@ mod tests {
             json!({"jsonrpc": "2.0", "method": "turn/completed", "params": {
                 "threadId": "thread-1", "turn": {"id": "turn-1", "status": "completed"}}}),
         );
+        let end = settle_completion(&mut state, end);
         assert!(end.terminal);
         assert!(end.events.is_empty(), "{:?}", end.events);
         let [unsubscribe] = writes(&end).try_into().unwrap();
@@ -3166,17 +3626,35 @@ mod tests {
         thread_start
     }
 
+    fn settle_completion(state: &mut AdapterState, mut first: AdapterOutput) -> AdapterOutput {
+        assert!(
+            !first.terminal,
+            "a successful segment must be reconciled before finishing"
+        );
+        let probe: Value = serde_json::from_slice(&first.writes.remove(0)).unwrap();
+        let read = answer(state, &probe, json!({"goal":null}));
+        let mut end = answer(
+            state,
+            &writes(&read)[0],
+            json!({"thread":{"id":"thread-1","status":{"type":"idle"}}}),
+        );
+        end.optional_writes.extend(first.optional_writes);
+        end.events.splice(0..0, first.events);
+        end
+    }
+
     fn user_turn_completed(state: &mut AdapterState) -> AdapterOutput {
         parse_line(
             r#"{"jsonrpc":"2.0","id":4,"result":{"turn":{"id":"turn-1"}}}"#,
             state,
         )
         .unwrap();
-        feed(
+        let output = feed(
             state,
             json!({"jsonrpc": "2.0", "method": "turn/completed", "params": {
                 "threadId": "thread-1", "turn": {"id": "turn-1", "status": "completed"}}}),
-        )
+        );
+        settle_completion(state, output)
     }
 
     #[test]

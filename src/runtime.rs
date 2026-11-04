@@ -903,8 +903,14 @@ impl RetainedHandoff {
     }
 }
 
+/// A completed segment must either continue or establish idle within this
+/// bound. Traffic and user messages cannot extend this reconciliation phase.
+const COMPLETION_SETTLEMENT_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// How a retained turn released its process.
 enum RetainedTurnEnd {
+    /// Reply completed, but its connection must not be reused.
+    Retired(TurnResult),
     /// The turn reached its terminal frame, with the parser state to park
     /// when background work outlives it.
     Completed(TurnResult, Option<Box<AdapterState>>),
@@ -1970,6 +1976,31 @@ async fn write_provider_frames(
             stream,
             source,
         })
+}
+
+/// Required completion writes share the read-side deadline and cancellation.
+async fn write_completion_frames(
+    provider: Provider,
+    stdin: Option<&mut FrameWriter>,
+    frames: &[Vec<u8>],
+    deadline: Option<tokio::time::Instant>,
+    cancellation: &tokio_util::sync::CancellationToken,
+) -> Result<()> {
+    if frames.is_empty() {
+        return Ok(());
+    }
+    let write = write_provider_frames(provider, stdin, frames, "provider write");
+    let Some(deadline) = deadline else {
+        return write.await;
+    };
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => Err(RuntimeError::Cancelled { provider }),
+        _ = tokio::time::sleep_until(deadline) => Err(RuntimeError::Timeout {
+            provider, seconds: COMPLETION_SETTLEMENT_TIMEOUT.as_secs(),
+        }),
+        result = write => result,
+    }
 }
 
 /// Deliver an adapter-encoded interrupt, giving up after
@@ -5822,6 +5853,11 @@ impl AgentRuntime {
         drop(io_guard);
         retained.handoff.ready.store(false, Ordering::Release);
         match result {
+            Ok(RetainedTurnEnd::Retired(result)) => {
+                // Keep the cleanup guard armed: it removes this generation
+                // from the pool. The process tree was already terminated.
+                Ok(result)
+            }
             Ok(RetainedTurnEnd::HandedOff(result, carried)) => {
                 *retained.session_id.lock().await = result.session_id.clone();
                 cleanup.disarm();
@@ -6075,7 +6111,21 @@ impl AgentRuntime {
             // The answer is progress, and the provider needs time to act on it.
             last_semantic_activity = tokio::time::Instant::now();
         }
+        let mut settlement_deadline = None;
         loop {
+            if adapter.completion_pending(&state) {
+                settlement_deadline.get_or_insert_with(|| {
+                    tokio::time::Instant::now() + COMPLETION_SETTLEMENT_TIMEOUT
+                });
+            } else {
+                settlement_deadline = None;
+            }
+            if settlement_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+                return Err(RuntimeError::Timeout {
+                    provider,
+                    seconds: 30,
+                });
+            }
             let inactivity_timeout = if !saw_semantic_activity || !turn_submitted {
                 retention.initialization_timeout
             } else {
@@ -6085,6 +6135,14 @@ impl AgentRuntime {
             };
             let starting = !saw_semantic_activity || !turn_submitted;
             let timed_out = || {
+                if settlement_deadline
+                    .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+                {
+                    return RuntimeError::Timeout {
+                        provider,
+                        seconds: COMPLETION_SETTLEMENT_TIMEOUT.as_secs(),
+                    };
+                }
                 if starting {
                     RuntimeError::StartupTimeout {
                         provider,
@@ -6097,7 +6155,10 @@ impl AgentRuntime {
                     }
                 }
             };
-            let deadline = last_semantic_activity + inactivity_timeout;
+            let deadline = settlement_deadline
+                .map_or(last_semantic_activity + inactivity_timeout, |settlement| {
+                    settlement.min(last_semantic_activity + inactivity_timeout)
+                });
             let frame = if let Some(line) = prefetched_lines.pop_front() {
                 Some(ProviderFrame::Line(line))
             } else {
@@ -6190,7 +6251,7 @@ impl AgentRuntime {
                         _ = tokio::time::sleep_until(frame_deadline) => {
                             // A frame that is still arriving is progress, not
                             // silence; a cancelled turn keeps its short bound.
-                            if !cancel_seen {
+                            if !cancel_seen && settlement_deadline.is_none() {
                                 if let Some(extended) = frame_deadline_after_arrivals(
                                     frame_deadline,
                                     frame_arrivals.last_bytes(),
@@ -6240,6 +6301,14 @@ impl AgentRuntime {
                     .take(STDERR_TAIL_BYTES)
                     .collect::<String>()
                 };
+                if adapter.can_finish_after_retirement(&state) {
+                    io.process
+                        .terminate()
+                        .await
+                        .map_err(|source| RuntimeError::Transport { provider, source })?;
+                    let result = finish_retained_turn(adapter, request, events, &mut state).await?;
+                    return Ok(RetainedTurnEnd::Retired(result));
+                }
                 return Err(RuntimeError::ProcessFailed {
                     provider,
                     kind: ProviderProcessErrorKind::Unknown,
@@ -6292,6 +6361,13 @@ impl AgentRuntime {
                 process_ready = true;
                 handoff.initialized.store(true, Ordering::Release);
             }
+            if adapter.completion_pending(&state) {
+                settlement_deadline.get_or_insert_with(|| {
+                    tokio::time::Instant::now() + COMPLETION_SETTLEMENT_TIMEOUT
+                });
+            } else {
+                settlement_deadline = None;
+            }
             for event in output.events {
                 if first_text && matches!(&event, TurnEvent::TextDelta { text } if !text.is_empty())
                 {
@@ -6301,13 +6377,29 @@ impl AgentRuntime {
                 let _delivery = trace.event_delivery();
                 events.emit(event).await?;
             }
-            write_provider_frames(
+            if let Err(error) = write_completion_frames(
                 provider,
                 Some(&mut io.stdin),
                 &output.writes,
-                "provider write",
+                settlement_deadline,
+                &request.cancellation,
             )
-            .await?;
+            .await
+            {
+                if matches!(
+                    error,
+                    RuntimeError::Timeout { .. } | RuntimeError::Cancelled { .. }
+                ) || !adapter.can_finish_after_retirement(&state)
+                {
+                    return Err(error);
+                }
+                io.process
+                    .terminate()
+                    .await
+                    .map_err(|source| RuntimeError::Transport { provider, source })?;
+                let result = finish_retained_turn(adapter, request, events, &mut state).await?;
+                return Ok(RetainedTurnEnd::Retired(result));
+            }
             write_optional_frames(Some(&mut io.stdin), &output.optional_writes).await;
             if let Some(interaction) = output.interaction {
                 if self
@@ -6331,6 +6423,14 @@ impl AgentRuntime {
                 last_semantic_activity = tokio::time::Instant::now();
             }
             if output.terminal {
+                if adapter.retire_after_completion(&state) {
+                    io.process
+                        .terminate()
+                        .await
+                        .map_err(|source| RuntimeError::Transport { provider, source })?;
+                    let result = finish_retained_turn(adapter, request, events, &mut state).await?;
+                    return Ok(RetainedTurnEnd::Retired(result));
+                }
                 return complete_retained_turn(adapter, request, events, state).await;
             }
             if request.cancellation.is_cancelled() {
@@ -6663,8 +6763,23 @@ impl AgentRuntime {
         let mut first_text = true;
         let mut reader = BufReader::new(reader);
         let mut protocol_completed = false;
+        let mut retired = false;
+        let mut settlement_deadline = None;
         loop {
+            if adapter.completion_pending(&state) {
+                settlement_deadline.get_or_insert_with(|| {
+                    tokio::time::Instant::now() + COMPLETION_SETTLEMENT_TIMEOUT
+                });
+            } else {
+                settlement_deadline = None;
+            }
             let frame = tokio::select! {
+                biased;
+                _ = tokio::time::sleep_until(settlement_deadline.unwrap_or_else(|| tokio::time::Instant::now() + COMPLETION_SETTLEMENT_TIMEOUT)), if settlement_deadline.is_some() => {
+                    process.terminate().await.map_err(|source| RuntimeError::Transport { provider, source })?;
+                    stderr_task.abort();
+                    return Err(RuntimeError::Timeout { provider, seconds: 30 });
+                }
                 _ = request.cancellation.cancelled() => {
                     let error = cancel_running_process(
                         provider,
@@ -6683,7 +6798,28 @@ impl AgentRuntime {
                     source,
                 })?,
             };
-            let Some(frame) = frame else { break };
+            let Some(frame) = frame else {
+                if adapter.can_finish_after_retirement(&state) {
+                    process
+                        .terminate()
+                        .await
+                        .map_err(|source| RuntimeError::Transport { provider, source })?;
+                    protocol_completed = true;
+                    retired = true;
+                } else if adapter.completion_pending(&state) {
+                    process
+                        .terminate()
+                        .await
+                        .map_err(|source| RuntimeError::Transport { provider, source })?;
+                    stderr_task.abort();
+                    return Err(RuntimeError::Protocol {
+                        provider,
+                        message: "Codex exited with an unfinished goal; resume the goal explicitly"
+                            .into(),
+                    });
+                }
+                break;
+            };
             if first_output {
                 first_output = false;
                 trace.record(StartupStage::FirstOutput);
@@ -6701,6 +6837,13 @@ impl AgentRuntime {
                     });
                 }
             };
+            if adapter.completion_pending(&state) {
+                settlement_deadline.get_or_insert_with(|| {
+                    tokio::time::Instant::now() + COMPLETION_SETTLEMENT_TIMEOUT
+                });
+            } else {
+                settlement_deadline = None;
+            }
             for event in output.events {
                 if first_text && matches!(&event, TurnEvent::TextDelta { text } if !text.is_empty())
                 {
@@ -6712,8 +6855,30 @@ impl AgentRuntime {
                     events.emit(event).await?;
                 }
             }
-            write_provider_frames(provider, stdin.as_mut(), &output.writes, "provider write")
-                .await?;
+            if let Err(error) = write_completion_frames(
+                provider,
+                stdin.as_mut(),
+                &output.writes,
+                settlement_deadline,
+                &request.cancellation,
+            )
+            .await
+            {
+                if matches!(
+                    error,
+                    RuntimeError::Timeout { .. } | RuntimeError::Cancelled { .. }
+                ) || !adapter.can_finish_after_retirement(&state)
+                {
+                    return Err(error);
+                }
+                process
+                    .terminate()
+                    .await
+                    .map_err(|source| RuntimeError::Transport { provider, source })?;
+                protocol_completed = true;
+                retired = true;
+                break;
+            }
             write_optional_frames(stdin.as_mut(), &output.optional_writes).await;
             if let Some(interaction) = output.interaction {
                 let response = match interaction {
@@ -6785,6 +6950,15 @@ impl AgentRuntime {
                 }
             }
             if output.terminal {
+                if adapter.retire_after_completion(&state) {
+                    process
+                        .terminate()
+                        .await
+                        .map_err(|source| RuntimeError::Transport { provider, source })?;
+                    protocol_completed = true;
+                    retired = true;
+                    break;
+                }
                 protocol_completed = true;
                 stdin.take();
                 if attached || exit_grace.is_some() {
@@ -6845,6 +7019,14 @@ impl AgentRuntime {
                     .map_err(|source| RuntimeError::Transport { provider, source })?;
                 let _ = tokio::time::timeout(ATTACHED_SHUTDOWN_GRACE, process.wait()).await;
             }
+            TransportExitStatus {
+                success: true,
+                code: None,
+            }
+        } else if retired {
+            // Termination already confirmed retirement. Reaping is best effort:
+            // a transport may no longer expose the exited process or its status.
+            let _ = tokio::time::timeout(ATTACHED_SHUTDOWN_GRACE, process.wait()).await;
             TransportExitStatus {
                 success: true,
                 code: None,
@@ -7626,6 +7808,52 @@ mod tests {
             written, "1234567\n",
             "the dropped frame left no partial bytes"
         );
+    }
+
+    #[tokio::test]
+    async fn empty_completion_writes_leave_interrupt_and_timeout_to_the_driver() {
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        cancellation.cancel();
+        let result = write_completion_frames(
+            Provider::Codex,
+            None,
+            &[],
+            Some(tokio::time::Instant::now()),
+            &cancellation,
+        )
+        .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn completion_writes_obey_deadline_and_stop_when_stdin_stalls() {
+        for cancel in [false, true] {
+            let (writer, _reader) = tokio::io::duplex(1);
+            let mut writer = FrameWriter::new(Box::new(writer));
+            let cancellation = tokio_util::sync::CancellationToken::new();
+            let start = tokio::time::Instant::now();
+            if cancel {
+                cancellation.cancel();
+            }
+            let result = write_completion_frames(
+                Provider::Codex,
+                Some(&mut writer),
+                &[b"probe".to_vec()],
+                Some(start + COMPLETION_SETTLEMENT_TIMEOUT),
+                &cancellation,
+            )
+            .await;
+            if cancel {
+                assert!(matches!(result, Err(RuntimeError::Cancelled { .. })));
+                assert_eq!(start.elapsed(), Duration::ZERO);
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(RuntimeError::Timeout { seconds: 30, .. })
+                ));
+                assert_eq!(start.elapsed(), COMPLETION_SETTLEMENT_TIMEOUT);
+            }
+        }
     }
 
     #[tokio::test]
