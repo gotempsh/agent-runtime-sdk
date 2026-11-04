@@ -9,7 +9,7 @@ static PATTERNS: LazyLock<Vec<regex::Regex>> = LazyLock::new(|| {
         r#"(?i)\b(?:bearer|basic)\s+[^\s\"'<>]+"#,
         r#"(?i)\b[a-z][a-z0-9+.-]*://[^\s/\"'<>]*@[^\s\"'<>]*"#,
         r#"(?i)\b[a-z][a-z0-9+.-]*://[^\s/:\"'<>]+:[^\s/\"'<>]+$"#,
-        r#"(?i)\b(?:[a-z0-9_]*[_-])?(?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|secret(?:[_-](?:access[_-])?key)?|password|passwd|credential|client[_-]?secret|signature|private[_-]?key)\s*[\"']?\s*[:=]\s*(?:\"(?:\\[^\r\n]|[^\"\\\r\n])*(?:\"|\\?$)|'(?:\\[^\r\n]|[^'\\\r\n])*(?:'|\\?$)|[^\s&,;\"'<>]+)"#,
+        r#"(?im)\b(?:[a-z0-9_]*[_-])?(?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|secret(?:[_-](?:access[_-])?key)?|password|passwd|credential|client[_-]?secret|signature|private[_-]?key)\s*[\"']?\s*[:=]\s*(?:\"(?:\\[^\r\n]|[^\"\\\r\n])*(?:\"|\\?\r?$)|'(?:\\[^\r\n]|[^'\\\r\n])*(?:'|\\?\r?$)|[^\s&,;\"'<>]+)"#,
         r"\b(?:sk-|sk_|gh[pousr]_|github_pat_|xox[baprs]-|AKIA|ASIA|eyJ)[A-Za-z0-9_./+=%-]*",
     ].into_iter().map(|p| regex::Regex::new(p).expect("credential pattern")).collect()
 });
@@ -135,6 +135,27 @@ mod tests {
                 !output.contains("opaque") && !output.contains("private"),
                 "{output}"
             );
+        }
+    }
+    #[test]
+    fn diagnostic_scrub_unfinished_quotes_before_another_line() {
+        for quote in ['"', '\''] {
+            for ending in ["\n", "\r\n"] {
+                for suffix in ["", "\\"] {
+                    let input = format!(
+                        "password={quote}opaque\\{quote}private{suffix}{ending}permission denied /workspace"
+                    );
+                    let output = scrub(&input, []);
+                    assert!(
+                        !output.contains("opaque") && !output.contains("private"),
+                        "{output}"
+                    );
+                    assert!(
+                        output.ends_with("\npermission denied /workspace"),
+                        "{output}"
+                    );
+                }
+            }
         }
     }
     #[test]
