@@ -1376,6 +1376,44 @@ async fn claude_reused_process_busy_past_the_startup_deadline_is_not_a_startup_f
 }
 
 #[tokio::test]
+async fn retained_launcher_preserves_401_and_scrubs_short_credentials() {
+    let f = Fixture::new(true, Duration::from_secs(30)).await;
+    let diagnostic = "unexpected status 401 Unauthorized: Missing bearer authentication in header, url: https://api.openai.com/v1/responses";
+    fs::write(
+        f.dir.path().join("claude-fixture"),
+        format!("#!/bin/sh\nread line\nprintf '%s\\n' '{diagnostic}' 'xy' >&2\nexit 1\n"),
+    )
+    .unwrap();
+    let mut input = Fixture::input("diagnostic-config", "hello");
+    for (name, value) in [
+        ("GIT_CONFIG_COUNT", "1"),
+        ("NODE_USE_ENV_PROXY", "1"),
+        ("GIT_CONFIG_VALUE_0", "*"),
+        ("UNKNOWN_SECRET", "xy"),
+    ] {
+        input
+            .environment
+            .insert(name.into(), temps_agent_runtime::SecretString::new(value));
+    }
+    input.environment.insert(
+        "CALLER_FLAG".into(),
+        temps_agent_runtime::SecretString::non_secret_configuration("1"),
+    );
+    let failure = f
+        .handle
+        .start_turn(input)
+        .await
+        .unwrap()
+        .wait()
+        .await
+        .unwrap_err();
+    assert!(failure.message.contains(diagnostic), "{}", failure.message);
+    assert!(!failure.message.contains("xy"));
+    assert!(failure.message.contains("[REDACTED]"));
+    f.dispose().await;
+}
+
+#[tokio::test]
 async fn retained_launcher_failure_preserves_redacted_stderr_without_waiting_for_descendants() {
     for diagnostic in [
         "nono: Sandbox initialization failed",

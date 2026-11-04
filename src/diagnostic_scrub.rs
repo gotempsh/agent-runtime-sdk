@@ -23,6 +23,21 @@ static UNFINISHED_QUOTED_VALUES: LazyLock<regex::Regex> = LazyLock::new(|| {
     regex::Regex::new(r#"(?m)"((?:\\[^\r\n]|[^"\\\r\n])*)(?:"|\\?\r?$)|'((?:\\[^\r\n]|[^'\\\r\n])*)(?:'|\\?\r?$)"#).expect("quoted values")
 });
 
+// Unknown names remain secret regardless of length. These are configuration
+// names used by the SDK or generic launchers, never credential mappings.
+pub(crate) fn environment_secret(name: &str, value: &str) -> bool {
+    !(matches!(
+        name,
+        "CODEX_HOME"
+            | "CLAUDE_CONFIG_DIR"
+            | "NO_PROXY"
+            | "no_proxy"
+            | "NODE_USE_ENV_PROXY"
+            | "GIT_CONFIG_COUNT"
+            | "GIT_CONFIG_KEY_0"
+    ) || (name == "GIT_CONFIG_VALUE_0" && value == "*"))
+}
+
 pub(crate) fn scrub<'a>(text: &str, secrets: impl IntoIterator<Item = &'a str>) -> String {
     let mut values: Vec<String> = secrets
         .into_iter()
@@ -159,6 +174,14 @@ fn credential_ranges(text: &str, values: &[String]) -> Vec<(usize, usize)> {
                 .name("credential")
                 .or_else(|| captures.get(0))
                 .unwrap();
+            // Only this provider error describes missing authentication.
+            // Independent known-value ranges above always take precedence.
+            if found.as_str().eq_ignore_ascii_case("bearer authentication")
+                && text[..found.start()].ends_with("Missing ")
+                && text[found.end()..].starts_with(" in header")
+            {
+                return None;
+            }
             if captures.name("credential").is_some() && has_numeric_port(found.as_str()) {
                 // Without userinfo or another credential marker, this is
                 // indistinguishable from a normal connection endpoint.
@@ -261,6 +284,19 @@ fn has_numeric_port(url: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn missing_bearer_authentication_is_prose_only_in_the_exact_error() {
+        let error = "unexpected status 401 Unauthorized: Missing bearer authentication in header, url: https://api.openai.com/v1/responses";
+        assert_eq!(scrub(error, []), error);
+        assert_eq!(scrub("Bearer authentication", []), "[REDACTED]");
+        assert_eq!(
+            scrub("Missing bearer real-token in header", []),
+            "Missing [REDACTED] in header"
+        );
+        assert!(!scrub(error, ["authentication"]).contains("authentication"));
+        assert_eq!(scrub("Bearer xy", []), "[REDACTED]");
+    }
+
     #[test]
     fn diagnostic_scrub_secret_keys_and_escaped_quotes() {
         for input in [

@@ -270,12 +270,39 @@ impl PermissionSupport {
 
 /// A secret-bearing string whose `Debug` output is always redacted.
 #[derive(Clone, PartialEq, Eq)]
-pub struct SecretString(String);
+pub struct SecretString(String, Option<bool>);
 
 impl SecretString {
     /// Wrap a secret value.
     pub fn new(value: impl Into<String>) -> Self {
-        Self(value.into())
+        Self(value.into(), None)
+    }
+
+    /// Mark an explicit credential mapping. Always scrub it, even under a
+    /// configuration variable name.
+    pub fn credential(value: impl Into<String>) -> Self {
+        Self(value.into(), Some(true))
+    }
+
+    /// Mark caller-owned, non-secret configuration for diagnostic collection.
+    /// Debug remains redacted and credential patterns still apply. Proxy URLs
+    /// and non-wildcard `GIT_CONFIG_VALUE_0` cannot be exempted this way.
+    /// Never use this for credential mappings; use [`Self::credential`] instead.
+    pub fn non_secret_configuration(value: impl Into<String>) -> Self {
+        Self(value.into(), Some(false))
+    }
+
+    pub(crate) fn diagnostic_secret(&self, name: &str) -> bool {
+        if self.1 == Some(true)
+            || matches!(
+                name.to_ascii_uppercase().as_str(),
+                "HTTP_PROXY" | "HTTPS_PROXY" | "ALL_PROXY"
+            )
+            || (name == "GIT_CONFIG_VALUE_0" && self.expose() != "*")
+        {
+            return true;
+        }
+        self.1 != Some(false) && crate::diagnostic_scrub::environment_secret(name, self.expose())
     }
 
     /// Expose the secret for explicit process-environment injection.
