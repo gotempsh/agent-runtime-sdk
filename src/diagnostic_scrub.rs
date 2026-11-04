@@ -7,11 +7,17 @@ static PATTERNS: LazyLock<Vec<regex::Regex>> = LazyLock::new(|| {
     [
         r"(?im)(?:proxy-)?authorization\s*[=:]\s*[^\r\n]+",
         r#"(?i)\b(?:bearer|basic)\s+[^\s\"'<>]+"#,
-        r#"(?i)\b[a-z][a-z0-9+.-]*://[^\s/\"'<>]*@[^\s\"'<>]*"#,
-        r#"(?i)\b[a-z][a-z0-9+.-]*://[^\s/:\"'<>]+:[^\s/\"'<>]+$"#,
+        r#"(?i)\b[a-z][a-z0-9+.-]*://[^\s/?#\"'<>]*@[^\s\"'<>]*"#,
+        r#"(?i)\b[a-z][a-z0-9+.-]*://[^\s/:?#\"'<>]+:[^\s/?#\"'<>]+$"#,
         r#"(?im)\b(?:[a-z0-9_]*[_-])?(?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|secret(?:[_-](?:access[_-])?key)?|password|passwd|credential|client[_-]?secret|signature|private[_-]?key|(?:encryption|signing|auth)[_-]?key)\s*[\"']?\s*[:=]\s*(?:\"(?:\\[^\r\n]|[^\"\\\r\n])*(?:\"|\\?\r?$)|'(?:\\[^\r\n]|[^'\\\r\n])*(?:'|\\?\r?$)|[^\s&,;\"'<>]+)"#,
         r"\b(?:sk-|sk_|gh[pousr]_|github_pat_|xox[baprs]-|AKIA|ASIA|eyJ)[A-Za-z0-9_./+=%-]*",
     ].into_iter().map(|p| regex::Regex::new(p).expect("credential pattern")).collect()
+});
+
+// Extract complete quoted diagnostic values as well as whitespace tokens.
+// Keep their original escaped bytes so matches map directly to the input.
+static QUOTED_VALUES: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r#""(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'"#).expect("quoted values")
 });
 
 pub(crate) fn scrub<'a>(text: &str, secrets: impl IntoIterator<Item = &'a str>) -> String {
@@ -90,6 +96,11 @@ fn credential_ranges(text: &str, values: &[String]) -> Vec<(usize, usize)> {
     let mut fragments: Vec<(&str, &str)> = text
         .split_whitespace()
         .map(|token| token.trim_matches(|c: char| "\"'(),;[]".contains(c)))
+        .chain(
+            QUOTED_VALUES
+                .find_iter(text)
+                .map(|quoted| &text[quoted.start() + 1..quoted.end() - 1]),
+        )
         .map(|token| {
             // Compare the credential bytes, but redact the diagnostic's whole
             // fragment, including the marker that says it was truncated.
@@ -251,6 +262,34 @@ mod tests {
             scrub("synthetic-private%E2%80%A6", ["synthetic-private-value"]),
             "[REDACTED]"
         );
+    }
+    #[test]
+    fn diagnostic_scrub_quoted_fragments_and_url_boundaries() {
+        for ellipsis in ["...", "…"] {
+            for input in [
+                format!(r#"{{"error": "abcdefgh{ellipsis}"}}"#),
+                format!(r#"{{"error":"abcdefgh{ellipsis}"}}"#),
+                format!(r#"{{"error":"rose violet{ellipsis}"}}"#),
+            ] {
+                let output = scrub(&input, ["abcdefgh-private-value", "rose violet-private"]);
+                let value: serde_json::Value = serde_json::from_str(&output).unwrap();
+                assert_eq!(value["error"], "[REDACTED]");
+            }
+        }
+        for url in [
+            "https://example.test?contact=alice@example.test",
+            "https://example.test#contact=alice@example.test",
+            "https://example.test?time=12:34",
+            "https://example.test#time=12:34",
+        ] {
+            assert_eq!(scrub(url, []), url);
+        }
+        for url in [
+            "https://synthetic:password@example.test?contact=alice@example.test",
+            "https://synthetic:password@example.test#contact=alice@example.test",
+        ] {
+            assert_eq!(scrub(url, []), "[REDACTED]");
+        }
     }
     #[test]
     fn diagnostic_scrub_explicit_before_trimming_and_truncation() {
