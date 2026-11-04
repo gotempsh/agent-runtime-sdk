@@ -47,7 +47,8 @@ use crate::services::{
     ManagedProcessError, ManagedProcessId, ManagedProcessSpec, ManagedProcessStatus,
     ManagedProcessSupervisor, RestartPolicy,
 };
-use proxy::{RouteTable, SocksUpstream, SplitProxy};
+pub use proxy::RouteTable;
+use proxy::{SocksUpstream, SplitProxy};
 use tailscale::{StatusJson, UpJsonLine};
 
 pub use tailscale::{install_hint, TailscaleBinaries};
@@ -353,6 +354,28 @@ impl std::fmt::Debug for TailnetStatus {
             .field("updated_at_ms", &self.updated_at_ms)
             .finish()
     }
+}
+
+/// Read-only routing state for an application-owned ingress.
+///
+/// This is a point-in-time observation, not authorization or a lifetime lease.
+/// Callers must enforce their own authentication, destination policy and revocation.
+/// No control socket or credentials are included. Reading it never runs a CLI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct TailnetRoutingSnapshot {
+    /// Opaque daemon incarnation. Changes on explicit and supervised restart,
+    /// including when a new daemon object replaces a previous one.
+    pub generation: String,
+    /// Whether current routes are usable. Unavailable snapshots have no routes
+    /// or SOCKS endpoint, even when a previous refresh succeeded.
+    pub available: bool,
+    /// Human-readable status or reason routing is unavailable.
+    pub detail: String,
+    /// Routes from the SDK's most recent successful status refresh.
+    pub routes: RouteTable,
+    /// Userspace data-plane endpoint, present only while available.
+    pub socks_addr: Option<SocketAddr>,
 }
 
 /// Everything a provider launch needs from a connected tailnet.
@@ -703,6 +726,7 @@ fn ssh_config_contents(
 }
 
 struct DaemonState {
+    routing_generation: Option<String>,
     tailscale: Option<StatusJson>,
     auth_url: Option<String>,
     /// Detail that overrides the derived one, e.g. a login failure.
@@ -715,6 +739,8 @@ struct DaemonState {
 }
 
 struct Inner {
+    lifecycle: Mutex<()>,
+    incarnation: String,
     spec: TailnetSpec,
     socket_path: PathBuf,
     ssh_config_path: PathBuf,
@@ -774,6 +800,11 @@ impl TailnetDaemon {
     }
 
     async fn start_tailscale(spec: TailnetSpec) -> Result<Self, TailnetError> {
+        let mut incarnation = [0u8; 16];
+        getrandom::fill(&mut incarnation)
+            .map_err(std::io::Error::other)
+            .map_err(TailnetError::Proxy)?;
+        let incarnation = u128::from_ne_bytes(incarnation).to_string();
         prepare_state_dir(&spec.state_dir).await?;
         let socket_path = socket_path_for(&spec.state_dir);
         // A stale socket from a crashed daemon makes the new one refuse to
@@ -812,6 +843,8 @@ impl TailnetDaemon {
         drop(handle);
 
         let inner = Arc::new(Inner {
+            lifecycle: Mutex::new(()),
+            incarnation,
             ssh_config_path: spec.state_dir.join("ssh_config"),
             spec,
             socket_path,
@@ -820,6 +853,7 @@ impl TailnetDaemon {
             process,
             proxy: Mutex::new(None),
             state: RwLock::new(DaemonState {
+                routing_generation: None,
                 tailscale: None,
                 auth_url: None,
                 detail_override: None,
@@ -938,6 +972,7 @@ impl TailnetDaemon {
     /// A failed query marks the daemon unreachable, so [`Self::status`]
     /// stops reporting it as connected until a later refresh succeeds.
     pub async fn refresh(&self) -> Result<TailnetStatus, TailnetError> {
+        let before = self.routing_generation().await;
         let queried = async {
             let output = tailscale::run_cli(
                 &self.inner.spec.binaries.tailscale,
@@ -955,12 +990,26 @@ impl TailnetDaemon {
         let status = match queried {
             Ok(status) => status,
             Err(error) => {
+                let _commit = self.inner.lifecycle.lock().await;
+                if self.routing_generation().await != before {
+                    return Err(error);
+                }
                 let mut state = self.inner.state.write().await;
                 state.unreachable = Some(error.to_string());
                 state.updated_at_ms = now_ms();
                 return Err(error);
             }
         };
+        let _commit = self.inner.lifecycle.lock().await;
+        let after = self.routing_generation().await;
+        if before.is_none() || before != after {
+            return Err(TailnetError::NotConnected {
+                name: self.inner.spec.name.clone(),
+                state: TailnetState::Starting,
+                detail: "Daemon changed during status refresh; retry the refresh".into(),
+            });
+        }
+        let observed_generation = after;
         let routes = status.route_table();
         if let Some(proxy) = self.inner.proxy.lock().await.as_ref() {
             proxy.set_routes(routes.clone()).await;
@@ -975,8 +1024,25 @@ impl TailnetDaemon {
             } else if status.needs_login() && !status.auth_url.is_empty() {
                 state.auth_url = Some(status.auth_url.clone());
             }
+            state.routing_generation = observed_generation;
             state.tailscale = Some(status);
             state.updated_at_ms = now_ms();
+        }
+        // The supervisor may restart independently of the explicit lifecycle
+        // lock. Do not retain a commit if that happened during its async writes.
+        if self.routing_generation().await != before {
+            if let Some(proxy) = self.inner.proxy.lock().await.as_ref() {
+                proxy.set_routes(RouteTable::default()).await;
+            }
+            self.write_ssh_config(&RouteTable::default()).await;
+            let mut state = self.inner.state.write().await;
+            state.routing_generation = None;
+            state.tailscale = None;
+            return Err(TailnetError::NotConnected {
+                name: self.inner.spec.name.clone(),
+                state: TailnetState::Starting,
+                detail: "Daemon changed while committing status; retry the refresh".into(),
+            });
         }
         Ok(self.status().await)
     }
@@ -998,6 +1064,7 @@ impl TailnetDaemon {
 
     /// Current status without querying the daemon.
     pub async fn status(&self) -> TailnetStatus {
+        let current_generation = self.routing_generation().await;
         let snapshot = self
             .inner
             .supervisor
@@ -1012,7 +1079,9 @@ impl TailnetDaemon {
             .as_ref()
             .map(|proxy| proxy.local_addr().port());
         let state = self.inner.state.read().await;
-        let tailscale = state.tailscale.as_ref();
+        let tailscale = state.tailscale.as_ref().filter(|_| {
+            current_generation.is_some() && current_generation == state.routing_generation
+        });
         let (lifecycle, mut detail) = match snapshot.as_ref().map(|snapshot| snapshot.status) {
             Some(ManagedProcessStatus::Running) if state.unreachable.is_some() => (
                 TailnetState::Starting,
@@ -1253,6 +1322,11 @@ impl TailnetDaemon {
 
     /// Stop `tailscaled` and the split proxy. State on disk is kept.
     pub async fn stop(&self) -> Result<TailnetStatus, TailnetError> {
+        let _lifecycle = self.inner.lifecycle.lock().await;
+        self.stop_locked().await
+    }
+
+    async fn stop_locked(&self) -> Result<TailnetStatus, TailnetError> {
         if let Some(task) = self.inner.login.lock().await.take() {
             task.abort();
         }
@@ -1271,13 +1345,73 @@ impl TailnetDaemon {
 
     /// Stop and relaunch `tailscaled` with the same specification.
     pub async fn restart(&self) -> Result<TailnetStatus, TailnetError> {
-        let _ = self.stop().await;
+        let lifecycle = self.inner.lifecycle.lock().await;
+        self.stop_locked().await?;
         let _ = tokio::fs::remove_file(&self.inner.socket_path).await;
         self.inner.supervisor.restart(&self.inner.process).await?;
         self.await_socket().await?;
         self.ensure_proxy().await?;
+        drop(lifecycle);
         let _ = self.refresh().await;
         Ok(self.status().await)
+    }
+
+    async fn routing_generation(&self) -> Option<String> {
+        let process = self
+            .inner
+            .supervisor
+            .snapshot(&self.inner.process)
+            .await
+            .ok()?;
+        if process.status != ManagedProcessStatus::Running || !self.inner.socket_path.exists() {
+            return None;
+        }
+        Some(format!(
+            "{}:{}:{}",
+            self.inner.incarnation, process.restart_count, process.pid?
+        ))
+    }
+
+    /// Observe cached routing without polling the CLI, starting a daemon, or
+    /// changing its login. A restarted process must have a successful refresh
+    /// before its previous incarnation's routes can be used.
+    pub async fn routing_snapshot(&self) -> TailnetRoutingSnapshot {
+        let before = self.routing_generation().await;
+        let state = self.inner.state.read().await;
+        let available = before.is_some()
+            && before == state.routing_generation
+            && state.unreachable.is_none()
+            && state.tailscale.as_ref().is_some_and(StatusJson::is_running);
+        let routes = if available {
+            state
+                .tailscale
+                .as_ref()
+                .map(StatusJson::route_table)
+                .unwrap_or_default()
+        } else {
+            RouteTable::default()
+        };
+        let unreachable = state.unreachable.is_some();
+        drop(state);
+        let after = self.routing_generation().await;
+        let available = available && before == after;
+        TailnetRoutingSnapshot {
+            generation: after.unwrap_or_else(|| format!("{}:unavailable", self.inner.incarnation)),
+            available,
+            detail: if available {
+                "Connected".into()
+            } else if unreachable {
+                "Tailnet is not answering; reconnect it and retry the status refresh".into()
+            } else {
+                "Tailnet unavailable; connect it and wait for a successful status refresh".into()
+            },
+            routes: if available {
+                routes
+            } else {
+                RouteTable::default()
+            },
+            socks_addr: available.then_some(self.inner.socks_addr),
+        }
     }
 
     /// Endpoints for a provider launch, or why the tailnet cannot serve one.
@@ -1723,24 +1857,163 @@ mod tests {
         assert!(daemon.access().await.is_err());
         assert!(temp.path().join("state/ssh_config").is_file());
 
+        let unavailable = daemon.routing_snapshot().await;
+        assert!(!unavailable.available);
+        assert!(!unavailable
+            .detail
+            .contains(daemon.socket_path().to_str().unwrap()));
+        assert_eq!(unavailable.routes, RouteTable::default());
+        assert!(unavailable.socks_addr.is_none());
+
+        // A read observes cached state without querying the CLI. A caller's
+        // mutations to its owned snapshot cannot change the daemon's routes.
+        std::fs::write(&tailscale, r#"#!/bin/sh
+echo '{"BackendState":"Running","CurrentTailnet":{"MagicDNSSuffix":"example.ts.net"},"Peer":{"p":{"HostName":"peer","DNSName":"peer.example.ts.net."}}}'
+"#).unwrap();
+        daemon.refresh().await.unwrap();
+        let mut routes = daemon.routing_snapshot().await;
+        assert!(routes.available, "{routes:?}");
+        assert!(routes.routes.is_tailnet_host("peer"));
+        assert!(routes.socks_addr.is_some());
+        let generation = routes.generation.clone();
+        routes.routes.host_names.clear();
+        assert!(daemon
+            .routing_snapshot()
+            .await
+            .routes
+            .is_tailnet_host("peer"));
+
+        // Exercise the supervisor's restart path independently of
+        // TailnetDaemon::restart: cached routes from the old process must
+        // be unavailable until a refresh observes the new process.
+        daemon
+            .inner
+            .supervisor
+            .restart(&daemon.inner.process)
+            .await
+            .unwrap();
+        let restarted = daemon.routing_snapshot().await;
+        assert_ne!(generation, restarted.generation);
+        assert!(!restarted.available);
+        assert!(restarted.socks_addr.is_none());
+        daemon.refresh().await.unwrap();
+        assert!(daemon.routing_snapshot().await.available);
+        let generation = daemon.routing_snapshot().await.generation;
+
         // A vanished control socket is healed by relaunching the daemon.
         std::fs::remove_file(daemon.socket_path()).unwrap();
+        assert!(!daemon.routing_snapshot().await.available);
+        assert!(daemon.routing_snapshot().await.socks_addr.is_none());
         assert!(daemon.heal_missing_socket().await);
         assert!(daemon.socket_path().exists());
         assert!(daemon.status().await.restart_count >= 1);
         assert!(!daemon.heal_missing_socket().await);
+        assert_ne!(generation, daemon.routing_snapshot().await.generation);
+        assert!(daemon.routing_snapshot().await.available);
+
+        // Pause a CLI response across a restart: an old response must never
+        // authorize routes for the new incarnation. Disable periodic refresh
+        // for deterministic ownership of the single in-flight query.
+        if let Some(task) = daemon.inner.refresh.lock().unwrap().take() {
+            task.abort();
+        }
+        std::fs::write(
+            &tailscale,
+            r#"#!/bin/sh
+root=$(dirname "$0")
+touch "$root/query-started"
+while [ ! -e "$root/release-query" ]; do sleep 0.01; done
+echo '{"BackendState":"Running","Peer":{"old":{"HostName":"old-peer"}}}'
+"#,
+        )
+        .unwrap();
+        let old = daemon.clone();
+        let query = tokio::spawn(async move { old.refresh().await });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !temp.path().join("query-started").exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        daemon
+            .inner
+            .supervisor
+            .restart(&daemon.inner.process)
+            .await
+            .unwrap();
+        std::fs::write(temp.path().join("release-query"), "").unwrap();
+        assert!(query.await.unwrap().is_err());
+        assert_ne!(daemon.status().await.state, TailnetState::Running);
+        assert!(daemon.access().await.is_err());
+        assert!(!std::fs::read_to_string(&daemon.inner.ssh_config_path)
+            .unwrap()
+            .contains("old-peer"));
+        let stale = daemon.routing_snapshot().await;
+        assert!(!stale.available);
+        assert_eq!(stale.routes, RouteTable::default());
+        assert!(stale.socks_addr.is_none());
+        daemon.refresh().await.unwrap();
+        assert!(daemon.routing_snapshot().await.available);
+
+        // A failing response from an old incarnation must not poison a
+        // successful refresh performed by the explicit restart itself.
+        std::fs::write(
+            &tailscale,
+            r#"#!/bin/sh
+root=$(dirname "$0")
+if mkdir "$root/failing-query" 2>/dev/null; then
+  touch "$root/failing-query-started"
+  while [ ! -e "$root/release-failing-query" ]; do sleep 0.01; done
+  echo 'old daemon failed' >&2
+  exit 1
+fi
+echo '{"BackendState":"Running","Peer":{"new":{"HostName":"new-peer"}}}'
+"#,
+        )
+        .unwrap();
+        let old = daemon.clone();
+        let query = tokio::spawn(async move { old.refresh().await });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !temp.path().join("failing-query-started").exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        daemon.restart().await.unwrap();
+        assert!(daemon.routing_snapshot().await.available);
+        std::fs::write(temp.path().join("release-failing-query"), "").unwrap();
+        assert!(query.await.unwrap().is_err());
+        assert!(daemon.routing_snapshot().await.available);
+        assert_eq!(daemon.status().await.state, TailnetState::Running);
+        assert!(daemon.access().await.is_ok());
 
         // A daemon that stops answering is no longer reported as connected.
-        std::fs::write(&tailscale, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::write(&tailscale, "#!/bin/sh\necho \"$1\" >&2\nexit 1\n").unwrap();
+        assert!(
+            daemon.routing_snapshot().await.available,
+            "reading must not query the CLI"
+        );
         assert!(daemon.refresh().await.is_err());
         let status = daemon.status().await;
         assert_eq!(status.state, TailnetState::Starting, "{status:?}");
         assert!(status.detail.contains("not answering"), "{status:?}");
         assert!(daemon.access().await.is_err());
 
+        let unavailable = daemon.routing_snapshot().await;
+        assert!(!unavailable.available);
+        assert!(!unavailable
+            .detail
+            .contains(daemon.socket_path().to_str().unwrap()));
+        assert_eq!(unavailable.routes, RouteTable::default());
+        assert!(unavailable.socks_addr.is_none());
+
         let stopped = daemon.stop().await.unwrap();
         assert_eq!(stopped.state, TailnetState::Stopped);
         assert!(stopped.pid.is_none());
+        assert!(!daemon.routing_snapshot().await.available);
+        assert!(daemon.routing_snapshot().await.socks_addr.is_none());
     }
 
     #[cfg(unix)]

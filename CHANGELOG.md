@@ -5,6 +5,12 @@ Versioning and Keep a Changelog conventions.
 
 ## [Unreleased]
 
+### Added
+
+- Read-only tailnet routing snapshots expose current peer routes and daemon
+  generation without CLI requests or control-socket diagnostics. Unavailable
+  daemons withhold routing endpoints; responses spanning restarts are rejected.
+
 ### Fixed
 
 - Retained provider processes now preserve startup stderr on unexpected stdout
