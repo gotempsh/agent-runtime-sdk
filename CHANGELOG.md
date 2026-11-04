@@ -16,6 +16,11 @@ Versioning and Keep a Changelog conventions.
 
 ### Security
 
+- Retained stderr redaction keeps the process launch environment across
+  continuations, including when the new request omits or rotates credentials.
+  Unknown secret-key assignments and escaped quotes in credential values are
+  scrubbed before diagnostics are returned.
+
 - `opencode serve` now requires HTTP Basic credentials
   (`OPENCODE_SERVER_USERNAME`/`OPENCODE_SERVER_PASSWORD`, a per-process
   password derived from a random SDK secret and the port), and the SDK's HTTP

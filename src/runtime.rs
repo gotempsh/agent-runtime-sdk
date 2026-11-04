@@ -1037,6 +1037,8 @@ struct RetainedCodexIo {
     stdin: FrameWriter,
     reader: BufReader<crate::TransportReader>,
     stderr_task: Option<crate::process::StderrCapture>,
+    // Lifetime-scoped: continuations can omit or rotate their environment.
+    launch_secrets: Vec<crate::SecretString>,
     stdout_task: Option<tokio::task::JoinHandle<std::io::Result<String>>>,
 }
 
@@ -5665,6 +5667,14 @@ impl AgentRuntime {
                         stderr,
                         STDERR_TAIL_BYTES,
                     )),
+                    launch_secrets: request
+                        .environment
+                        .values()
+                        .cloned()
+                        .chain(spec.environment.values().map(|value| {
+                            crate::SecretString::new(value.to_string_lossy().into_owned())
+                        }))
+                        .collect(),
                     stdout_task,
                 })),
                 generation: AtomicU64::new(0),
@@ -6210,11 +6220,17 @@ impl AgentRuntime {
                     Some(capture) => capture.finish(STDERR_DRAIN_GRACE).await.unwrap_or_default(),
                     None => String::new(),
                 };
-                let diagnostic = redact_secrets(&diagnostic, &request.environment)
-                    .trim()
-                    .chars()
-                    .take(STDERR_TAIL_BYTES)
-                    .collect::<String>();
+                let diagnostic = crate::diagnostic_scrub::scrub(
+                    &diagnostic,
+                    io.launch_secrets
+                        .iter()
+                        .chain(request.environment.values())
+                        .map(crate::SecretString::expose),
+                )
+                .trim()
+                .chars()
+                .take(STDERR_TAIL_BYTES)
+                .collect::<String>();
                 return Err(RuntimeError::ProcessFailed {
                     provider,
                     kind: ProviderProcessErrorKind::Unknown,
@@ -10225,6 +10241,7 @@ mod tests {
                     tokio::io::empty(),
                     STDERR_TAIL_BYTES,
                 )),
+                launch_secrets: Vec::new(),
                 stdout_task: None,
             })),
             generation: AtomicU64::new(0),

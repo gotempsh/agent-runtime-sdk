@@ -9,7 +9,7 @@ static PATTERNS: LazyLock<Vec<regex::Regex>> = LazyLock::new(|| {
         r#"(?i)\b(?:bearer|basic)\s+[^\s\"'<>]+"#,
         r#"(?i)\b[a-z][a-z0-9+.-]*://[^\s/\"'<>]*@[^\s\"'<>]*"#,
         r#"(?i)\b[a-z][a-z0-9+.-]*://[^\s/:\"'<>]+:[^\s/\"'<>]+$"#,
-        r#"(?i)\b(?:[a-z0-9_]*[_-])?(?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|secret|password|passwd|credential|client[_-]?secret|signature|private[_-]?key)\s*[\"']?\s*[:=]\s*(?:\"[^\"\r\n]*(?:\"|$)|'[^'\r\n]*(?:'|$)|[^\s&,;\"'<>]+)"#,
+        r#"(?i)\b(?:[a-z0-9_]*[_-])?(?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|secret(?:[_-](?:access[_-])?key)?|password|passwd|credential|client[_-]?secret|signature|private[_-]?key)\s*[\"']?\s*[:=]\s*(?:\"(?:\\[^\r\n]|[^\"\\\r\n])*(?:\"|\\?$)|'(?:\\[^\r\n]|[^'\\\r\n])*(?:'|\\?$)|[^\s&,;\"'<>]+)"#,
         r"\b(?:sk-|sk_|gh[pousr]_|github_pat_|xox[baprs]-|AKIA|ASIA|eyJ)[A-Za-z0-9_./+=%-]*",
     ].into_iter().map(|p| regex::Regex::new(p).expect("credential pattern")).collect()
 });
@@ -121,6 +121,22 @@ fn credential_ranges(text: &str, values: &[String]) -> Vec<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn diagnostic_scrub_secret_keys_and_escaped_quotes() {
+        for input in [
+            "AWS_SECRET_ACCESS_KEY=opaque-aws-value",
+            "SECRET_KEY=opaque-django-value",
+            r#"{"password":"opaque\"private"}"#,
+            r"password='opaque\'private'",
+            r#"{"password":"opaque\"private"#,
+        ] {
+            let output = scrub(input, []);
+            assert!(
+                !output.contains("opaque") && !output.contains("private"),
+                "{output}"
+            );
+        }
+    }
     #[test]
     fn diagnostic_scrub_unknown_and_encoded_credentials() {
         for diagnostic in [

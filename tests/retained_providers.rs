@@ -1448,3 +1448,70 @@ async fn retained_launcher_failure_bounds_stderr_and_handles_empty_diagnostics()
         f.dispose().await;
     }
 }
+
+#[tokio::test]
+async fn retained_continuation_scrubs_original_launch_secrets() {
+    for rotate in [false, true] {
+        let f = Fixture::new(true, Duration::from_secs(30)).await;
+        let path = f.dir.path().join("claude-fixture");
+        let script = fs::read_to_string(&path).unwrap().replace(
+            "  result('SHELL-FOLLOWUP')",
+            "  while not os.path.exists(RELEASE+'-eof'):time.sleep(.01)\n  sys.stderr.write('nono: permission denied '+os.environ['LAUNCH_ONLY']+'\\n');sys.stderr.flush()\n  os._exit(2)",
+        );
+        fs::write(path, script).unwrap();
+        let mut first = Fixture::input("launch", "spawn-shell");
+        let secret = "v7Q2m9R4p6T8n3L5";
+        first.environment.insert(
+            "LAUNCH_ONLY".into(),
+            temps_agent_runtime::SecretString::new(secret),
+        );
+        let mut follow_ups = f.runtime.subscribe_background_follow_ups();
+        assert_eq!(
+            f.handle
+                .start_turn(first)
+                .await
+                .unwrap()
+                .wait()
+                .await
+                .unwrap()
+                .text,
+            "SERVING"
+        );
+        f.wait_for_log("shell-start").await;
+        f.release_background();
+        tokio::time::timeout(Duration::from_secs(10), follow_ups.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut continuation = Fixture::continuation("continue");
+        if rotate {
+            continuation.environment.insert(
+                "LAUNCH_ONLY".into(),
+                temps_agent_runtime::SecretString::new("replacement-opaque-value"),
+            );
+        }
+        let turn = f.handle.start_turn(continuation).await.unwrap();
+        let (mut events, completion) = turn.into_parts();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(envelope) = events.next().await {
+                if matches!(envelope.event, RuntimeEvent::ProviderEvent { event: TurnEvent::TextDelta { text } } if text.contains("SHELL-FOLLOWUP")) {
+                    return;
+                }
+            }
+            panic!("continuation must claim its pending answer before EOF");
+        }).await.unwrap();
+        fs::write(f.dir.path().join("release-eof"), "go").unwrap();
+        let failure = tokio::time::timeout(Duration::from_secs(10), completion.wait())
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            failure.message.contains("permission denied"),
+            "{}",
+            failure.message
+        );
+        assert!(!failure.message.contains(secret), "{}", failure.message);
+        assert_eq!(f.spawns().len(), 1);
+        f.dispose().await;
+    }
+}
