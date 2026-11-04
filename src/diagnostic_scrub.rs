@@ -9,7 +9,7 @@ static PATTERNS: LazyLock<Vec<regex::Regex>> = LazyLock::new(|| {
         r#"(?i)\b(?:bearer|basic)\s+[^\s\"'<>]+"#,
         r#"(?i)\b[a-z][a-z0-9+.-]*://[^\s/\"'<>]*@[^\s\"'<>]*"#,
         r#"(?i)\b[a-z][a-z0-9+.-]*://[^\s/:\"'<>]+:[^\s/\"'<>]+$"#,
-        r#"(?im)\b(?:[a-z0-9_]*[_-])?(?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|secret(?:[_-](?:access[_-])?key)?|password|passwd|credential|client[_-]?secret|signature|private[_-]?key)\s*[\"']?\s*[:=]\s*(?:\"(?:\\[^\r\n]|[^\"\\\r\n])*(?:\"|\\?\r?$)|'(?:\\[^\r\n]|[^'\\\r\n])*(?:'|\\?\r?$)|[^\s&,;\"'<>]+)"#,
+        r#"(?im)\b(?:[a-z0-9_]*[_-])?(?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|secret(?:[_-](?:access[_-])?key)?|password|passwd|credential|client[_-]?secret|signature|private[_-]?key|(?:encryption|signing|auth)[_-]?key)\s*[\"']?\s*[:=]\s*(?:\"(?:\\[^\r\n]|[^\"\\\r\n])*(?:\"|\\?\r?$)|'(?:\\[^\r\n]|[^'\\\r\n])*(?:'|\\?\r?$)|[^\s&,;\"'<>]+)"#,
         r"\b(?:sk-|sk_|gh[pousr]_|github_pat_|xox[baprs]-|AKIA|ASIA|eyJ)[A-Za-z0-9_./+=%-]*",
     ].into_iter().map(|p| regex::Regex::new(p).expect("credential pattern")).collect()
 });
@@ -87,10 +87,19 @@ pub(crate) fn scrub<'a>(text: &str, secrets: impl IntoIterator<Item = &'a str>) 
 
 fn credential_ranges(text: &str, values: &[String]) -> Vec<(usize, usize)> {
     let mut ranges = Vec::new();
-    let mut fragments: Vec<&str> = text
+    let mut fragments: Vec<(&str, &str)> = text
         .split_whitespace()
         .map(|token| token.trim_matches(|c: char| "\"'(),;[]".contains(c)))
-        .filter(|token| token.len() >= 8)
+        .map(|token| {
+            // Compare the credential bytes, but redact the diagnostic's whole
+            // fragment, including the marker that says it was truncated.
+            let value = token
+                .strip_suffix("...")
+                .or_else(|| token.strip_suffix('…'))
+                .unwrap_or(token);
+            (token, value)
+        })
+        .filter(|(_, value)| value.len() >= 8)
         .collect();
     fragments.sort_unstable();
     fragments.dedup();
@@ -99,8 +108,8 @@ fn credential_ranges(text: &str, values: &[String]) -> Vec<(usize, usize)> {
             text.match_indices(value.as_str())
                 .map(|(start, found)| (start, start + found.len())),
         );
-        for fragment in &fragments {
-            if value.contains(fragment) {
+        for (fragment, candidate) in &fragments {
+            if value.contains(candidate) {
                 ranges.extend(
                     text.match_indices(fragment)
                         .map(|(start, found)| (start, start + found.len())),
@@ -166,6 +175,9 @@ mod tests {
             "https://synthetic:password@example.test/path",
             "https://synthetic:partial",
             "api_key=synthetic-cut",
+            "ENCRYPTION_KEY=synthetic-encryption",
+            "SIGNING_KEY=synthetic-signing",
+            "AUTH_KEY=synthetic-auth",
             "sk-synthetic-cut",
             "Authorization%3A%20Bearer%20synthetic-encoded",
             "{\"access_token\":\"synthetic-json\"}",
@@ -214,6 +226,31 @@ mod tests {
             "failed: [REDACTED]"
         );
         assert_eq!(scrub("synthetic%2Dopaque%2Dprivate", [value]), "[REDACTED]");
+    }
+    #[test]
+    fn diagnostic_scrub_known_fragments_with_ellipsis() {
+        for ellipsis in ["...", "…"] {
+            assert_eq!(
+                scrub(
+                    &format!("failed: synthetic-private{ellipsis}"),
+                    ["synthetic-private-value"]
+                ),
+                "failed: [REDACTED]"
+            );
+            assert_eq!(
+                scrub(
+                    &format!("failed: [abcdefgh{ellipsis}]"),
+                    ["abcdefgh-private-value"]
+                ),
+                "failed: [[REDACTED]]"
+            );
+            let short = format!("abcdefg{ellipsis}");
+            assert_eq!(scrub(&short, ["abcdefgh-private-value"]), short);
+        }
+        assert_eq!(
+            scrub("synthetic-private%E2%80%A6", ["synthetic-private-value"]),
+            "[REDACTED]"
+        );
     }
     #[test]
     fn diagnostic_scrub_explicit_before_trimming_and_truncation() {
