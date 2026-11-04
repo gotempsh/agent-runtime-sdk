@@ -98,7 +98,7 @@ fn credential_ranges(text: &str, values: &[String]) -> Vec<(usize, usize)> {
     let mut ranges = Vec::new();
     let mut fragments: Vec<(&str, &str)> = text
         .split_whitespace()
-        .map(|token| token.trim_matches(|c: char| "\"'(),;[]".contains(c)))
+        .map(|token| token.trim_matches(|c: char| "\"'(),;[]:".contains(c)))
         .chain(
             [&*QUOTED_VALUES, &*UNFINISHED_QUOTED_VALUES]
                 .into_iter()
@@ -129,13 +129,16 @@ fn credential_ranges(text: &str, values: &[String]) -> Vec<(usize, usize)> {
         // A timed capture can stop inside a multi-word known value, where no
         // individual token reaches the fragment minimum. Inspect the trailing
         // prefix in both original/decoded views, including launcher ellipses.
-        let ending = text
+        // Locate content before terminal whitespace without changing its
+        // original offsets: scrub first, and leave diagnostic formatting intact.
+        let content = text.trim_end();
+        let ending = content
             .strip_suffix("...")
-            .or_else(|| text.strip_suffix('…'))
-            .unwrap_or(text);
+            .or_else(|| content.strip_suffix('…'))
+            .unwrap_or(content);
         let prefix_len = trailing_known_prefix_len(ending, value);
         if prefix_len >= 8 {
-            ranges.push((ending.len() - prefix_len, text.len()));
+            ranges.push((ending.len() - prefix_len, content.len()));
         }
         ranges.extend(
             text.match_indices(value.as_str())
@@ -507,6 +510,43 @@ mod tests {
                 ["alpha bravo charlie delta echo"]
             ),
             "permission denied /workspace"
+        );
+    }
+    #[test]
+    fn diagnostic_scrub_fragment_before_punctuation() {
+        for ellipsis in ["...", "…"] {
+            assert_eq!(
+                scrub(
+                    &format!("failed: synthetic-private{ellipsis}: detail"),
+                    ["synthetic-private-value"]
+                ),
+                "failed: [REDACTED]: detail"
+            );
+            assert_eq!(
+                scrub(
+                    &format!("failed: error=synthetic-private{ellipsis}: detail"),
+                    ["synthetic-private-value"]
+                ),
+                "failed: [REDACTED]: detail"
+            );
+        }
+    }
+    #[test]
+    fn diagnostic_scrub_multiword_prefix_before_terminal_whitespace() {
+        for newline in ["\n", "\r\n", " \t", "\r\n\n"] {
+            for ellipsis in ["", "...", "…"] {
+                assert_eq!(
+                    scrub(
+                        &format!("failed: alpha bravo{ellipsis}{newline}"),
+                        ["alpha bravo charlie"]
+                    ),
+                    format!("failed: [REDACTED]{newline}")
+                );
+            }
+        }
+        assert_eq!(
+            scrub("failed: alpha%20bravo%0D%0A", ["alpha bravo charlie"]),
+            "failed: [REDACTED]%0D%0A"
         );
     }
     #[test]
