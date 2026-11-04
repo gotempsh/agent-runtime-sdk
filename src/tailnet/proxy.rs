@@ -255,8 +255,23 @@ async fn serve_connection(
             let input = std::io::Cursor::new(leftover).chain(client_read);
             if upgrade {
                 let mut input = BufReader::new(input);
+                let (accept, accepted) = tokio::sync::oneshot::channel::<()>();
+                // Keep this future alive across 101: a pending body write may
+                // own bytes already consumed from input. Cancelling it here
+                // would silently discard those bytes before tunneling.
+                let send = async {
+                    forward_body(&mut input, &mut origin_write, body).await?;
+                    accepted.await.map_err(|_| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::ConnectionAborted,
+                            "upgrade was not accepted",
+                        )
+                    })?;
+                    tokio::io::copy(&mut input, &mut origin_write).await?;
+                    origin_write.shutdown().await
+                };
+                tokio::pin!(send);
                 let accepted = {
-                    let send = forward_body(&mut input, &mut origin_write, body);
                     let reply = async {
                         loop {
                             // Do not over-read an interim response into the
@@ -287,25 +302,20 @@ async fn serve_connection(
                             return Ok(false);
                         }
                     };
-                    tokio::pin!(send, reply);
+                    tokio::pin!(reply);
                     tokio::select! {
                         result = &mut reply => result?,
                         result = &mut send => { result?; reply.await? }
                     }
                 };
                 if accepted {
+                    let _ = accept.send(());
                     // Preserve TCP half-close: a client can finish its upload
                     // and still wait for a final reply from the upgraded peer.
-                    tokio::try_join!(
-                        async {
-                            tokio::io::copy(&mut input, &mut origin_write).await?;
-                            origin_write.shutdown().await
-                        },
-                        async {
-                            tokio::io::copy(&mut origin_read, &mut client_write).await?;
-                            client_write.shutdown().await
-                        }
-                    )?;
+                    tokio::try_join!(send, async {
+                        tokio::io::copy(&mut origin_read, &mut client_write).await?;
+                        client_write.shutdown().await
+                    })?;
                 }
                 return Ok(());
             }
@@ -1007,6 +1017,44 @@ mod tests {
             assert!(reply.ends_with("\r\n\r\nok"));
             server.await.unwrap();
         }).await.expect("100 Continue must not deadlock upload");
+    }
+
+    #[tokio::test]
+    async fn early_upgrade_preserves_backpressured_upload_bytes() {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let body = vec![b'x'; 16 * 1024 * 1024];
+            let length = body.len();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let (_, leftover) = read_head(&mut stream).await.unwrap();
+                // Leave the upload blocked in a socket write when 101 arrives.
+                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                stream.write_all(b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: fixture\r\n\r\n").await.unwrap();
+                let mut received = leftover;
+                stream.read_to_end(&mut received).await.unwrap();
+                assert_eq!(received.len(), length + 4, "101 must not discard buffered upload bytes");
+                assert!(received[..length].iter().all(|byte| *byte == b'x'));
+                assert_eq!(&received[length..], b"ping");
+                stream.write_all(b"complete").await.unwrap();
+            });
+            let proxy = SplitProxy::start(SocksUpstream { addr }, RouteTable::default()).await.unwrap();
+            let mut client = TcpStream::connect(proxy.local_addr()).await.unwrap();
+            client.write_all(format!("POST http://{addr}/ HTTP/1.1\r\nContent-Length: {length}\r\nConnection: Upgrade\r\nUpgrade: fixture\r\n\r\n").as_bytes()).await.unwrap();
+            let (mut read, mut write) = client.split();
+            let (_, reply) = tokio::join!(async {
+                write.write_all(&body).await.unwrap();
+                write.write_all(b"ping").await.unwrap();
+                write.shutdown().await.unwrap();
+            }, async {
+                let mut reply = String::new();
+                read.read_to_string(&mut reply).await.unwrap();
+                reply
+            });
+            server.await.unwrap();
+            assert!(reply.ends_with("complete"));
+        }).await.expect("early upgrade must preserve upload and final reply");
     }
 
     #[test]
