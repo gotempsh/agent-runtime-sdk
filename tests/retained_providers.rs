@@ -1383,7 +1383,7 @@ async fn retained_launcher_failure_preserves_redacted_stderr_without_waiting_for
     ] {
         let f = Fixture::new(true, Duration::from_secs(30)).await;
         fs::write(f.dir.path().join("claude-fixture"), format!(
-            "#!/bin/sh\nread line\nprintf '%s\\n' '{diagnostic}: diagnostic-secret\nAuthorization: Bearer synthetic-file-token\nhttps://synthetic-user:synthetic-pass@example.test\napi_key=synthetic-cut\nfailed: {{synthetic-private...}}' >&2\nprintf '%s' 'alpha bravo charlie delta' >&2\nsleep 5 >&2 &\nexit 1\n"
+            "#!/bin/sh\nread line\nprintf '%s\\n' '{diagnostic}: diagnostic-secret\nAuthorization: Bearer synthetic-file-token\nhttps://synthetic-user:synthetic-pass@example.test\napi_key=synthetic-cut\nfailed: {{synthetic-private...}}\nfailed: (abcdefg!): detail' >&2\nprintf '%s' 'alpha bravo charlie delta' >&2\nsleep 5 >&2 &\nexit 1\n"
         )).unwrap();
         let mut input = Fixture::input("launcher-failed", "hello");
         input.environment.insert(
@@ -1397,6 +1397,10 @@ async fn retained_launcher_failure_preserves_redacted_stderr_without_waiting_for
         input.environment.insert(
             "WRAPPED_SECRET".into(),
             temps_agent_runtime::SecretString::new("synthetic-private-value"),
+        );
+        input.environment.insert(
+            "PUNCTUATED_SECRET".into(),
+            temps_agent_runtime::SecretString::new("abcdefg!private-value"),
         );
         let started = std::time::Instant::now();
         let failure = tokio::time::timeout(Duration::from_secs(4), async {
@@ -1414,7 +1418,8 @@ async fn retained_launcher_failure_preserves_redacted_stderr_without_waiting_for
         assert!(
             !failure.message.contains("diagnostic-secret")
                 && !failure.message.contains("synthetic")
-                && !failure.message.contains("alpha bravo"),
+                && !failure.message.contains("alpha bravo")
+                && !failure.message.contains("abcdefg"),
             "{}",
             failure.message
         );

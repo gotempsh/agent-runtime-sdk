@@ -135,20 +135,9 @@ fn credential_ranges(text: &str, values: &[String]) -> Vec<(usize, usize)> {
     fragments.sort_unstable();
     fragments.dedup();
     for value in values {
-        // A timed capture can stop inside a multi-word known value, where no
-        // individual token reaches the fragment minimum. Inspect the trailing
-        // prefix in both original/decoded views, including launcher ellipses.
-        // Locate content before terminal whitespace without changing its
-        // original offsets: scrub first, and leave diagnostic formatting intact.
-        let content = text.trim_end();
-        let ending = content
-            .strip_suffix("...")
-            .or_else(|| content.strip_suffix('…'))
-            .unwrap_or(content);
-        let prefix_len = trailing_known_prefix_len(ending, value);
-        if prefix_len >= 8 {
-            ranges.push((ending.len() - prefix_len, content.len()));
-        }
+        // Match known prefixes directly: wrapper punctuation can also belong
+        // to the credential, so token normalization alone cannot identify it.
+        ranges.extend(known_prefix_ranges(text, value));
         ranges.extend(
             text.match_indices(value.as_str())
                 .map(|(start, found)| (start, start + found.len())),
@@ -182,12 +171,12 @@ fn credential_ranges(text: &str, values: &[String]) -> Vec<(usize, usize)> {
     ranges
 }
 
-// KMP prefix fallback keeps this linear in the diagnostic plus known value,
-// even for long, repetitive credentials. The table is bounded by text length.
-fn trailing_known_prefix_len(text: &str, value: &str) -> usize {
+// KMP fallback keeps prefix matching linear in the diagnostic plus known
+// value, even for repetitive credentials. The table is bounded by text length.
+fn known_prefix_ranges(text: &str, value: &str) -> Vec<(usize, usize)> {
     let needle = &value.as_bytes()[..value.len().min(text.len())];
     if needle.len() < 8 {
-        return 0;
+        return Vec::new();
     }
     let mut fallback = vec![0; needle.len()];
     for i in 1..needle.len() {
@@ -200,20 +189,52 @@ fn trailing_known_prefix_len(text: &str, value: &str) -> usize {
         }
         fallback[i] = matched;
     }
+    let mut ranges = Vec::new();
+    let mut record = |end: usize, matched: usize, content_end: usize| {
+        let start = end - matched;
+        let mut end = end;
+        // A mismatch may occur inside a multi-byte character. Record only
+        // complete UTF-8, then preserve diagnostic whitespace after the match.
+        while end > start && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        if end - start >= 8 && content_end > start {
+            end = content_end;
+            if text[end..].starts_with("...") {
+                end += 3;
+            } else if text[end..].starts_with('…') {
+                end += '…'.len_utf8();
+            }
+            ranges.push((start, end));
+        }
+    };
     let mut matched = 0;
-    for byte in text.bytes() {
-        while matched > 0 && (matched == needle.len() || byte != needle[matched]) {
-            matched = fallback[matched - 1];
+    let mut content_end = 0;
+    for (char_start, ch) in text.char_indices() {
+        let char_end = char_start + ch.len_utf8();
+        for (offset, byte) in text.as_bytes()[char_start..char_end]
+            .iter()
+            .copied()
+            .enumerate()
+        {
+            if matched > 0 && (matched == needle.len() || byte != needle[matched]) {
+                record(char_start + offset, matched, content_end);
+                while matched > 0 && (matched == needle.len() || byte != needle[matched]) {
+                    matched = fallback[matched - 1];
+                }
+            }
+            if byte == needle[matched] {
+                matched += 1;
+            }
         }
-        if byte == needle[matched] {
-            matched += 1;
+        // Track whitespace boundaries once, avoiding repeated trim scans for
+        // overlapping prefixes with long runs of spaces.
+        if !ch.is_whitespace() {
+            content_end = char_end;
         }
     }
-    if value.is_char_boundary(matched) {
-        matched
-    } else {
-        0
-    }
+    record(text.len(), matched, content_end);
+    ranges
 }
 
 fn has_numeric_port(url: &str) -> bool {
@@ -603,6 +624,58 @@ mod tests {
                 "failed: [REDACTED] detail"
             );
         }
+    }
+    #[test]
+    fn diagnostic_scrub_known_prefix_with_credential_punctuation_inside_wrappers() {
+        for secret in ["abcdefg!private-value", "+abcdefg-private", "éééé-private"] {
+            for end in (8..secret.len()).filter(|end| secret.is_char_boundary(*end)) {
+                let prefix = &secret[..end];
+                for (open, close) in [
+                    ("(", "):"),
+                    ("{", "}"),
+                    ("<", ">"),
+                    ("`", "`"),
+                    ("\"", "\""),
+                ] {
+                    for ellipsis in ["", "...", "…"] {
+                        let text = format!("failed: {open}{prefix}{ellipsis}{close} detail");
+                        assert_eq!(
+                            scrub(&text, [secret]),
+                            format!("failed: {open}[REDACTED]{close} detail")
+                        );
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn diagnostic_scrub_known_prefix_in_nonterminal_diagnostics() {
+        assert_eq!(
+            scrub("ééééê detail", ["ééééé-private"]),
+            "[REDACTED]ê detail"
+        );
+        let whitespace = " ".repeat(32768);
+        let secret = format!("{}private", " ".repeat(16384));
+        assert_eq!(scrub(&whitespace, [secret.as_str()]), whitespace);
+        for text in [
+            "failed: alpha bravo: detail",
+            "failed: alpha%20bravo: detail",
+            "failed: alpha bravo\npermission denied",
+        ] {
+            assert!(!scrub(text, ["alpha bravo charlie"]).contains("alpha"));
+        }
+        assert_eq!(
+            scrub("failed: ab cd e detail", ["ab cd ef gh"]),
+            "failed: ab cd e detail"
+        );
+        assert_eq!(
+            scrub("failed: café au � detail", ["café au lait"]),
+            "failed: [REDACTED] � detail"
+        );
+        assert_eq!(
+            scrub("ab ab ax: ab ab ab: detail", ["ab ab ab cd"]),
+            "ab ab ax: [REDACTED]: detail"
+        );
     }
     #[test]
     fn diagnostic_scrub_explicit_before_trimming_and_truncation() {
