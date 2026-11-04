@@ -28,3 +28,10 @@ Temps Code integration requires marking its own non-secret launch configuration
 with `non_secret_configuration`, and explicit credential mappings with `credential`.
 No Temps Code variable names are built into the SDK. This SDK change does not
 update a downstream dependency pin or caller.
+
+Remote clients carry the per-value classification in an optional
+`diagnostic_secret` field on each protocol environment entry. The host restores
+it for both runtime acquisition and turn input. Older frames without it keep the
+name-based defaults; older hosts still redact all values, so preserving caller
+configuration remotely requires upgrading both ends. Debug output remains
+redacted throughout transport.

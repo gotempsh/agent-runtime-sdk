@@ -292,6 +292,17 @@ impl SecretString {
         Self(value.into(), Some(false))
     }
 
+    pub(crate) fn diagnostic_classification(&self) -> Option<bool> {
+        self.1
+    }
+
+    pub(crate) fn with_diagnostic_classification(
+        value: String,
+        classification: Option<bool>,
+    ) -> Self {
+        Self(value, classification)
+    }
+
     pub(crate) fn diagnostic_secret(&self, name: &str) -> bool {
         if self.1 == Some(true)
             || matches!(

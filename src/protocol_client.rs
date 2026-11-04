@@ -1111,7 +1111,7 @@ fn protocol_turn_input(input: TurnInput) -> ProtocolTurnInput {
     }
 }
 
-fn protocol_environment(
+pub(crate) fn protocol_environment(
     environment: BTreeMap<String, SecretString>,
 ) -> Vec<ProtocolEnvironmentVariable> {
     environment
@@ -1119,6 +1119,7 @@ fn protocol_environment(
         .map(|(name, value)| ProtocolEnvironmentVariable {
             name,
             value: ProtocolSecret::new(value.expose().to_owned()),
+            diagnostic_secret: value.diagnostic_classification(),
         })
         .collect()
 }
