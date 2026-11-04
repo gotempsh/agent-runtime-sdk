@@ -1866,6 +1866,46 @@ echo '{"BackendState":"Running","CurrentTailnet":{"MagicDNSSuffix":"example.ts.n
         assert_ne!(generation, daemon.routing_snapshot().await.generation);
         assert!(daemon.routing_snapshot().await.available);
 
+        // Pause a CLI response across a restart: an old response must never
+        // authorize routes for the new incarnation. Disable periodic refresh
+        // for deterministic ownership of the single in-flight query.
+        if let Some(task) = daemon.inner.refresh.lock().unwrap().take() {
+            task.abort();
+        }
+        std::fs::write(
+            &tailscale,
+            r#"#!/bin/sh
+root=$(dirname "$0")
+touch "$root/query-started"
+while [ ! -e "$root/release-query" ]; do sleep 0.01; done
+echo '{"BackendState":"Running","Peer":{"old":{"HostName":"old-peer"}}}'
+"#,
+        )
+        .unwrap();
+        let old = daemon.clone();
+        let query = tokio::spawn(async move { old.refresh().await });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !temp.path().join("query-started").exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        daemon
+            .inner
+            .supervisor
+            .restart(&daemon.inner.process)
+            .await
+            .unwrap();
+        std::fs::write(temp.path().join("release-query"), "").unwrap();
+        query.await.unwrap().unwrap();
+        let stale = daemon.routing_snapshot().await;
+        assert!(!stale.available);
+        assert_eq!(stale.routes, RouteTable::default());
+        assert!(stale.socks_addr.is_none());
+        daemon.refresh().await.unwrap();
+        assert!(daemon.routing_snapshot().await.available);
+
         // A daemon that stops answering is no longer reported as connected.
         std::fs::write(&tailscale, "#!/bin/sh\nexit 1\n").unwrap();
         assert!(
