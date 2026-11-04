@@ -16,6 +16,11 @@ Versioning and Keep a Changelog conventions.
 
 ### Security
 
+- Retained EOF stderr is withheld for commands that inherit an untracked host
+  environment (`clear_environment = false`). These commands still launch; raw
+  diagnostics cannot expose inherited opaque credentials absent from the
+  explicit redaction set.
+
 - Retained stderr redaction keeps the process launch environment across
   continuations, including when the new request omits or rotates credentials.
   Unknown secret-key assignments and escaped quotes in credential values are

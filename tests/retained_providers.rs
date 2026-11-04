@@ -1432,6 +1432,78 @@ async fn retained_launcher_failure_preserves_redacted_stderr_without_waiting_for
 }
 
 #[tokio::test]
+async fn retained_launcher_with_inherited_environment_withholds_unknown_credentials() {
+    const CHILD: &str = "SDK_DIAGNOSTIC_INHERITED_CHILD";
+    const SECRET_KEY: &str = "SDK_DIAGNOSTIC_INHERITED_SECRET";
+    const SECRET: &str = "v7Q2m9R4p6T8n3L5";
+    struct InheritEnvironment;
+    #[async_trait::async_trait]
+    impl temps_agent_runtime::SandboxBackend for InheritEnvironment {
+        fn name(&self) -> &'static str {
+            "synthetic-inherited-environment"
+        }
+        fn capabilities(&self) -> temps_agent_runtime::SandboxCapabilities {
+            temps_agent_runtime::SandboxCapabilities::NONE
+        }
+        async fn prepare(
+            &self,
+            _context: temps_agent_runtime::SandboxContext,
+            mut command: temps_agent_runtime::CommandSpec,
+        ) -> Result<temps_agent_runtime::CommandSpec, temps_agent_runtime::SandboxError> {
+            command.clear_environment = false;
+            Ok(command)
+        }
+    }
+    if std::env::var_os(CHILD).is_none() {
+        // Isolate the inherited synthetic credential in a subprocess; never
+        // mutate the environment shared by concurrent tests.
+        let status = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "retained_launcher_with_inherited_environment_withholds_unknown_credentials",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env(SECRET_KEY, SECRET)
+            .status()
+            .await
+            .unwrap();
+        assert!(
+            status.success(),
+            "isolated inherited-environment regression failed"
+        );
+        return;
+    }
+    let f = Fixture::new(true, Duration::from_secs(30)).await;
+    fs::write(f.dir.path().join("claude-fixture"), format!(
+        "#!/usr/bin/env python3\nimport os,sys\nsys.stdin.readline()\nsecret=os.environ['{SECRET_KEY}']\nwith open('inherited-observed','w') as marker:marker.write('yes' if secret=='{SECRET}' else 'no')\nsys.stderr.write('permission denied '+secret+'\\n')\nsys.exit(1)\n"
+    )).unwrap();
+    let id = RuntimeId::new("inherited-environment").unwrap();
+    let mut spec = RuntimeSpec::new(id.clone(), Provider::Claude, f.dir.path());
+    spec.sandbox = Some(temps_agent_runtime::SandboxRequest::new(InheritEnvironment));
+    let handle = f.client.acquire(spec).await.unwrap();
+    let failure = handle
+        .start_turn(Fixture::input("fail", "hello"))
+        .await
+        .unwrap()
+        .wait()
+        .await
+        .unwrap_err();
+    assert_eq!(
+        fs::read_to_string(f.dir.path().join("inherited-observed")).unwrap(),
+        "yes"
+    );
+    assert!(!failure.message.contains(SECRET), "{}", failure.message);
+    assert!(
+        failure.message.contains("withheld") && failure.message.contains("inherited environment"),
+        "{}",
+        failure.message
+    );
+    f.client.dispose(&id).await.unwrap();
+    f.dispose().await;
+}
+
+#[tokio::test]
 async fn retained_launcher_failure_bounds_stderr_and_handles_empty_diagnostics() {
     for oversized in [false, true] {
         let f = Fixture::new(true, Duration::from_secs(30)).await;
