@@ -315,6 +315,8 @@ pub(crate) struct StderrCapture {
     tail: Arc<Mutex<VecDeque<u8>>>,
     detached: bool,
     overflow: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(test)]
+    before_snapshot_lock: Option<Box<dyn FnOnce() + Send + Sync>>,
 }
 
 impl StderrCapture {
@@ -350,6 +352,8 @@ impl StderrCapture {
             tail,
             detached: false,
             overflow,
+            #[cfg(test)]
+            before_snapshot_lock: None,
         }
     }
 
@@ -388,6 +392,12 @@ impl StderrCapture {
             // The reader is still running; dropping `self` below leaves it
             // or stops it according to `detach`.
             Err(_) => {}
+        }
+        // Test-only scheduling point immediately before acquiring the snapshot
+        // lock, so a reader update in this window can be exercised deterministically.
+        #[cfg(test)]
+        if let Some(before_lock) = self.before_snapshot_lock.take() {
+            before_lock();
         }
         let tail = self
             .tail
@@ -724,6 +734,45 @@ mod tests {
         assert!(tail.contains("content withheld"));
         assert!(started.elapsed() < Duration::from_secs(5));
         drop(writer);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stderr_capture_checks_overflow_after_the_snapshot_lock() {
+        use std::sync::atomic::Ordering;
+
+        let (reader, mut writer) = tokio::io::duplex(64);
+        let mut capture = StderrCapture::spawn(reader, 8);
+        let overflow = Arc::clone(&capture.overflow);
+        let write_now = Arc::new(tokio::sync::Notify::new());
+        let writer_ready = Arc::clone(&write_now);
+        let (overflowed_tx, overflowed_rx) = std::sync::mpsc::sync_channel(1);
+        let writer_task = tokio::spawn(async move {
+            writer_ready.notified().await;
+            writer.write_all(b"synthetic-private-tail").await.unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !overflow.load(Ordering::Relaxed) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("reader must overflow before the snapshot resumes");
+            overflowed_tx.send(()).unwrap();
+        });
+        let overflowed_rx = Mutex::new(overflowed_rx);
+        capture.before_snapshot_lock = Some(Box::new(move || {
+            // The old ordering would already have read `overflow == false`.
+            // Let the real reader overflow under `tail` before finish locks it.
+            write_now.notify_one();
+            overflowed_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(5))
+                .expect("reader update must finish before snapshot locking");
+        }));
+        let diagnostic = capture.finish(Duration::ZERO).await.unwrap();
+        writer_task.await.unwrap();
+        assert!(diagnostic.contains("content withheld"), "{diagnostic}");
+        assert!(!diagnostic.contains("ate-tail"));
     }
 
     #[tokio::test]
