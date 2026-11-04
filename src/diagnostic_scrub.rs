@@ -126,6 +126,17 @@ fn credential_ranges(text: &str, values: &[String]) -> Vec<(usize, usize)> {
     fragments.sort_unstable();
     fragments.dedup();
     for value in values {
+        // A timed capture can stop inside a multi-word known value, where no
+        // individual token reaches the fragment minimum. Inspect the trailing
+        // prefix in both original/decoded views, including launcher ellipses.
+        let ending = text
+            .strip_suffix("...")
+            .or_else(|| text.strip_suffix('…'))
+            .unwrap_or(text);
+        let prefix_len = trailing_known_prefix_len(ending, value);
+        if prefix_len >= 8 {
+            ranges.push((ending.len() - prefix_len, text.len()));
+        }
         ranges.extend(
             text.match_indices(value.as_str())
                 .map(|(start, found)| (start, start + found.len())),
@@ -157,6 +168,40 @@ fn credential_ranges(text: &str, values: &[String]) -> Vec<(usize, usize)> {
         }));
     }
     ranges
+}
+
+// KMP prefix fallback keeps this linear in the diagnostic plus known value,
+// even for long, repetitive credentials. The table is bounded by text length.
+fn trailing_known_prefix_len(text: &str, value: &str) -> usize {
+    let needle = &value.as_bytes()[..value.len().min(text.len())];
+    if needle.len() < 8 {
+        return 0;
+    }
+    let mut fallback = vec![0; needle.len()];
+    for i in 1..needle.len() {
+        let mut matched = fallback[i - 1];
+        while matched > 0 && needle[i] != needle[matched] {
+            matched = fallback[matched - 1];
+        }
+        if needle[i] == needle[matched] {
+            matched += 1;
+        }
+        fallback[i] = matched;
+    }
+    let mut matched = 0;
+    for byte in text.bytes() {
+        while matched > 0 && (matched == needle.len() || byte != needle[matched]) {
+            matched = fallback[matched - 1];
+        }
+        if byte == needle[matched] {
+            matched += 1;
+        }
+    }
+    if value.is_char_boundary(matched) {
+        matched
+    } else {
+        0
+    }
 }
 
 fn has_numeric_port(url: &str) -> bool {
@@ -426,6 +471,43 @@ mod tests {
                 );
             }
         }
+    }
+    #[test]
+    fn diagnostic_scrub_snapshot_cut_inside_multiword_known_value() {
+        for suffix in ["", "...", "…"] {
+            for prefix in [
+                "alpha bravo charlie delta",
+                "alpha%20bravo%20charlie%20delta",
+            ] {
+                assert_eq!(
+                    scrub(
+                        &format!("permission denied: {prefix}{suffix}"),
+                        ["alpha bravo charlie delta echo"]
+                    ),
+                    "permission denied: [REDACTED]"
+                );
+            }
+        }
+        assert_eq!(
+            scrub("failed: ab cd ef", ["ab cd ef gh"]),
+            "failed: [REDACTED]"
+        );
+        assert_eq!(scrub("failed: ab cd e", ["ab cd ef gh"]), "failed: ab cd e");
+        assert_eq!(
+            scrub("failed: café au", ["café au lait"]),
+            "failed: [REDACTED]"
+        );
+        assert_eq!(
+            scrub("ab ab ax: ab ab ab", ["ab ab ab cd"]),
+            "ab ab ax: [REDACTED]"
+        );
+        assert_eq!(
+            scrub(
+                "permission denied /workspace",
+                ["alpha bravo charlie delta echo"]
+            ),
+            "permission denied /workspace"
+        );
     }
     #[test]
     fn diagnostic_scrub_explicit_before_trimming_and_truncation() {

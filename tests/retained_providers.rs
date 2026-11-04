@@ -1383,12 +1383,16 @@ async fn retained_launcher_failure_preserves_redacted_stderr_without_waiting_for
     ] {
         let f = Fixture::new(true, Duration::from_secs(30)).await;
         fs::write(f.dir.path().join("claude-fixture"), format!(
-            "#!/bin/sh\nread line\nprintf '%s\\n' '{diagnostic}: diagnostic-secret\nAuthorization: Bearer synthetic-file-token\nhttps://synthetic-user:synthetic-pass@example.test\napi_key=synthetic-cut' >&2\nsleep 5 >&2 &\nexit 1\n"
+            "#!/bin/sh\nread line\nprintf '%s\\n' '{diagnostic}: diagnostic-secret\nAuthorization: Bearer synthetic-file-token\nhttps://synthetic-user:synthetic-pass@example.test\napi_key=synthetic-cut' >&2\nprintf '%s' 'alpha bravo charlie delta' >&2\nsleep 5 >&2 &\nexit 1\n"
         )).unwrap();
         let mut input = Fixture::input("launcher-failed", "hello");
         input.environment.insert(
             "DIAGNOSTIC_SECRET".into(),
             temps_agent_runtime::SecretString::new("diagnostic-secret"),
+        );
+        input.environment.insert(
+            "MULTIWORD_SECRET".into(),
+            temps_agent_runtime::SecretString::new("alpha bravo charlie delta echo"),
         );
         let started = std::time::Instant::now();
         let failure = tokio::time::timeout(Duration::from_secs(4), async {
@@ -1405,7 +1409,8 @@ async fn retained_launcher_failure_preserves_redacted_stderr_without_waiting_for
         assert!(failure.message.contains(diagnostic), "{}", failure.message);
         assert!(
             !failure.message.contains("diagnostic-secret")
-                && !failure.message.contains("synthetic"),
+                && !failure.message.contains("synthetic")
+                && !failure.message.contains("alpha bravo"),
             "{}",
             failure.message
         );
