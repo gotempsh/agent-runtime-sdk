@@ -7023,19 +7023,19 @@ impl AgentRuntime {
                 success: true,
                 code: None,
             }
+        } else if retired {
+            // Termination already confirmed retirement. Reaping is best effort:
+            // a transport may no longer expose the exited process or its status.
+            let _ = tokio::time::timeout(ATTACHED_SHUTDOWN_GRACE, process.wait()).await;
+            TransportExitStatus {
+                success: true,
+                code: None,
+            }
         } else {
-            let status = process
+            process
                 .wait()
                 .await
-                .map_err(|source| RuntimeError::Transport { provider, source })?;
-            if retired {
-                TransportExitStatus {
-                    success: true,
-                    code: None,
-                }
-            } else {
-                status
-            }
+                .map_err(|source| RuntimeError::Transport { provider, source })?
         };
         match request.tool_process_policy {
             crate::ToolProcessPolicy::PreserveOnCompletion => process.disarm(),

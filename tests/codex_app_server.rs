@@ -86,6 +86,7 @@ impl Script {
 #[derive(Clone)]
 struct AppServer {
     fail_exit: bool,
+    wait_error: bool,
     script: Script,
     release_hidden: Arc<tokio::sync::Notify>,
     /// Every frame the SDK wrote to the app server, in order.
@@ -104,6 +105,7 @@ impl AppServer {
     fn new(script: Script) -> Self {
         Self {
             fail_exit: false,
+            wait_error: false,
             script,
             release_hidden: Arc::new(tokio::sync::Notify::new()),
             frames: Arc::new(Mutex::new(Vec::new())),
@@ -252,6 +254,7 @@ impl ExecutionTransport for AppServer {
                 terminations,
                 terminated: false,
                 fail_exit: self.fail_exit,
+                wait_error: self.wait_error,
             },
         ))
     }
@@ -274,12 +277,22 @@ impl ExecutionTransport for AppServer {
 struct Control {
     terminated: bool,
     fail_exit: bool,
+    wait_error: bool,
     terminations: Arc<AtomicUsize>,
 }
 
 #[async_trait]
 impl TransportProcessControl for Control {
     async fn wait(&mut self) -> TransportResult<TransportExitStatus> {
+        if self.wait_error {
+            return Err(TransportError::new(
+                TransportErrorKind::Unsupported,
+                "fixture",
+                "wait",
+                "status unavailable",
+                false,
+            ));
+        }
         Ok(TransportExitStatus {
             success: !self.terminated && !self.fail_exit,
             code: Some(i32::from(self.terminated || self.fail_exit)),
@@ -2205,13 +2218,14 @@ async fn one_shot_eof_cannot_succeed_with_an_unfinished_goal() {
 
 #[tokio::test]
 async fn retirement_exit_preserves_completed_reply_but_ordinary_failure_does_not() {
-    for retire in [false, true] {
+    for (retire, wait_error) in [(false, false), (true, false), (false, true), (true, true)] {
         let mut transport = AppServer::new(if retire {
             Script::TitleThenClose
         } else {
             Script::HiddenContinuation
         });
         transport.fail_exit = true;
+        transport.wait_error = wait_error;
         let events = Collector::default();
         let mut input = request();
         if retire {
@@ -2221,6 +2235,11 @@ async fn retirement_exit_preserves_completed_reply_but_ordinary_failure_does_not
         if retire {
             assert_eq!(result.unwrap().text, "Working");
             assert!(transport.termination_count() > 0);
+        } else if wait_error {
+            assert!(matches!(
+                result,
+                Err(temps_agent_runtime::RuntimeError::Transport { .. })
+            ));
         } else {
             assert!(matches!(
                 result,
