@@ -5,6 +5,13 @@ Versioning and Keep a Changelog conventions.
 
 ## [Unreleased]
 
+### Fixed
+
+- Retained provider processes now preserve startup stderr on unexpected stdout
+  EOF, so sandbox launcher failures carry their actual diagnostic. Capture keeps
+  the last 32 KiB, waits at most two seconds for inherited stderr pipes, and uses
+  the same explicit-environment secret redaction as other process failures.
+
 ### Security
 
 - `opencode serve` now requires HTTP Basic credentials

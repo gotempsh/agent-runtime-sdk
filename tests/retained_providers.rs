@@ -1374,3 +1374,76 @@ async fn claude_reused_process_busy_past_the_startup_deadline_is_not_a_startup_f
     assert_eq!(f.spawns().len(), 1, "{:?}", f.events());
     f.dispose().await;
 }
+
+#[tokio::test]
+async fn retained_launcher_failure_preserves_redacted_stderr_without_waiting_for_descendants() {
+    for diagnostic in [
+        "nono: Sandbox initialization failed",
+        "docker: Cannot connect to the Docker daemon",
+    ] {
+        let f = Fixture::new(true, Duration::from_secs(30)).await;
+        fs::write(f.dir.path().join("claude-fixture"), format!(
+            "#!/bin/sh\nread line\nprintf '%s\\n' '{diagnostic}: diagnostic-secret' >&2\nsleep 5 >&2 &\nexit 1\n"
+        )).unwrap();
+        let mut input = Fixture::input("launcher-failed", "hello");
+        input.environment.insert(
+            "DIAGNOSTIC_SECRET".into(),
+            temps_agent_runtime::SecretString::new("diagnostic-secret"),
+        );
+        let started = std::time::Instant::now();
+        let failure = tokio::time::timeout(Duration::from_secs(4), async {
+            f.handle
+                .start_turn(input)
+                .await
+                .unwrap()
+                .wait()
+                .await
+                .unwrap_err()
+        })
+        .await
+        .expect("failure must not wait for the descendant");
+        assert!(failure.message.contains(diagnostic), "{}", failure.message);
+        assert!(
+            !failure.message.contains("diagnostic-secret"),
+            "{}",
+            failure.message
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "stderr held by descendants must not stall failure"
+        );
+        f.dispose().await;
+    }
+}
+
+#[tokio::test]
+async fn retained_launcher_failure_bounds_stderr_and_handles_empty_diagnostics() {
+    for oversized in [false, true] {
+        let f = Fixture::new(true, Duration::from_secs(30)).await;
+        let script = if oversized {
+            "#!/usr/bin/env python3\nimport sys\nsys.stdin.readline()\nsys.stderr.write('discarded-prefix' + 'x' * 65536 + 'tail-marker\\n')\nsys.exit(1)\n"
+        } else {
+            "#!/bin/sh\nread line\nexit 1\n"
+        };
+        fs::write(f.dir.path().join("claude-fixture"), script).unwrap();
+        let failure = f
+            .handle
+            .start_turn(Fixture::input("launcher-failed", "hello"))
+            .await
+            .unwrap()
+            .wait()
+            .await
+            .unwrap_err();
+        if oversized {
+            assert!(failure.message.contains("tail-marker"));
+            assert!(!failure.message.contains("discarded-prefix"));
+            // RuntimeFailure adds a small display prefix to the bounded diagnostic.
+            assert!(failure.message.len() < 33 * 1024);
+        } else {
+            assert!(failure
+                .message
+                .contains("process exited before completing the turn"));
+        }
+        f.dispose().await;
+    }
+}

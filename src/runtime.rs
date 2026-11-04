@@ -1036,7 +1036,7 @@ struct RetainedCodexIo {
     process: crate::TransportProcess,
     stdin: FrameWriter,
     reader: BufReader<crate::TransportReader>,
-    stderr_task: tokio::task::JoinHandle<std::io::Result<String>>,
+    stderr_task: Option<crate::process::StderrCapture>,
     stdout_task: Option<tokio::task::JoinHandle<std::io::Result<String>>>,
 }
 
@@ -1276,7 +1276,9 @@ impl RetainedCodexProcess {
         self.usable.store(false, Ordering::Release);
         self.generation.fetch_add(1, Ordering::AcqRel);
         if let Some(mut io) = self.io.lock().await.take() {
-            io.stderr_task.abort();
+            if let Some(stderr) = &io.stderr_task {
+                stderr.abort();
+            }
             if let Some(stdout_task) = io.stdout_task.take() {
                 stdout_task.abort();
             }
@@ -5659,7 +5661,7 @@ impl AgentRuntime {
                     process,
                     stdin,
                     reader,
-                    stderr_task: tokio::spawn(crate::process::bounded_stderr(
+                    stderr_task: Some(crate::process::StderrCapture::spawn(
                         stderr,
                         STDERR_TAIL_BYTES,
                     )),
@@ -6202,13 +6204,25 @@ impl AgentRuntime {
                 }
             };
             let Some(frame) = frame else {
+                // stdout EOF is often the sandbox launcher rejecting startup.
+                // Keep its bounded stderr even when a descendant holds the pipe.
+                let diagnostic = match io.stderr_task.take() {
+                    Some(capture) => capture.finish(STDERR_DRAIN_GRACE).await.unwrap_or_default(),
+                    None => String::new(),
+                };
+                let diagnostic = redact_secrets(diagnostic.trim(), &request.environment)
+                    .chars()
+                    .take(STDERR_TAIL_BYTES)
+                    .collect::<String>();
                 return Err(RuntimeError::ProcessFailed {
                     provider,
                     kind: ProviderProcessErrorKind::Unknown,
                     exit_code: None,
-                    stderr: format!(
-                        "retained {provider} process exited before completing the turn"
-                    ),
+                    stderr: if diagnostic.is_empty() {
+                        format!("retained {provider} process exited before completing the turn")
+                    } else {
+                        diagnostic
+                    },
                     provider_code: None,
                     delivery: crate::lifecycle::DeliveryState::PossiblySent,
                 });
@@ -10217,7 +10231,10 @@ mod tests {
                 process,
                 stdin: FrameWriter::new(Box::new(tokio::io::sink())),
                 reader: BufReader::new(output),
-                stderr_task: tokio::spawn(async { Ok(String::new()) }),
+                stderr_task: Some(crate::process::StderrCapture::spawn(
+                    tokio::io::empty(),
+                    STDERR_TAIL_BYTES,
+                )),
                 stdout_task: None,
             })),
             generation: AtomicU64::new(0),
