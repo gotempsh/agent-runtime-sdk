@@ -8,16 +8,16 @@ static PATTERNS: LazyLock<Vec<regex::Regex>> = LazyLock::new(|| {
         r"(?im)(?:proxy-)?authorization\s*[=:]\s*[^\r\n]+",
         r#"(?i)\b(?:bearer|basic)\s+[^\s\"'<>]+"#,
         r#"(?i)\b[a-z][a-z0-9+.-]*://[^\s/?#\"'<>]*@[^\s\"'<>]*"#,
-        r#"(?i)\b[a-z][a-z0-9+.-]*://[^\s/:?#\"'<>]+:[^\s/?#\"'<>]+$"#,
+        r#"(?i)(?P<credential>\b[a-z][a-z0-9+.-]*://[^\s/:?#\"'<>]+:[^\s/?#\"'<>]+)(?:$|[\s\"'<>])"#,
         r#"(?im)\b(?:[a-z0-9_]*[_-])?(?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|secret(?:[_-](?:access[_-])?key)?|password|passwd|credential|client[_-]?secret|signature|private[_-]?key|(?:encryption|signing|auth)[_-]?key)\s*[\"']?\s*[:=]\s*(?:\"(?:\\[^\r\n]|[^\"\\\r\n])*(?:\"|\\?\r?$)|'(?:\\[^\r\n]|[^'\\\r\n])*(?:'|\\?\r?$)|[^\s&,;\"'<>]+)"#,
         r"\b(?:sk-|sk_|gh[pousr]_|github_pat_|xox[baprs]-|AKIA|ASIA|eyJ)[A-Za-z0-9_./+=%-]*",
     ].into_iter().map(|p| regex::Regex::new(p).expect("credential pattern")).collect()
 });
 
-// Extract complete quoted diagnostic values as well as whitespace tokens.
+// Extract quoted diagnostic values, including cut-off lines, as well as tokens.
 // Keep their original escaped bytes so matches map directly to the input.
 static QUOTED_VALUES: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(r#""(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'"#).expect("quoted values")
+    regex::Regex::new(r#"(?m)"((?:\\[^\r\n]|[^"\\\r\n])*)(?:"|\\?\r?$)|'((?:\\[^\r\n]|[^'\\\r\n])*)(?:'|\\?\r?$)"#).expect("quoted values")
 });
 
 pub(crate) fn scrub<'a>(text: &str, secrets: impl IntoIterator<Item = &'a str>) -> String {
@@ -98,8 +98,9 @@ fn credential_ranges(text: &str, values: &[String]) -> Vec<(usize, usize)> {
         .map(|token| token.trim_matches(|c: char| "\"'(),;[]".contains(c)))
         .chain(
             QUOTED_VALUES
-                .find_iter(text)
-                .map(|quoted| &text[quoted.start() + 1..quoted.end() - 1]),
+                .captures_iter(text)
+                .filter_map(|quoted| quoted.get(1).or_else(|| quoted.get(2)))
+                .map(|quoted| quoted.as_str()),
         )
         .map(|token| {
             // Compare the credential bytes, but redact the diagnostic's whole
@@ -129,11 +130,15 @@ fn credential_ranges(text: &str, values: &[String]) -> Vec<(usize, usize)> {
         }
     }
     for pattern in PATTERNS.iter() {
-        ranges.extend(
-            pattern
-                .find_iter(text)
-                .map(|found| (found.start(), found.end())),
-        );
+        ranges.extend(pattern.captures_iter(text).map(|captures| {
+            // A boundary may be consumed to recognize a partial URL;
+            // leave that separator and the following diagnostic intact.
+            let found = captures
+                .name("credential")
+                .or_else(|| captures.get(0))
+                .unwrap();
+            (found.start(), found.end())
+        }));
     }
     ranges
 }
@@ -276,6 +281,13 @@ mod tests {
                 assert_eq!(value["error"], "[REDACTED]");
             }
         }
+        for ending in ["", "\npermission denied", "\r\npermission denied"] {
+            let text = format!(r#"{{"error":"abcdefgh...{ending}"#);
+            assert_eq!(
+                scrub(&text, ["abcdefgh-private-value"]),
+                format!(r#"{{"error":"[REDACTED]{ending}"#)
+            );
+        }
         for url in [
             "https://example.test?contact=alice@example.test",
             "https://example.test#contact=alice@example.test",
@@ -290,6 +302,30 @@ mod tests {
         ] {
             assert_eq!(scrub(url, []), "[REDACTED]");
         }
+    }
+    #[test]
+    fn diagnostic_scrub_partial_urls_before_boundaries() {
+        for suffix in [
+            "",
+            "\n",
+            "\r\n",
+            " permission denied",
+            "\npermission denied",
+            "\r\npermission denied",
+            "\" permission denied",
+            "' permission denied",
+            "\tpermission denied",
+        ] {
+            let text = format!("failed: https://alice:opaque-secret{suffix}");
+            assert_eq!(scrub(&text, []), format!("failed: [REDACTED]{suffix}"));
+        }
+        assert_eq!(
+            scrub(
+                "https://alice:opaque-secret https://bob:other-private\n",
+                []
+            ),
+            "[REDACTED] [REDACTED]\n"
+        );
     }
     #[test]
     fn diagnostic_scrub_explicit_before_trimming_and_truncation() {
