@@ -9,7 +9,7 @@ static PATTERNS: LazyLock<Vec<regex::Regex>> = LazyLock::new(|| {
         r#"(?i)\b(?:bearer|basic)\s+[^\s\"'<>]+"#,
         r#"(?i)\b[a-z][a-z0-9+.-]*://[^\s/?#\"'<>]*@[^\s\"'<>]*"#,
         r#"(?i)(?P<credential>\b[a-z][a-z0-9+.-]*://[^\s/:?#\"'<>]+:[^\s/?#\"'<>]+)(?:$|[\s\"'<>])"#,
-        r#"(?im)\b(?:[a-z0-9_]*[_-])?(?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|secret(?:[_-](?:access[_-])?key)?|password|passwd|credential|client[_-]?secret|signature|private[_-]?key|(?:encryption|signing|auth)[_-]?key)\s*[\"']?\s*[:=]\s*(?:\"(?:\\[^\r\n]|[^\"\\\r\n])*(?:\"|\\?\r?$)|'(?:\\[^\r\n]|[^'\\\r\n])*(?:'|\\?\r?$)|[^\s&,;\"'<>]+)"#,
+        r#"(?ims)\b(?:[a-z0-9_]*[_-])?(?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|secret(?:[_-](?:access[_-])?key)?|password|passwd|credential|client[_-]?secret|signature|private[_-]?key|(?:encryption|signing|auth)[_-]?key)\s*[\"']?\s*[:=]\s*(?:\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|\"(?:\\[^\r\n]|[^\"\\\r\n])*(?:\"|\\?\r?$)|'(?:\\[^\r\n]|[^'\\\r\n])*(?:'|\\?\r?$)|[^\s&,;\"'<>]+)"#,
         r"\b(?:sk-|sk_|gh[pousr]_|github_pat_|xox[baprs]-|AKIA|ASIA|eyJ)[A-Za-z0-9_./+=%-]*",
     ].into_iter().map(|p| regex::Regex::new(p).expect("credential pattern")).collect()
 });
@@ -388,6 +388,17 @@ mod tests {
         assert_eq!(scrub("http://alice:12345@example.test", []), "[REDACTED]");
         assert!(!scrub("http://alice:12345 connection refused", ["12345"]).contains("12345"));
         assert_eq!(scrub("password=http://alice:12345", []), "[REDACTED]");
+    }
+    #[test]
+    fn diagnostic_scrub_unknown_multiline_quoted_credentials() {
+        for quote in ['"', '\''] {
+            for newline in ["\n", "\r\n"] {
+                let text = format!(
+                    "password={quote}opaque{newline}private{quote}\npermission denied /workspace"
+                );
+                assert_eq!(scrub(&text, []), "[REDACTED]\npermission denied /workspace");
+            }
+        }
     }
     #[test]
     fn diagnostic_scrub_explicit_before_trimming_and_truncation() {
