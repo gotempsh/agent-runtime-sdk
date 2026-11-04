@@ -34,13 +34,16 @@ pub(crate) fn scrub<'a>(text: &str, secrets: impl IntoIterator<Item = &'a str>) 
         .collect();
     values.sort_unstable_by_key(|s| std::cmp::Reverse(s.len()));
     values.dedup();
-    // Exact values must be removed before normalization changes their bytes.
-    let raw = scrub_known(text, &values);
-    // Decode percent escapes before matching, including encoded header delimiters.
+    // Inspect original and decoded views without mutating either. Map decoded
+    // matches back to original byte ranges so normalization and overlapping
+    // values cannot hide one another, and useful text stays byte-for-byte intact.
+    let mut ranges = credential_ranges(text, &values);
     let mut bytes = Vec::with_capacity(text.len());
-    let input = raw.as_bytes();
+    let mut offsets = Vec::with_capacity(text.len() + 1);
+    let input = text.as_bytes();
     let mut i = 0;
     while i < input.len() {
+        offsets.push(i);
         if input[i] == b'%' && i + 2 < input.len() {
             if let Ok(hex) = std::str::from_utf8(&input[i + 1..i + 3]) {
                 if let Ok(byte) = u8::from_str_radix(hex, 16) {
@@ -53,30 +56,66 @@ pub(crate) fn scrub<'a>(text: &str, secrets: impl IntoIterator<Item = &'a str>) 
         bytes.push(input[i]);
         i += 1;
     }
-    let mut text = scrub_known(&String::from_utf8_lossy(&bytes), &values);
-    for pattern in PATTERNS.iter() {
-        text = pattern.replace_all(&text, "[REDACTED]").into_owned();
+    offsets.push(text.len());
+    let Ok(decoded) = std::str::from_utf8(&bytes) else {
+        return "Diagnostic contained invalid encoded text; content withheld to protect credentials.".into();
+    };
+    ranges.extend(
+        credential_ranges(decoded, &values)
+            .into_iter()
+            .map(|(start, end)| (offsets[start], offsets[end])),
+    );
+    ranges.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (start, end) in ranges {
+        if let Some(last) = merged.last_mut().filter(|last| start <= last.1) {
+            last.1 = last.1.max(end);
+        } else {
+            merged.push((start, end));
+        }
     }
-    text
+    let mut output = String::new();
+    let mut cursor = 0;
+    for (start, end) in merged {
+        output.push_str(&text[cursor..start]);
+        output.push_str("[REDACTED]");
+        cursor = end;
+    }
+    output.push_str(&text[cursor..]);
+    output
 }
 
-fn scrub_known(text: &str, values: &[String]) -> String {
-    let mut text = text.to_owned();
+fn credential_ranges(text: &str, values: &[String]) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut fragments: Vec<&str> = text
+        .split_whitespace()
+        .map(|token| token.trim_matches(|c: char| "\"'(),;[]".contains(c)))
+        .filter(|token| token.len() >= 8)
+        .collect();
+    fragments.sort_unstable();
+    fragments.dedup();
     for value in values {
-        // Long-value fragments must be removed before a shorter overlapping
-        // exact value can destroy the evidence needed to recognize them.
-        let fragments: Vec<String> = text
-            .split_whitespace()
-            .map(|token| token.trim_matches(|c: char| "\"'(),;[]".contains(c)))
-            .filter(|token| token.len() >= 8 && value.contains(token))
-            .map(str::to_owned)
-            .collect();
-        for fragment in fragments {
-            text = text.replace(&fragment, "[REDACTED]");
+        ranges.extend(
+            text.match_indices(value.as_str())
+                .map(|(start, found)| (start, start + found.len())),
+        );
+        for fragment in &fragments {
+            if value.contains(fragment) {
+                ranges.extend(
+                    text.match_indices(fragment)
+                        .map(|(start, found)| (start, start + found.len())),
+                );
+            }
         }
-        text = text.replace(value, "[REDACTED]");
     }
-    text
+    for pattern in PATTERNS.iter() {
+        ranges.extend(
+            pattern
+                .find_iter(text)
+                .map(|found| (found.start(), found.end())),
+        );
+    }
+    ranges
 }
 
 #[cfg(test)]
@@ -113,6 +152,23 @@ mod tests {
             ),
             "[REDACTED]"
         );
+        assert_eq!(
+            scrub("rose violet-extra", ["rose violet-extra"]),
+            "[REDACTED]"
+        );
+        assert_eq!(
+            scrub(
+                "token%2Dsensitive%2Dprivate",
+                ["token", "token-sensitive-private-value"]
+            ),
+            "[REDACTED]"
+        );
+        assert_eq!(
+            scrub("nono: permission denied /a%20b", []),
+            "nono: permission denied /a%20b"
+        );
+        assert_eq!(scrub("caf%C3%A9-private", ["café-private"]), "[REDACTED]");
+        assert!(scrub("Authorization%3A%20Bearer%20%FF", []).contains("withheld"));
         let value = "synthetic-opaque-private";
         let encoded = base64::engine::general_purpose::STANDARD.encode(value);
         assert_eq!(scrub(&encoded, [value]), "[REDACTED]");
