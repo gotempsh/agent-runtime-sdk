@@ -389,13 +389,13 @@ impl StderrCapture {
             // or stops it according to `detach`.
             Err(_) => {}
         }
-        if self.overflow.load(std::sync::atomic::Ordering::Relaxed) {
-            return Ok("Launcher diagnostic exceeded the capture limit; content withheld to protect credentials.".into());
-        }
         let tail = self
             .tail
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.overflow.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok("Launcher diagnostic exceeded the capture limit; content withheld to protect credentials.".into());
+        }
         let bytes = tail.iter().copied().collect::<Vec<_>>();
         Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
