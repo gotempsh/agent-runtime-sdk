@@ -24,7 +24,7 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{RwLock, Semaphore};
 use tokio::task::JoinHandle;
@@ -169,7 +169,14 @@ enum ProxyRequest {
         host: String,
         port: u16,
         origin_head: Vec<u8>,
+        body: HttpBody,
     },
+}
+
+#[derive(Debug)]
+enum HttpBody {
+    Length(u64),
+    Chunked,
 }
 
 async fn serve_connection(
@@ -233,11 +240,28 @@ async fn serve_connection(
                 upstream.write_all(&leftover).await?;
             }
         }
-        ProxyRequest::Forward { origin_head, .. } => {
+        ProxyRequest::Forward {
+            origin_head, body, ..
+        } => {
             upstream.write_all(&origin_head).await?;
-            if !leftover.is_empty() {
-                upstream.write_all(&leftover).await?;
+            // One request per plain-HTTP connection. Never tunnel a second
+            // absolute-form request (or a different authority) to this origin.
+            let (client_read, mut client_write) = client.split();
+            let (mut origin_read, mut origin_write) = upstream.split();
+            let input = std::io::Cursor::new(leftover).chain(client_read);
+            let send = async {
+                forward_body(BufReader::new(input), &mut origin_write, body).await?;
+                origin_write.shutdown().await
+            };
+            // Forward interim responses (e.g. 100 Continue) while uploading,
+            // and stop reading a body if the origin rejects it early.
+            let reply = tokio::io::copy(&mut origin_read, &mut client_write);
+            tokio::pin!(send, reply);
+            tokio::select! {
+                result = &mut reply => { result?; }
+                result = &mut send => { result?; reply.await?; }
             }
+            return Ok(());
         }
     }
     let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
@@ -329,14 +353,119 @@ fn parse_request(head: &[u8]) -> Result<ProxyRequest, &'static str> {
         format!("/{path_query}")
     };
     let version = parts.next().ok_or("missing HTTP version")?;
-    let line_end = text.find("\r\n").ok_or("missing request line terminator")?;
-    let mut origin_head = format!("{method} {origin} {version}").into_bytes();
-    origin_head.extend_from_slice(&head[line_end..]);
+    let mut origin_head =
+        format!("{method} {origin} {version}\r\nHost: {authority}\r\n").into_bytes();
+    let mut length = None;
+    let mut chunked = false;
+    for line in text
+        .split("\r\n")
+        .skip(1)
+        .take_while(|line| !line.is_empty())
+    {
+        let (name, value) = line.split_once(':').ok_or("invalid HTTP header")?;
+        if name.eq_ignore_ascii_case("content-length") {
+            if length.is_some() {
+                return Err("duplicate content length");
+            }
+            length = Some(
+                value
+                    .trim()
+                    .parse::<u64>()
+                    .map_err(|_| "invalid content length")?,
+            );
+        }
+        if name.eq_ignore_ascii_case("transfer-encoding") {
+            if chunked || !value.trim().eq_ignore_ascii_case("chunked") {
+                return Err("unsupported transfer encoding");
+            }
+            chunked = true;
+        }
+        if name.eq_ignore_ascii_case("host")
+            || name.eq_ignore_ascii_case("connection")
+            || name.eq_ignore_ascii_case("proxy-connection")
+        {
+            continue;
+        }
+        origin_head.extend_from_slice(line.as_bytes());
+        origin_head.extend_from_slice(b"\r\n");
+    }
+    if chunked && length.is_some() {
+        return Err("ambiguous request body framing");
+    }
+    origin_head.extend_from_slice(b"Connection: close\r\n\r\n");
     Ok(ProxyRequest::Forward {
         host,
         port,
         origin_head,
+        body: if chunked {
+            HttpBody::Chunked
+        } else {
+            HttpBody::Length(length.unwrap_or(0))
+        },
     })
+}
+
+/// Copy exactly one request body, excluding any pipelined request bytes.
+async fn forward_body<R: tokio::io::AsyncBufRead + Unpin, W: tokio::io::AsyncWrite + Unpin>(
+    mut input: R,
+    upstream: &mut W,
+    body: HttpBody,
+) -> std::io::Result<()> {
+    let invalid =
+        || std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid HTTP body framing");
+    match body {
+        HttpBody::Length(length) => {
+            if tokio::io::copy(&mut (&mut input).take(length), upstream).await? != length {
+                return Err(invalid());
+            }
+        }
+        HttpBody::Chunked => loop {
+            let line = body_line(&mut input).await?;
+            let text = std::str::from_utf8(&line).map_err(|_| invalid())?;
+            let size = u64::from_str_radix(text.trim_end().split(';').next().unwrap_or(""), 16)
+                .map_err(|_| invalid())?;
+            upstream.write_all(&line).await?;
+            if size == 0 {
+                let mut total = 0;
+                loop {
+                    let trailer = body_line(&mut input).await?;
+                    total += trailer.len();
+                    if total > MAX_HEAD_BYTES {
+                        return Err(invalid());
+                    }
+                    upstream.write_all(&trailer).await?;
+                    if trailer == b"\r\n" {
+                        return Ok(());
+                    }
+                }
+            }
+            if tokio::io::copy(&mut (&mut input).take(size), upstream).await? != size {
+                return Err(invalid());
+            }
+            let mut end = [0; 2];
+            input.read_exact(&mut end).await?;
+            if end != *b"\r\n" {
+                return Err(invalid());
+            }
+            upstream.write_all(&end).await?;
+        },
+    }
+    Ok(())
+}
+
+async fn body_line<R: tokio::io::AsyncBufRead + Unpin>(input: &mut R) -> std::io::Result<Vec<u8>> {
+    let mut line = Vec::new();
+    (&mut *input)
+        .take((MAX_HEAD_BYTES + 1) as u64)
+        .read_until(b'\n', &mut line)
+        .await?;
+    if line.len() > MAX_HEAD_BYTES || !line.ends_with(b"\r\n") {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid HTTP chunk line",
+        ));
+    }
+    Ok(line)
 }
 
 /// Split `host:port`, `[v6]:port`, or a bare host (using `default_port`).
@@ -660,7 +789,10 @@ mod tests {
                     let (head, mut body) = read_head(&mut client).await.unwrap();
                     assert_eq!(
                         String::from_utf8(head).unwrap(),
-                        format!("POST {origin} HTTP/1.1\r\n{headers}")
+                        format!(
+                            "POST {origin} HTTP/1.1\r\n{}Connection: close\r\n\r\n",
+                            headers.trim_end_matches("\r\n").to_string() + "\r\n"
+                        )
                     );
                     let received = body.len();
                     body.resize(3, 0);
@@ -672,6 +804,80 @@ mod tests {
         })
         .await
         .expect("plain HTTP forwarding must finish");
+    }
+
+    #[test]
+    fn plain_http_host_header_comes_from_target_authority() {
+        for authority in [
+            "peer.ts.net",
+            "peer.ts.net:8080",
+            "[fd7a:115c:a1e0::1]:8080",
+        ] {
+            let request = format!("GET http://{authority}/ HTTP/1.1\r\nhOsT: different.example\r\nX-Fixture: retained\r\n\r\n");
+            let ProxyRequest::Forward { origin_head, .. } =
+                parse_request(request.as_bytes()).unwrap()
+            else {
+                panic!("expected forward");
+            };
+            assert_eq!(String::from_utf8(origin_head).unwrap(), format!("GET / HTTP/1.1\r\nHost: {authority}\r\nX-Fixture: retained\r\nConnection: close\r\n\r\n"));
+        }
+    }
+
+    #[test]
+    fn absolute_targets_reject_userinfo_and_fragments_but_preserve_escaped_bytes() {
+        for target in [
+            "http://user:pass@host/",
+            "http://host/#part",
+            "http://host#part",
+        ] {
+            assert!(parse_request(format!("GET {target} HTTP/1.1\r\n\r\n").as_bytes()).is_err());
+        }
+        for target in ["http://host/a%40b?q=%23", "http://host/?q=%40%23"] {
+            assert!(parse_request(format!("GET {target} HTTP/1.1\r\n\r\n").as_bytes()).is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn plain_http_closes_after_one_request_including_chunked_bodies() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let echo = echo_server().await;
+            let proxy = SplitProxy::start(SocksUpstream { addr: echo }, RouteTable::default()).await.unwrap();
+            for (headers, body) in [("Content-Length: 3", "abc"), ("Transfer-Encoding: chunked", "3;fixture=yes\r\nabc\r\n0\r\nX-End: yes\r\n\r\n")] {
+                let mut client = TcpStream::connect(proxy.local_addr()).await.unwrap();
+                let request = format!("POST http://{echo}/first HTTP/1.1\r\nHost: {echo}\r\nConnection: keep-alive\r\n{headers}\r\n\r\n{body}GET http://{echo}/second HTTP/1.1\r\n\r\n");
+                client.write_all(request.as_bytes()).await.unwrap();
+                let mut received = String::new();
+                client.read_to_string(&mut received).await.unwrap();
+                assert_eq!(received, format!("POST /first HTTP/1.1\r\nHost: {echo}\r\n{headers}\r\nConnection: close\r\n\r\n{body}"));
+            }
+        }).await.expect("one-request HTTP connections must close");
+    }
+
+    #[tokio::test]
+    async fn plain_http_passes_continue_before_reading_the_body() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let (_, leftover) = read_head(&mut stream).await.unwrap();
+                assert_eq!(leftover, [] as [u8; 0]);
+                stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await.unwrap();
+                let mut body = [0; 3];
+                stream.read_exact(&mut body).await.unwrap();
+                assert_eq!(&body, b"abc");
+                stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok").await.unwrap();
+            });
+            let proxy = SplitProxy::start(SocksUpstream { addr }, RouteTable::default()).await.unwrap();
+            let mut client = TcpStream::connect(proxy.local_addr()).await.unwrap();
+            client.write_all(format!("POST http://{addr}/ HTTP/1.1\r\nContent-Length: 3\r\nExpect: 100-continue\r\n\r\n").as_bytes()).await.unwrap();
+            assert_eq!(read_head(&mut client).await.unwrap().0, b"HTTP/1.1 100 Continue\r\n\r\n");
+            client.write_all(b"abc").await.unwrap();
+            let mut reply = String::new();
+            client.read_to_string(&mut reply).await.unwrap();
+            assert!(reply.ends_with("\r\n\r\nok"));
+            server.await.unwrap();
+        }).await.expect("100 Continue must not deadlock upload");
     }
 
     #[tokio::test]
