@@ -164,10 +164,11 @@ enum ProxyRequest {
         host: String,
         port: u16,
     },
-    /// Absolute-form plain HTTP request; the whole head is forwarded as-is.
+    /// Plain HTTP request with its target rewritten for the origin server.
     Forward {
         host: String,
         port: u16,
+        origin_head: Vec<u8>,
     },
 }
 
@@ -190,7 +191,7 @@ async fn serve_connection(
         }
     };
     let (host, port) = match &request {
-        ProxyRequest::Connect { host, port } | ProxyRequest::Forward { host, port } => {
+        ProxyRequest::Connect { host, port } | ProxyRequest::Forward { host, port, .. } => {
             (host.clone(), *port)
         }
     };
@@ -232,8 +233,8 @@ async fn serve_connection(
                 upstream.write_all(&leftover).await?;
             }
         }
-        ProxyRequest::Forward { .. } => {
-            upstream.write_all(&head).await?;
+        ProxyRequest::Forward { origin_head, .. } => {
+            upstream.write_all(&origin_head).await?;
             if !leftover.is_empty() {
                 upstream.write_all(&leftover).await?;
             }
@@ -313,9 +314,29 @@ fn parse_request(head: &[u8]) -> Result<ProxyRequest, &'static str> {
     let rest = target
         .strip_prefix("http://")
         .ok_or("only CONNECT and absolute http:// requests are supported")?;
-    let authority = rest.split('/').next().unwrap_or("");
+    // Preserve escaped path/query bytes; URL normalization could change the
+    // resource selected by an origin. A query may follow an empty path.
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    let path_query = &rest[authority_end..];
+    if authority.contains('@') || path_query.contains('#') {
+        return Err("request target must not contain userinfo or a fragment");
+    }
     let (host, port) = split_host_port(authority, 80).ok_or("invalid request authority")?;
-    Ok(ProxyRequest::Forward { host, port })
+    let origin = if path_query.starts_with('/') {
+        path_query.to_string()
+    } else {
+        format!("/{path_query}")
+    };
+    let version = parts.next().ok_or("missing HTTP version")?;
+    let line_end = text.find("\r\n").ok_or("missing request line terminator")?;
+    let mut origin_head = format!("{method} {origin} {version}").into_bytes();
+    origin_head.extend_from_slice(&head[line_end..]);
+    Ok(ProxyRequest::Forward {
+        host,
+        port,
+        origin_head,
+    })
 }
 
 /// Split `host:port`, `[v6]:port`, or a bare host (using `default_port`).
@@ -490,7 +511,7 @@ mod tests {
         match parse_request(b"GET http://grafana.jerboa-altered.ts.net/api HTTP/1.1\r\n\r\n")
             .unwrap()
         {
-            ProxyRequest::Forward { host, port } => {
+            ProxyRequest::Forward { host, port, .. } => {
                 assert_eq!(host, "grafana.jerboa-altered.ts.net");
                 assert_eq!(port, 80);
             }
@@ -606,6 +627,51 @@ mod tests {
             seen.lock().unwrap().as_slice(),
             ["grafana.jerboa-altered.ts.net".to_string()]
         );
+    }
+
+    #[tokio::test]
+    async fn plain_http_forwards_origin_form_and_body_on_both_routes() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let echo = echo_server().await;
+            let (socks, seen) = fake_socks5(echo).await;
+            let proxy = SplitProxy::start(SocksUpstream { addr: socks }, table())
+                .await
+                .unwrap();
+            for authority in [
+                echo.to_string(),
+                "grafana.jerboa-altered.ts.net:8080".into(),
+            ] {
+                for (target, origin) in [
+                    ("/a%2Fb?key=one%20two", "/a%2Fb?key=one%20two"),
+                    ("", "/"),
+                    ("?q=1", "/?q=1"),
+                ] {
+                    let mut client = TcpStream::connect(proxy.local_addr()).await.unwrap();
+                    let headers = format!(
+                        "Host: {authority}\r\nContent-Length: 3\r\nX-Fixture: preserved\r\n\r\n"
+                    );
+                    client
+                        .write_all(
+                            format!("POST http://{authority}{target} HTTP/1.1\r\n{headers}abc")
+                                .as_bytes(),
+                        )
+                        .await
+                        .unwrap();
+                    let (head, mut body) = read_head(&mut client).await.unwrap();
+                    assert_eq!(
+                        String::from_utf8(head).unwrap(),
+                        format!("POST {origin} HTTP/1.1\r\n{headers}")
+                    );
+                    let received = body.len();
+                    body.resize(3, 0);
+                    client.read_exact(&mut body[received..]).await.unwrap();
+                    assert_eq!(body, b"abc");
+                }
+            }
+            assert_eq!(seen.lock().unwrap().len(), 3);
+        })
+        .await
+        .expect("plain HTTP forwarding must finish");
     }
 
     #[tokio::test]
