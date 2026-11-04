@@ -154,13 +154,24 @@ fn credential_ranges(text: &str, values: &[String]) -> Vec<(usize, usize)> {
 }
 
 fn has_numeric_port(url: &str) -> bool {
-    url.split_once("://")
-        .and_then(|(_, authority)| authority.rsplit_once(':'))
-        .is_some_and(|(_, port)| {
-            !port.is_empty()
-                && port.bytes().all(|b| b.is_ascii_digit())
-                && port.parse::<u16>().is_ok()
-        })
+    let Some((_, authority)) = url.split_once("://") else {
+        return false;
+    };
+    let port = if let Some(bracketed) = authority.strip_prefix('[') {
+        let Some((address, port)) = bracketed.split_once("]:") else {
+            return false;
+        };
+        if address.parse::<std::net::Ipv6Addr>().is_err() {
+            return false;
+        }
+        port
+    } else {
+        let Some((_, port)) = authority.split_once(':') else {
+            return false;
+        };
+        port
+    };
+    !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) && port.parse::<u16>().is_ok()
 }
 
 #[cfg(test)]
@@ -366,6 +377,13 @@ mod tests {
                 let input = format!("cannot connect to {endpoint}{suffix}");
                 assert_eq!(scrub(&input, []), input);
             }
+        }
+        for url in [
+            "https://alice:opaque:1234",
+            "https://alice:opaque:1234 connection refused",
+            "https://alice:opaque%3A1234\n",
+        ] {
+            assert!(!scrub(url, []).contains("opaque"));
         }
         assert_eq!(scrub("http://alice:12345@example.test", []), "[REDACTED]");
         assert!(!scrub("http://alice:12345 connection refused", ["12345"]).contains("12345"));
