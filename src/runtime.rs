@@ -1986,6 +1986,9 @@ async fn write_completion_frames(
     deadline: Option<tokio::time::Instant>,
     cancellation: &tokio_util::sync::CancellationToken,
 ) -> Result<()> {
+    if frames.is_empty() {
+        return Ok(());
+    }
     let write = write_provider_frames(provider, stdin, frames, "provider write");
     let Some(deadline) = deadline else {
         return write.await;
@@ -6760,6 +6763,7 @@ impl AgentRuntime {
         let mut first_text = true;
         let mut reader = BufReader::new(reader);
         let mut protocol_completed = false;
+        let mut retired = false;
         let mut settlement_deadline = None;
         loop {
             if adapter.completion_pending(&state) {
@@ -6801,6 +6805,7 @@ impl AgentRuntime {
                         .await
                         .map_err(|source| RuntimeError::Transport { provider, source })?;
                     protocol_completed = true;
+                    retired = true;
                 } else if adapter.completion_pending(&state) {
                     process
                         .terminate()
@@ -6871,6 +6876,7 @@ impl AgentRuntime {
                     .await
                     .map_err(|source| RuntimeError::Transport { provider, source })?;
                 protocol_completed = true;
+                retired = true;
                 break;
             }
             write_optional_frames(stdin.as_mut(), &output.optional_writes).await;
@@ -6950,6 +6956,7 @@ impl AgentRuntime {
                         .await
                         .map_err(|source| RuntimeError::Transport { provider, source })?;
                     protocol_completed = true;
+                    retired = true;
                     break;
                 }
                 protocol_completed = true;
@@ -7017,10 +7024,18 @@ impl AgentRuntime {
                 code: None,
             }
         } else {
-            process
+            let status = process
                 .wait()
                 .await
-                .map_err(|source| RuntimeError::Transport { provider, source })?
+                .map_err(|source| RuntimeError::Transport { provider, source })?;
+            if retired {
+                TransportExitStatus {
+                    success: true,
+                    code: None,
+                }
+            } else {
+                status
+            }
         };
         match request.tool_process_policy {
             crate::ToolProcessPolicy::PreserveOnCompletion => process.disarm(),
@@ -7793,6 +7808,21 @@ mod tests {
             written, "1234567\n",
             "the dropped frame left no partial bytes"
         );
+    }
+
+    #[tokio::test]
+    async fn empty_completion_writes_leave_interrupt_and_timeout_to_the_driver() {
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        cancellation.cancel();
+        let result = write_completion_frames(
+            Provider::Codex,
+            None,
+            &[],
+            Some(tokio::time::Instant::now()),
+            &cancellation,
+        )
+        .await;
+        assert!(result.is_ok());
     }
 
     #[tokio::test(start_paused = true)]

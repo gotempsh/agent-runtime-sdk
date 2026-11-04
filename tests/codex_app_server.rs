@@ -85,6 +85,7 @@ impl Script {
 
 #[derive(Clone)]
 struct AppServer {
+    fail_exit: bool,
     script: Script,
     release_hidden: Arc<tokio::sync::Notify>,
     /// Every frame the SDK wrote to the app server, in order.
@@ -102,6 +103,7 @@ struct AppServer {
 impl AppServer {
     fn new(script: Script) -> Self {
         Self {
+            fail_exit: false,
             script,
             release_hidden: Arc::new(tokio::sync::Notify::new()),
             frames: Arc::new(Mutex::new(Vec::new())),
@@ -246,7 +248,11 @@ impl ExecutionTransport for AppServer {
             Some(Box::new(sdk_stdin) as TransportWriter),
             Box::new(sdk_stdout) as TransportReader,
             Box::new(sdk_stderr) as TransportReader,
-            Control { terminations },
+            Control {
+                terminations,
+                terminated: false,
+                fail_exit: self.fail_exit,
+            },
         ))
     }
 
@@ -266,6 +272,8 @@ impl ExecutionTransport for AppServer {
 }
 
 struct Control {
+    terminated: bool,
+    fail_exit: bool,
     terminations: Arc<AtomicUsize>,
 }
 
@@ -273,12 +281,13 @@ struct Control {
 impl TransportProcessControl for Control {
     async fn wait(&mut self) -> TransportResult<TransportExitStatus> {
         Ok(TransportExitStatus {
-            success: true,
-            code: Some(0),
+            success: !self.terminated && !self.fail_exit,
+            code: Some(i32::from(self.terminated || self.fail_exit)),
         })
     }
 
     async fn terminate(&mut self) -> TransportResult<()> {
+        self.terminated = true;
         self.terminations.fetch_add(1, Ordering::AcqRel);
         Ok(())
     }
@@ -2192,4 +2201,31 @@ async fn one_shot_eof_cannot_succeed_with_an_unfinished_goal() {
         Err(temps_agent_runtime::RuntimeError::Protocol { .. })
     ));
     assert!(transport.termination_count() > 0);
+}
+
+#[tokio::test]
+async fn retirement_exit_preserves_completed_reply_but_ordinary_failure_does_not() {
+    for retire in [false, true] {
+        let mut transport = AppServer::new(if retire {
+            Script::TitleThenClose
+        } else {
+            Script::HiddenContinuation
+        });
+        transport.fail_exit = true;
+        let events = Collector::default();
+        let mut input = request();
+        if retire {
+            input.request_session_title = Some("Generate title".into());
+        }
+        let result = runtime(transport.clone()).run(input, &events, None).await;
+        if retire {
+            assert_eq!(result.unwrap().text, "Working");
+            assert!(transport.termination_count() > 0);
+        } else {
+            assert!(matches!(
+                result,
+                Err(temps_agent_runtime::RuntimeError::ProcessFailed { .. })
+            ));
+        }
+    }
 }
