@@ -17,6 +17,9 @@ static PATTERNS: LazyLock<Vec<regex::Regex>> = LazyLock::new(|| {
 // Extract quoted diagnostic values, including cut-off lines, as well as tokens.
 // Keep their original escaped bytes so matches map directly to the input.
 static QUOTED_VALUES: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r#"(?s)"((?:\\.|[^"\\])*)"|'((?:\\.|[^'\\])*)'"#).expect("quoted values")
+});
+static UNFINISHED_QUOTED_VALUES: LazyLock<regex::Regex> = LazyLock::new(|| {
     regex::Regex::new(r#"(?m)"((?:\\[^\r\n]|[^"\\\r\n])*)(?:"|\\?\r?$)|'((?:\\[^\r\n]|[^'\\\r\n])*)(?:'|\\?\r?$)"#).expect("quoted values")
 });
 
@@ -97,8 +100,9 @@ fn credential_ranges(text: &str, values: &[String]) -> Vec<(usize, usize)> {
         .split_whitespace()
         .map(|token| token.trim_matches(|c: char| "\"'(),;[]".contains(c)))
         .chain(
-            QUOTED_VALUES
-                .captures_iter(text)
+            [&*QUOTED_VALUES, &*UNFINISHED_QUOTED_VALUES]
+                .into_iter()
+                .flat_map(|pattern| pattern.captures_iter(text))
                 .filter_map(|quoted| quoted.get(1).or_else(|| quoted.get(2)))
                 .map(|quoted| quoted.as_str()),
         )
@@ -130,17 +134,33 @@ fn credential_ranges(text: &str, values: &[String]) -> Vec<(usize, usize)> {
         }
     }
     for pattern in PATTERNS.iter() {
-        ranges.extend(pattern.captures_iter(text).map(|captures| {
+        ranges.extend(pattern.captures_iter(text).filter_map(|captures| {
             // A boundary may be consumed to recognize a partial URL;
             // leave that separator and the following diagnostic intact.
             let found = captures
                 .name("credential")
                 .or_else(|| captures.get(0))
                 .unwrap();
-            (found.start(), found.end())
+            if captures.name("credential").is_some() && has_numeric_port(found.as_str()) {
+                // Without userinfo or another credential marker, this is
+                // indistinguishable from a normal connection endpoint.
+                // Known-value matches are still redacted independently.
+                return None;
+            }
+            Some((found.start(), found.end()))
         }));
     }
     ranges
+}
+
+fn has_numeric_port(url: &str) -> bool {
+    url.split_once("://")
+        .and_then(|(_, authority)| authority.rsplit_once(':'))
+        .is_some_and(|(_, port)| {
+            !port.is_empty()
+                && port.bytes().all(|b| b.is_ascii_digit())
+                && port.parse::<u16>().is_ok()
+        })
 }
 
 #[cfg(test)]
@@ -326,6 +346,30 @@ mod tests {
             ),
             "[REDACTED] [REDACTED]\n"
         );
+    }
+    #[test]
+    fn diagnostic_scrub_multiline_fragments_and_numeric_ports() {
+        for ellipsis in ["...", "…"] {
+            let input = format!("failed: 'rose\nviolet{ellipsis}'");
+            assert_eq!(
+                scrub(&input, ["rose\nviolet-extra"]),
+                "failed: '[REDACTED]'"
+            );
+        }
+        for endpoint in [
+            "http://127.0.0.1:8080",
+            "https://example.test:443",
+            "http://localhost:3000",
+            "http://[::1]:8080",
+        ] {
+            for suffix in ["", " connection refused", "\npermission denied"] {
+                let input = format!("cannot connect to {endpoint}{suffix}");
+                assert_eq!(scrub(&input, []), input);
+            }
+        }
+        assert_eq!(scrub("http://alice:12345@example.test", []), "[REDACTED]");
+        assert!(!scrub("http://alice:12345 connection refused", ["12345"]).contains("12345"));
+        assert_eq!(scrub("password=http://alice:12345", []), "[REDACTED]");
     }
     #[test]
     fn diagnostic_scrub_explicit_before_trimming_and_truncation() {
