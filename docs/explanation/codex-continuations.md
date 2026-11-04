@@ -19,7 +19,9 @@ returns a terminal result:
 3. A new `turn/started` on that thread while completion is pending adopts its
    new ID. Its output and approvals stay in the same SDK invocation; Stop uses
    the new ID. Previous segment output, foreign threads, and replies to old
-   completion probes cannot end or contaminate it.
+   completion probes cannot end or contaminate it. Probe IDs are unique across
+   invocations sharing a connection, and segment filtering also applies to
+   one-shot execution.
 
 The host's ordinary Busy guard continues to serialize queued input and settings
 that replace the process. There is no new public invocation or duplicate prompt

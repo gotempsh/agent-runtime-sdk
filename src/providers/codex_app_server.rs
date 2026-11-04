@@ -598,7 +598,8 @@ pub(super) fn parse_line(line: &str, state: &mut AdapterState) -> Result<Adapter
         store(state, &turn);
         return Ok(output);
     }
-    if turn.retained
+    let needs_turn_correlation = turn.retained || !turn.completed_turn_ids.is_empty();
+    if needs_turn_correlation
         && !method.is_empty()
         && value.get("id").is_none()
         && reported_turn_id(&value).is_none()
@@ -608,7 +609,7 @@ pub(super) fn parse_line(line: &str, state: &mut AdapterState) -> Result<Adapter
         // its dedicated APIs instead of leaking into the active turn stream.
         return Ok(output);
     }
-    if turn.retained
+    if needs_turn_correlation
         && reported_turn_id(&value)
             .is_some_and(|reported| turn.turn_id.as_deref() != Some(reported))
     {
@@ -639,7 +640,10 @@ pub(super) fn parse_line(line: &str, state: &mut AdapterState) -> Result<Adapter
 }
 
 fn begin_completion_probe(turn: &mut TurnState, output: &mut AdapterOutput) -> Result<()> {
-    turn.completion_epoch += 1;
+    // Parser state is fresh for each invocation, but the connection can be
+    // reused. Never let a delayed old response match a new invocation.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    turn.completion_epoch = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let id = format!("sdk-completion-{}-goal", turn.completion_epoch);
     output.writes.push(encode(
         &json!({"jsonrpc":"2.0","id":id,"method":"thread/goal/get",
@@ -677,7 +681,7 @@ fn belongs_to_active_turn(value: &Value, turn: &TurnState) -> bool {
     {
         return false;
     }
-    if !turn.retained {
+    if !turn.retained && turn.completed_turn_ids.is_empty() {
         return true;
     }
     let reported = reported_turn_id(value);
@@ -2240,6 +2244,61 @@ mod tests {
         );
         assert_eq!(foreign.events, [] as [TurnEvent; 0]);
     }
+    #[test]
+    fn continuation_filters_previous_segment_events_in_both_execution_modes() {
+        for retained in [false, true] {
+            let mut state = continuation_state();
+            let mut turn = load(&state);
+            turn.retained = retained;
+            store(&mut state, &turn);
+            segment_end(&mut state, "turn-1");
+            segment_start(&mut state, "thread-1", "turn-2");
+            let previous_output = feed(
+                &mut state,
+                json!({"method":"item/agentMessage/delta",
+                "params":{"threadId":"thread-1","turnId":"turn-1","delta":"stale"}}),
+            );
+            assert_eq!(previous_output.events, [] as [TurnEvent; 0]);
+            let stale_end = segment_end(&mut state, "turn-1");
+            assert!(!stale_end.terminal && no_writes(&stale_end));
+            assert!(!completion_pending(&state));
+            let current = feed(
+                &mut state,
+                json!({"method":"item/agentMessage/delta",
+                "params":{"threadId":"thread-1","turnId":"turn-2","delta":"current"}}),
+            );
+            assert!(current
+                .events
+                .iter()
+                .any(|e| matches!(e, TurnEvent::TextDelta { text } if text == "current")));
+        }
+    }
+
+    #[test]
+    fn completion_probe_ids_do_not_repeat_across_invocations() {
+        let mut earlier = continuation_state();
+        let first = segment_end(&mut earlier, "turn-1");
+        let old_goal = writes(&first)[0].clone();
+        let read = answer(&mut earlier, &old_goal, json!({"goal":null}));
+        let old_idle = writes(&read)[0].clone();
+        let mut current = continuation_state();
+        let next = segment_end(&mut current, "turn-1");
+        let new_goal = writes(&next)[0].clone();
+        assert_ne!(old_goal["id"], new_goal["id"]);
+        let stale_goal = answer(&mut current, &old_goal, json!({"goal":null}));
+        assert!(!stale_goal.terminal && no_writes(&stale_goal));
+        let stale_idle = answer(
+            &mut current,
+            &old_idle,
+            json!({"thread":{"id":"thread-1","status":{"type":"idle"}}}),
+        );
+        assert!(!stale_idle.terminal && no_writes(&stale_idle));
+        assert_eq!(
+            load(&current).completion_probe.as_deref(),
+            new_goal["id"].as_str()
+        );
+    }
+
     #[test]
     fn active_goal_waits_across_idle_status_until_a_later_turn() {
         let mut state = continuation_state();
