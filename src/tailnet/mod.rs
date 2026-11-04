@@ -1396,13 +1396,10 @@ impl TailnetDaemon {
             available,
             detail: if available {
                 "Connected".into()
+            } else if unreachable {
+                "Tailnet is not answering; reconnect it and retry the status refresh".into()
             } else {
-                if unreachable {
-                    "Tailnet is not answering; reconnect it and retry the status refresh".into()
-                } else {
-                    "Tailnet unavailable; connect it and wait for a successful status refresh"
-                        .into()
-                }
+                "Tailnet unavailable; connect it and wait for a successful status refresh".into()
             },
             routes: if available {
                 routes
