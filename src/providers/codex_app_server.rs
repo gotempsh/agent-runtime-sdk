@@ -82,6 +82,7 @@ struct TurnState {
     retained: bool,
     /// A provider turn ended; retain ownership until a state read confirms idle.
     completion_pending: bool,
+    completion_settled: bool,
     completion_epoch: u64,
     completion_probe: Option<String>,
     retire: bool,
@@ -172,11 +173,12 @@ struct TitleFlow {
 }
 
 pub(super) fn completion_pending(state: &AdapterState) -> bool {
-    load(state).completion_pending
+    let turn = load(state);
+    turn.completion_pending && !turn.completion_settled
 }
 pub(super) fn can_finish_after_retirement(state: &AdapterState) -> bool {
     let turn = load(state);
-    turn.completion_pending && !turn.goal_active
+    turn.completion_pending && !turn.completion_settled && !turn.goal_active
 }
 pub(super) fn retire_after_completion(state: &AdapterState) -> bool {
     load(state).retire
@@ -439,6 +441,24 @@ pub(super) fn parse_line(line: &str, state: &mut AdapterState) -> Result<Adapter
     // provider turn invalidates old responses before it emits any activity.
     let own_thread = turn.thread_id.is_some()
         && value.pointer("/params/threadId").and_then(Value::as_str) == turn.thread_id.as_deref();
+    if turn.completion_settled && !method.is_empty() && method != "thread/name/updated" {
+        if own_thread
+            && (method == "turn/started"
+                || (method == "thread/status/changed"
+                    && value.pointer("/params/status/type").and_then(Value::as_str)
+                        == Some("active")))
+        {
+            return Err(protocol(
+                "Codex started unowned work after confirming idle; the provider was stopped",
+            ));
+        }
+        if value.get("id").is_some() {
+            turn.retire = true;
+            output.terminal = true;
+        }
+        store(state, &turn);
+        return Ok(output);
+    }
     if own_thread && method == "turn/started" && turn.completion_pending {
         if let Some(id) = reported_turn_id(&value) {
             if turn.completed_turn_ids.contains(id) {
@@ -450,6 +470,7 @@ pub(super) fn parse_line(line: &str, state: &mut AdapterState) -> Result<Adapter
             if turn.turn_id.as_deref() != Some(id) {
                 turn.turn_id = Some(id.to_owned());
                 turn.completion_pending = false;
+                turn.completion_settled = false;
                 turn.completion_probe = None;
                 turn.streamed.clear();
                 turn.error_message = None;
@@ -540,7 +561,10 @@ pub(super) fn parse_line(line: &str, state: &mut AdapterState) -> Result<Adapter
                     .pointer("/result/thread/status/type")
                     .and_then(Value::as_str)
                 {
-                    Some("idle") => output.terminal = true,
+                    Some("idle") => {
+                        turn.completion_settled = true;
+                        output.terminal = true;
+                    }
                     Some("active") => {}
                     _ => {
                         return Err(protocol(
@@ -2317,6 +2341,27 @@ mod tests {
         ));
         assert!(completion_pending(&state));
         assert!(!renamed.terminal);
+    }
+
+    #[test]
+    fn confirmed_idle_disarms_settlement_without_accepting_late_work() {
+        let mut state = continuation_state();
+        let completed = segment_end(&mut state, "turn-1");
+        let read = answer(&mut state, &writes(&completed)[0], json!({"goal":null}));
+        let idle = answer(
+            &mut state,
+            &writes(&read)[0],
+            json!({"thread":{"id":"thread-1","status":{"type":"idle"}}}),
+        );
+        assert!(idle.terminal);
+        assert!(!completion_pending(&state));
+        assert!(!can_finish_after_retirement(&state));
+        let late = feed(
+            &mut state,
+            json!({"method":"item/agentMessage/delta","params":{"threadId":"thread-1","turnId":"turn-1","delta":"late"}}),
+        );
+        assert_eq!(late.events, [] as [TurnEvent; 0]);
+        assert!(parse_line(&json!({"method":"turn/started","params":{"threadId":"thread-1","turn":{"id":"unowned"}}}).to_string(), &mut state).is_err());
     }
 
     #[test]
