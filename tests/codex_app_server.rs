@@ -38,6 +38,9 @@ use tokio_util::sync::CancellationToken;
 /// Turn shape the fixture app server plays out after `turn/start`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Script {
+    HiddenContinuation,
+    HiddenHeld,
+    HiddenNeverSettles,
     /// Ask for command approval and finish once the decision arrives.
     Approval,
     /// Ask a blocking question and finish once the answer arrives.
@@ -82,6 +85,7 @@ impl Script {
 #[derive(Clone)]
 struct AppServer {
     script: Script,
+    release_hidden: Arc<tokio::sync::Notify>,
     /// Every frame the SDK wrote to the app server, in order.
     frames: Arc<Mutex<Vec<Value>>>,
     /// Arguments the SDK asked the transport to spawn `codex` with.
@@ -98,6 +102,7 @@ impl AppServer {
     fn new(script: Script) -> Self {
         Self {
             script,
+            release_hidden: Arc::new(tokio::sync::Notify::new()),
             frames: Arc::new(Mutex::new(Vec::new())),
             arguments: Arc::new(Mutex::new(Vec::new())),
             spawns: Arc::new(AtomicUsize::new(0)),
@@ -214,6 +219,7 @@ impl ExecutionTransport for AppServer {
         let (sdk_stderr, server_stderr) = duplex(1024);
         drop(server_stderr);
         let script = self.script;
+        let release_hidden = self.release_hidden.clone();
         let frames = Arc::clone(&self.frames);
         let terminations = Arc::clone(&self.terminations);
         let background_terminals = Arc::clone(&self.background_terminals);
@@ -221,6 +227,7 @@ impl ExecutionTransport for AppServer {
         tokio::spawn(async move {
             serve(
                 script,
+                release_hidden,
                 frames,
                 background_terminals,
                 ignore_probes,
@@ -279,21 +286,61 @@ impl TransportProcessControl for Control {
 /// Scripted app server: reads client frames and writes protocol replies.
 async fn serve(
     script: Script,
+    release_hidden: Arc<tokio::sync::Notify>,
     frames: Arc<Mutex<Vec<Value>>>,
     background_terminals: Arc<AtomicUsize>,
     ignore_probes: Arc<AtomicBool>,
     input: tokio::io::DuplexStream,
-    mut output: tokio::io::DuplexStream,
+    output: tokio::io::DuplexStream,
 ) {
-    async fn send(output: &mut tokio::io::DuplexStream, value: Value) {
-        let _ = output.write_all(format!("{value}\n").as_bytes()).await;
-        let _ = output.flush().await;
+    struct Output {
+        pipe: tokio::io::DuplexStream,
+        thread_id: String,
     }
+    fn rebind(value: &mut Value, thread_id: &str) {
+        match value {
+            Value::String(id) if id == "thread-fixture" => *id = thread_id.to_owned(),
+            Value::Array(values) => {
+                for value in values {
+                    rebind(value, thread_id);
+                }
+            }
+            Value::Object(values) => {
+                for value in values.values_mut() {
+                    rebind(value, thread_id);
+                }
+            }
+            _ => {}
+        }
+    }
+    async fn send(output: &mut Output, mut value: Value) {
+        // Resumed fixture threads must emit their real identifier too; a
+        // parser must not accept another thread's events to make resume work.
+        rebind(&mut value, &output.thread_id);
+        let _ = output.pipe.write_all(format!("{value}\n").as_bytes()).await;
+        let _ = output.pipe.flush().await;
+    }
+    let mut output = Output {
+        pipe: output,
+        thread_id: "thread-fixture".into(),
+    };
     let mut lines = BufReader::new(input).lines();
     // `Script::Title` holds only the first user turn open until the hidden
     // title thread is done; later turns titled nothing and finish at once.
     let mut user_turns = 0;
-    while let Ok(Some(line)) = lines.next_line().await {
+    let mut hidden_running = false;
+    loop {
+        let line = tokio::select! {
+            line = lines.next_line() => line,
+            _ = release_hidden.notified(), if hidden_running => {
+                hidden_running = false;
+                send(&mut output, json!({"method":"turn/completed","params":{"threadId":"thread-fixture","turn":{"id":"turn-2","status":"completed"}}})).await;
+                continue;
+            }
+        };
+        let Ok(Some(line)) = line else {
+            break;
+        };
         let Ok(message) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
@@ -303,6 +350,17 @@ async fn serve(
         let hidden = params.get("threadId").and_then(Value::as_str) == Some("title-thread");
         match message.get("method").and_then(Value::as_str) {
             Some("initialized") => {}
+            Some("thread/goal/get") => {
+                let goal = if hidden_running || script == Script::HiddenNeverSettles {
+                    json!({"status":"active"})
+                } else {
+                    Value::Null
+                };
+                send(&mut output, json!({"id":id,"result":{"goal":goal}})).await;
+            }
+            Some("thread/read") => {
+                send(&mut output, json!({"id":id,"result":{"thread":{"id":"thread-fixture","status":{"type":"idle"}}}})).await;
+            }
             Some("config/read") => {
                 send(
                     &mut output,
@@ -414,6 +472,7 @@ async fn serve(
                     .and_then(Value::as_str)
                     .unwrap_or("thread-fixture")
                     .to_string();
+                output.thread_id = resumed.clone();
                 send(
                     &mut output,
                     json!({"jsonrpc":"2.0","id":id,"result":{"thread":{"id":resumed}}}),
@@ -445,6 +504,26 @@ async fn serve(
                     json!({"jsonrpc":"2.0","id":id,"result":{"turn":{"id":"turn-1"}}}),
                 )
                 .await;
+                if script == Script::HiddenNeverSettles {
+                    send(&mut output, json!({"method":"turn/completed","params":{"threadId":"thread-fixture","turn":{"id":"turn-1","status":"completed"}}})).await;
+                    continue;
+                }
+                if matches!(script, Script::HiddenContinuation | Script::HiddenHeld) {
+                    hidden_running = script == Script::HiddenHeld;
+                    let mut frames = vec![
+                        json!({"method":"turn/completed","params":{"threadId":"thread-fixture","turn":{"id":"turn-1","status":"completed"}}}),
+                        json!({"method":"turn/started","params":{"threadId":"thread-fixture","turn":{"id":"turn-2"}}}),
+                        json!({"method":"item/agentMessage/delta","params":{"threadId":"thread-fixture","turnId":"turn-2","itemId":"continued","delta":"continued work"}}),
+                        json!({"method":"turn/completed","params":{"threadId":"thread-fixture","turn":{"id":"turn-2","status":"completed"}}}),
+                    ];
+                    if hidden_running {
+                        frames.pop();
+                    }
+                    for frame in frames {
+                        send(&mut output, frame).await;
+                    }
+                    continue;
+                }
                 if script == Script::Crash {
                     return;
                 }
@@ -517,6 +596,7 @@ async fn serve(
                 // Never answer; keep logging until the SDK drops the stream.
                 for _ in 0..4_000 {
                     if output
+                        .pipe
                         .write_all(
                             json!({"jsonrpc":"2.0","method":"item/commandExecution/outputDelta",
                                 "params":{"threadId":"thread-fixture","turnId":"turn-1",
@@ -525,7 +605,7 @@ async fn serve(
                             .as_bytes(),
                         )
                         .await
-                        .and(output.write_all(b"\n").await)
+                        .and(output.pipe.write_all(b"\n").await)
                         .is_err()
                     {
                         return;
@@ -585,7 +665,10 @@ fn opening_frames(script: Script) -> Vec<Value> {
                         "options":[{"label":"Dark","description":"Dim"}]}]}
             })]
         }
-        Script::Interrupt
+        Script::HiddenContinuation
+        | Script::HiddenHeld
+        | Script::HiddenNeverSettles
+        | Script::Interrupt
         | Script::StalledInterrupt
         | Script::Crash
         | Script::CompactionCrash
@@ -1910,4 +1993,177 @@ async fn a_hidden_thread_opened_after_its_turn_ended_is_unsubscribed_between_tur
     assert_eq!(unsubscribe["params"], json!({"threadId": "title-thread"}));
     // The late reply did not retire the process.
     assert_eq!(transport.termination_count(), 0);
+}
+
+#[tokio::test]
+async fn hidden_continuation_stays_in_the_invocation() {
+    let transport = AppServer::new(Script::HiddenContinuation);
+    let runtime = retained_runtime(transport.clone(), Duration::from_secs(30));
+    let (_, handle) = retained_handle(runtime).await;
+    let result = handle
+        .start_turn(TurnInput::new(
+            InvocationId::new("hidden-continuation").unwrap(),
+            "work",
+        ))
+        .await
+        .unwrap()
+        .wait()
+        .await
+        .unwrap();
+    assert!(format!("{result:?}").contains("continued work"));
+    assert_eq!(transport.method_count("thread/read"), 1);
+}
+
+#[tokio::test]
+async fn hidden_continuation_stop_targets_the_new_turn_and_retires_it() {
+    let transport = AppServer::new(Script::HiddenHeld);
+    let runtime = retained_runtime(transport.clone(), Duration::from_secs(30));
+    let (_, handle) = retained_handle(runtime).await;
+    let turn = handle
+        .start_turn(TurnInput::new(
+            InvocationId::new("hidden-stop").unwrap(),
+            "work",
+        ))
+        .await
+        .unwrap();
+    transport.wait_for("thread/goal/get").await.unwrap();
+    turn.interrupt().await;
+    let stop = transport.wait_for("turn/interrupt").await.unwrap();
+    assert_eq!(stop["params"]["turnId"], "turn-2");
+    assert!(transport.termination_count() > 0);
+}
+
+#[tokio::test]
+async fn hidden_continuation_blocks_the_next_invocation_until_idle() {
+    let transport = AppServer::new(Script::HiddenHeld);
+    let runtime = retained_runtime(transport.clone(), Duration::from_secs(30));
+    let (_, handle) = retained_handle(runtime).await;
+    let turn = handle
+        .start_turn(TurnInput::new(
+            InvocationId::new("hidden-first").unwrap(),
+            "work",
+        ))
+        .await
+        .unwrap();
+    transport.wait_for("thread/goal/get").await.unwrap();
+    let rejected = handle
+        .start_turn(TurnInput::new(
+            InvocationId::new("hidden-queued").unwrap(),
+            "next",
+        ))
+        .await;
+    assert!(
+        rejected.is_err(),
+        "the application must keep its queued message until the running invocation finishes"
+    );
+    assert_eq!(transport.method_count("turn/start"), 1);
+    transport.release_hidden.notify_one();
+    let result = tokio::time::timeout(Duration::from_secs(2), turn.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(result.text.contains("continued work"));
+    let next = handle
+        .start_turn(TurnInput::new(
+            InvocationId::new("hidden-after").unwrap(),
+            "next",
+        ))
+        .await
+        .unwrap();
+    transport.release_hidden.notify_one();
+    tokio::time::timeout(Duration::from_secs(2), next.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(transport.method_count("turn/start"), 2);
+}
+
+#[tokio::test]
+async fn hidden_goal_that_never_continues_is_bounded_and_retired() {
+    let transport = AppServer::new(Script::HiddenNeverSettles);
+    let runtime = retained_runtime(transport.clone(), Duration::from_secs(30));
+    let client = InProcessRuntimeClient::new(runtime);
+    let mut spec = RuntimeSpec::new(
+        RuntimeId::new("never-settles").unwrap(),
+        Provider::Codex,
+        ".",
+    );
+    spec.turn_timeout = Duration::from_millis(50);
+    let handle = client.acquire(spec).await.unwrap();
+    let turn = handle
+        .start_turn(TurnInput::new(
+            InvocationId::new("hidden-never").unwrap(),
+            "work",
+        ))
+        .await
+        .unwrap();
+    let failure = tokio::time::timeout(Duration::from_secs(2), turn.wait())
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(failure.kind, RuntimeFailureKind::Timeout);
+    assert!(transport.termination_count() > 0);
+}
+
+#[tokio::test]
+async fn hidden_continuation_defers_process_replacing_configuration() {
+    let transport = AppServer::new(Script::HiddenHeld);
+    let runtime = retained_runtime(transport.clone(), Duration::from_secs(30));
+    let (_, handle) = retained_handle(runtime).await;
+    let turn = handle
+        .start_turn(TurnInput::new(
+            InvocationId::new("config-held").unwrap(),
+            "work",
+        ))
+        .await
+        .unwrap();
+    transport.wait_for("thread/goal/get").await.unwrap();
+    assert_eq!(
+        handle.health().await.status,
+        temps_agent_runtime::lifecycle::RuntimeStatus::Busy
+    );
+    let mut changed = TurnInput::new(InvocationId::new("config-busy").unwrap(), "next");
+    changed.permission_mode = Some(PermissionMode::FullAccess);
+    assert!(handle.start_turn(changed).await.is_err());
+    assert_eq!(transport.spawn_count(), 1);
+    assert_eq!(transport.termination_count(), 0);
+    transport.release_hidden.notify_one();
+    turn.wait().await.unwrap();
+    let mut changed = TurnInput::new(InvocationId::new("config-after").unwrap(), "next");
+    changed.permission_mode = Some(PermissionMode::FullAccess);
+    let next = handle.start_turn(changed).await.unwrap();
+    transport.release_hidden.notify_one();
+    tokio::time::timeout(Duration::from_secs(2), next.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(transport.spawn_count(), 2);
+    assert!(transport.termination_count() > 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn hidden_settlement_has_a_thirty_second_bound_even_with_a_long_turn_limit() {
+    let transport = AppServer::new(Script::HiddenNeverSettles);
+    let runtime = retained_runtime(transport.clone(), Duration::from_secs(300));
+    let client = InProcessRuntimeClient::new(runtime);
+    let mut spec = RuntimeSpec::new(
+        RuntimeId::new("settlement-bound").unwrap(),
+        Provider::Codex,
+        ".",
+    );
+    spec.turn_timeout = Duration::from_secs(86400);
+    let handle = client.acquire(spec).await.unwrap();
+    let turn = handle
+        .start_turn(TurnInput::new(
+            InvocationId::new("hidden-bound").unwrap(),
+            "work",
+        ))
+        .await
+        .unwrap();
+    transport.wait_for("thread/goal/get").await.unwrap();
+    let start = tokio::time::Instant::now();
+    let failure = turn.wait().await.unwrap_err();
+    assert_eq!(failure.kind, RuntimeFailureKind::Timeout);
+    assert!(start.elapsed() <= Duration::from_secs(31));
+    assert!(transport.termination_count() > 0);
 }
