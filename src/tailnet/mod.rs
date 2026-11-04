@@ -362,6 +362,7 @@ impl std::fmt::Debug for TailnetStatus {
 /// Callers must enforce their own authentication, destination policy and revocation.
 /// No control socket or credentials are included. Reading it never runs a CLI.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct TailnetRoutingSnapshot {
     /// Opaque daemon incarnation. Changes on explicit and supervised restart,
     /// including when a new daemon object replaces a previous one.

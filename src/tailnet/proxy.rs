@@ -38,6 +38,7 @@ const MAX_HEAD_BYTES: usize = 16 * 1024;
 /// Which destinations count as "inside the tailnet". Rebuilt from
 /// `tailscale status --json` whenever the runtime refreshes.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct RouteTable {
     /// MagicDNS suffix of the tailnet, e.g. `jerboa-altered.ts.net`.
     pub magic_dns_suffix: Option<String>,
