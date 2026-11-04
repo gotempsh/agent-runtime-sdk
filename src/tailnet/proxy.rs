@@ -255,31 +255,51 @@ async fn serve_connection(
             let input = std::io::Cursor::new(leftover).chain(client_read);
             if upgrade {
                 let mut input = BufReader::new(input);
-                forward_body(&mut input, &mut origin_write, body).await?;
-                loop {
-                    let (head, extra) = read_head(&mut origin_read).await?;
-                    let status = std::str::from_utf8(&head)
-                        .ok()
-                        .and_then(|text| text.lines().next())
-                        .and_then(|line| line.split_whitespace().nth(1))
-                        .and_then(|code| code.parse::<u16>().ok());
-                    client_write.write_all(&head).await?;
-                    client_write.write_all(&extra).await?;
-                    if status == Some(101) {
-                        tokio::select! {
-                            result = tokio::io::copy(&mut input, &mut origin_write) => { result?; }
-                            result = tokio::io::copy(&mut origin_read, &mut client_write) => { result?; }
+                let accepted = {
+                    let send = forward_body(&mut input, &mut origin_write, body);
+                    let reply = async {
+                        loop {
+                            // Do not over-read an interim response into the
+                            // following head or upgraded protocol payload.
+                            let mut head = Vec::new();
+                            while !head.ends_with(b"\r\n\r\n") {
+                                if head.len() == MAX_HEAD_BYTES {
+                                    return Err(std::io::Error::new(
+                                        std::io::ErrorKind::InvalidData,
+                                        "response head exceeds limit",
+                                    ));
+                                }
+                                head.push(origin_read.read_u8().await?);
+                            }
+                            let status = std::str::from_utf8(&head)
+                                .ok()
+                                .and_then(|text| text.lines().next())
+                                .and_then(|line| line.split_whitespace().nth(1))
+                                .and_then(|code| code.parse::<u16>().ok());
+                            client_write.write_all(&head).await?;
+                            if status == Some(101) {
+                                return Ok::<bool, std::io::Error>(true);
+                            }
+                            if status.is_some_and(|code| (100..200).contains(&code)) {
+                                continue;
+                            }
+                            tokio::io::copy(&mut origin_read, &mut client_write).await?;
+                            return Ok(false);
                         }
-                        return Ok(());
+                    };
+                    tokio::pin!(send, reply);
+                    tokio::select! {
+                        result = &mut reply => result?,
+                        result = &mut send => { result?; reply.await? }
                     }
-                    if status.is_some_and(|code| (100..200).contains(&code)) && extra.is_empty() {
-                        continue;
+                };
+                if accepted {
+                    tokio::select! {
+                        result = tokio::io::copy(&mut input, &mut origin_write) => { result?; }
+                        result = tokio::io::copy(&mut origin_read, &mut client_write) => { result?; }
                     }
-                    // A rejected upgrade remains ordinary HTTP; never send
-                    // buffered protocol bytes or a second request to the origin.
-                    tokio::io::copy(&mut origin_read, &mut client_write).await?;
-                    return Ok(());
                 }
+                return Ok(());
             }
             // Keep the write half open: EOF can cancel an origin handler
             // before it finishes its response. Connection: close ends it.
@@ -945,6 +965,33 @@ mod tests {
             let proxy = SplitProxy::start(SocksUpstream { addr }, RouteTable::default()).await.unwrap();
             let mut client = TcpStream::connect(proxy.local_addr()).await.unwrap();
             client.write_all(format!("POST http://{addr}/ HTTP/1.1\r\nContent-Length: 3\r\nExpect: 100-continue\r\n\r\n").as_bytes()).await.unwrap();
+            assert_eq!(read_head(&mut client).await.unwrap().0, b"HTTP/1.1 100 Continue\r\n\r\n");
+            client.write_all(b"abc").await.unwrap();
+            let mut reply = String::new();
+            client.read_to_string(&mut reply).await.unwrap();
+            assert!(reply.ends_with("\r\n\r\nok"));
+            server.await.unwrap();
+        }).await.expect("100 Continue must not deadlock upload");
+    }
+
+    #[tokio::test]
+    async fn upgrade_passes_continue_before_reading_the_body() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let (_, leftover) = read_head(&mut stream).await.unwrap();
+                assert_eq!(leftover, [] as [u8; 0]);
+                stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await.unwrap();
+                let mut body = [0; 3];
+                stream.read_exact(&mut body).await.unwrap();
+                assert_eq!(&body, b"abc");
+                stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok").await.unwrap();
+            });
+            let proxy = SplitProxy::start(SocksUpstream { addr }, RouteTable::default()).await.unwrap();
+            let mut client = TcpStream::connect(proxy.local_addr()).await.unwrap();
+            client.write_all(format!("POST http://{addr}/ HTTP/1.1\r\nContent-Length: 3\r\nExpect: 100-continue\r\nConnection: Upgrade\r\nUpgrade: fixture\r\n\r\n").as_bytes()).await.unwrap();
             assert_eq!(read_head(&mut client).await.unwrap().0, b"HTTP/1.1 100 Continue\r\n\r\n");
             client.write_all(b"abc").await.unwrap();
             let mut reply = String::new();
