@@ -2062,15 +2062,25 @@ async fn finish_retained_turn(
     request: &TurnRequest,
     events: &dyn EventSink,
     state: &mut AdapterState,
+    launch_secrets: &[crate::SecretString],
 ) -> Result<TurnResult> {
     let provider = request.provider;
     if let Some(failure) = state.terminal_failure.take() {
+        let scrub = |value: &str| {
+            crate::diagnostic_scrub::scrub(
+                value,
+                launch_secrets
+                    .iter()
+                    .chain(diagnostic_environment_values(&request.environment))
+                    .map(crate::SecretString::expose),
+            )
+        };
         return Err(RuntimeError::ProcessFailed {
             provider,
             kind: failure.kind,
             exit_code: None,
-            stderr: redact_secrets(&failure.diagnostic, &request.environment),
-            provider_code: failure.provider_code,
+            stderr: scrub(&failure.diagnostic),
+            provider_code: failure.provider_code.as_deref().map(scrub),
             delivery: failure.delivery,
         });
     }
@@ -2115,8 +2125,9 @@ async fn complete_retained_turn(
     request: &TurnRequest,
     events: &dyn EventSink,
     mut state: AdapterState,
+    launch_secrets: &[crate::SecretString],
 ) -> Result<RetainedTurnEnd> {
-    let result = finish_retained_turn(adapter, request, events, &mut state).await?;
+    let result = finish_retained_turn(adapter, request, events, &mut state, launch_secrets).await?;
     let keep_state = adapter.retained_background_work(&state) || request.provider == Provider::Acp;
     if request.provider == Provider::Acp {
         state.result = TurnResult::default();
@@ -5829,7 +5840,8 @@ impl AgentRuntime {
             && parked_output.interactions.is_empty()
             && !adapter.retained_follow_up_pending(&state)
         {
-            complete_retained_turn(adapter.as_ref(), request, events, state).await
+            complete_retained_turn(adapter.as_ref(), request, events, state, &io.launch_secrets)
+                .await
         } else {
             self.drive_retained_codex_turn(
                 adapter.as_ref(),
@@ -6219,7 +6231,7 @@ impl AgentRuntime {
                                 })
                                 .await?;
                         }
-                        return complete_retained_turn(adapter, request, events, state).await;
+                        return complete_retained_turn(adapter, request, events, state, &io.launch_secrets).await;
                     }
                 }
                 // Finish a frame that has begun even if the turn is cancelled
@@ -6302,7 +6314,14 @@ impl AgentRuntime {
                         .terminate()
                         .await
                         .map_err(|source| RuntimeError::Transport { provider, source })?;
-                    let result = finish_retained_turn(adapter, request, events, &mut state).await?;
+                    let result = finish_retained_turn(
+                        adapter,
+                        request,
+                        events,
+                        &mut state,
+                        &io.launch_secrets,
+                    )
+                    .await?;
                     return Ok(RetainedTurnEnd::Retired(result));
                 }
                 return Err(RuntimeError::ProcessFailed {
@@ -6393,7 +6412,9 @@ impl AgentRuntime {
                     .terminate()
                     .await
                     .map_err(|source| RuntimeError::Transport { provider, source })?;
-                let result = finish_retained_turn(adapter, request, events, &mut state).await?;
+                let result =
+                    finish_retained_turn(adapter, request, events, &mut state, &io.launch_secrets)
+                        .await?;
                 return Ok(RetainedTurnEnd::Retired(result));
             }
             write_optional_frames(Some(&mut io.stdin), &output.optional_writes).await;
@@ -6424,10 +6445,18 @@ impl AgentRuntime {
                         .terminate()
                         .await
                         .map_err(|source| RuntimeError::Transport { provider, source })?;
-                    let result = finish_retained_turn(adapter, request, events, &mut state).await?;
+                    let result = finish_retained_turn(
+                        adapter,
+                        request,
+                        events,
+                        &mut state,
+                        &io.launch_secrets,
+                    )
+                    .await?;
                     return Ok(RetainedTurnEnd::Retired(result));
                 }
-                return complete_retained_turn(adapter, request, events, state).await;
+                return complete_retained_turn(adapter, request, events, state, &io.launch_secrets)
+                    .await;
             }
             if request.cancellation.is_cancelled() {
                 return self
@@ -8900,6 +8929,61 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[cfg(feature = "claude")]
+    #[tokio::test]
+    async fn retained_terminal_failure_scrubs_launch_and_current_secrets_in_both_fields() {
+        let adapter = crate::providers::Claude::default();
+        let mut request = TurnRequest::new(Provider::Claude, ".", "test");
+        request
+            .environment
+            .insert("CURRENT_SECRET".into(), crate::SecretString::new("xy"));
+        request
+            .environment
+            .insert("GIT_CONFIG_COUNT".into(), crate::SecretString::new("1"));
+        let launch = vec![crate::SecretString::credential("launch-opaque")];
+        for complete in [false, true] {
+            let mut state = AdapterState {
+                terminal_failure: Some(
+                    crate::ProviderTerminalFailure::new(
+                        ProviderProcessErrorKind::Unknown,
+                        "401 launch-opaque xy",
+                        crate::lifecycle::DeliveryState::Accepted,
+                    )
+                    .with_provider_code("401 launch-opaque xy"),
+                ),
+                ..AdapterState::default()
+            };
+            let error = if complete {
+                match complete_retained_turn(
+                    &adapter,
+                    &request,
+                    &crate::NoopEventSink,
+                    state,
+                    &launch,
+                )
+                .await
+                {
+                    Err(error) => error,
+                    Ok(_) => panic!("expected terminal failure"),
+                }
+            } else {
+                finish_retained_turn(
+                    &adapter,
+                    &request,
+                    &crate::NoopEventSink,
+                    &mut state,
+                    &launch,
+                )
+                .await
+                .unwrap_err()
+            };
+            assert!(
+                matches!(error, RuntimeError::ProcessFailed { stderr, provider_code, .. }
+                if stderr == "401 [REDACTED] [REDACTED]" && provider_code.as_deref() == Some("401 [REDACTED] [REDACTED]"))
+            );
+        }
     }
 
     #[test]
