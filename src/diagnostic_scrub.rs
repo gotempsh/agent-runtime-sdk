@@ -35,10 +35,7 @@ pub(crate) fn scrub<'a>(text: &str, secrets: impl IntoIterator<Item = &'a str>) 
     values.sort_unstable_by_key(|s| std::cmp::Reverse(s.len()));
     values.dedup();
     // Exact values must be removed before normalization changes their bytes.
-    let mut raw = text.to_owned();
-    for value in &values {
-        raw = raw.replace(value, "[REDACTED]");
-    }
+    let raw = scrub_known(text, &values);
     // Decode percent escapes before matching, including encoded header delimiters.
     let mut bytes = Vec::with_capacity(text.len());
     let input = raw.as_bytes();
@@ -56,11 +53,18 @@ pub(crate) fn scrub<'a>(text: &str, secrets: impl IntoIterator<Item = &'a str>) 
         bytes.push(input[i]);
         i += 1;
     }
-    let mut text = String::from_utf8_lossy(&bytes).into_owned();
+    let mut text = scrub_known(&String::from_utf8_lossy(&bytes), &values);
+    for pattern in PATTERNS.iter() {
+        text = pattern.replace_all(&text, "[REDACTED]").into_owned();
+    }
+    text
+}
+
+fn scrub_known(text: &str, values: &[String]) -> String {
+    let mut text = text.to_owned();
     for value in values {
-        text = text.replace(&value, "[REDACTED]");
-        // Producers may have cut a known value before we see the diagnostic.
-        // Also match bounded token fragments after a runtime-added error prefix.
+        // Long-value fragments must be removed before a shorter overlapping
+        // exact value can destroy the evidence needed to recognize them.
         let fragments: Vec<String> = text
             .split_whitespace()
             .map(|token| token.trim_matches(|c: char| "\"'(),;[]".contains(c)))
@@ -70,9 +74,7 @@ pub(crate) fn scrub<'a>(text: &str, secrets: impl IntoIterator<Item = &'a str>) 
         for fragment in fragments {
             text = text.replace(&fragment, "[REDACTED]");
         }
-    }
-    for pattern in PATTERNS.iter() {
-        text = pattern.replace_all(&text, "[REDACTED]").into_owned();
+        text = text.replace(value, "[REDACTED]");
     }
     text
 }
@@ -102,6 +104,13 @@ mod tests {
     fn diagnostic_scrub_encoded_known_and_prefixed_fragment() {
         assert_eq!(
             scrub("opaque%41private", ["opaque%41private"]),
+            "[REDACTED]"
+        );
+        assert_eq!(
+            scrub(
+                "token-sensitive-private",
+                ["token", "token-sensitive-private-value"]
+            ),
             "[REDACTED]"
         );
         let value = "synthetic-opaque-private";
