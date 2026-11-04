@@ -739,6 +739,7 @@ struct DaemonState {
 }
 
 struct Inner {
+    lifecycle: Mutex<()>,
     incarnation: String,
     spec: TailnetSpec,
     socket_path: PathBuf,
@@ -842,6 +843,7 @@ impl TailnetDaemon {
         drop(handle);
 
         let inner = Arc::new(Inner {
+            lifecycle: Mutex::new(()),
             incarnation,
             ssh_config_path: spec.state_dir.join("ssh_config"),
             spec,
@@ -994,8 +996,16 @@ impl TailnetDaemon {
                 return Err(error);
             }
         };
+        let _commit = self.inner.lifecycle.lock().await;
         let after = self.routing_generation().await;
-        let observed_generation = if before == after { after } else { None };
+        if before.is_none() || before != after {
+            return Err(TailnetError::NotConnected {
+                name: self.inner.spec.name.clone(),
+                state: TailnetState::Starting,
+                detail: "Daemon changed during status refresh; retry the refresh".into(),
+            });
+        }
+        let observed_generation = after;
         let routes = status.route_table();
         if let Some(proxy) = self.inner.proxy.lock().await.as_ref() {
             proxy.set_routes(routes.clone()).await;
@@ -1013,6 +1023,22 @@ impl TailnetDaemon {
             state.routing_generation = observed_generation;
             state.tailscale = Some(status);
             state.updated_at_ms = now_ms();
+        }
+        // The supervisor may restart independently of the explicit lifecycle
+        // lock. Do not retain a commit if that happened during its async writes.
+        if self.routing_generation().await != before {
+            if let Some(proxy) = self.inner.proxy.lock().await.as_ref() {
+                proxy.set_routes(RouteTable::default()).await;
+            }
+            self.write_ssh_config(&RouteTable::default()).await;
+            let mut state = self.inner.state.write().await;
+            state.routing_generation = None;
+            state.tailscale = None;
+            return Err(TailnetError::NotConnected {
+                name: self.inner.spec.name.clone(),
+                state: TailnetState::Starting,
+                detail: "Daemon changed while committing status; retry the refresh".into(),
+            });
         }
         Ok(self.status().await)
     }
@@ -1034,6 +1060,7 @@ impl TailnetDaemon {
 
     /// Current status without querying the daemon.
     pub async fn status(&self) -> TailnetStatus {
+        let current_generation = self.routing_generation().await;
         let snapshot = self
             .inner
             .supervisor
@@ -1048,7 +1075,9 @@ impl TailnetDaemon {
             .as_ref()
             .map(|proxy| proxy.local_addr().port());
         let state = self.inner.state.read().await;
-        let tailscale = state.tailscale.as_ref();
+        let tailscale = state.tailscale.as_ref().filter(|_| {
+            current_generation.is_some() && current_generation == state.routing_generation
+        });
         let (lifecycle, mut detail) = match snapshot.as_ref().map(|snapshot| snapshot.status) {
             Some(ManagedProcessStatus::Running) if state.unreachable.is_some() => (
                 TailnetState::Starting,
@@ -1289,6 +1318,11 @@ impl TailnetDaemon {
 
     /// Stop `tailscaled` and the split proxy. State on disk is kept.
     pub async fn stop(&self) -> Result<TailnetStatus, TailnetError> {
+        let _lifecycle = self.inner.lifecycle.lock().await;
+        self.stop_locked().await
+    }
+
+    async fn stop_locked(&self) -> Result<TailnetStatus, TailnetError> {
         if let Some(task) = self.inner.login.lock().await.take() {
             task.abort();
         }
@@ -1307,11 +1341,13 @@ impl TailnetDaemon {
 
     /// Stop and relaunch `tailscaled` with the same specification.
     pub async fn restart(&self) -> Result<TailnetStatus, TailnetError> {
-        let _ = self.stop().await;
+        let lifecycle = self.inner.lifecycle.lock().await;
+        self.stop_locked().await?;
         let _ = tokio::fs::remove_file(&self.inner.socket_path).await;
         self.inner.supervisor.restart(&self.inner.process).await?;
         self.await_socket().await?;
         self.ensure_proxy().await?;
+        drop(lifecycle);
         let _ = self.refresh().await;
         Ok(self.status().await)
     }
@@ -1323,7 +1359,7 @@ impl TailnetDaemon {
             .snapshot(&self.inner.process)
             .await
             .ok()?;
-        if process.status != ManagedProcessStatus::Running {
+        if process.status != ManagedProcessStatus::Running || !self.inner.socket_path.exists() {
             return None;
         }
         Some(format!(
@@ -1351,7 +1387,7 @@ impl TailnetDaemon {
         } else {
             RouteTable::default()
         };
-        let detail = state.unreachable.clone();
+        let unreachable = state.unreachable.is_some();
         drop(state);
         let after = self.routing_generation().await;
         let available = available && before == after;
@@ -1361,10 +1397,12 @@ impl TailnetDaemon {
             detail: if available {
                 "Connected".into()
             } else {
-                detail.unwrap_or_else(|| {
+                if unreachable {
+                    "Tailnet is not answering; reconnect it and retry the status refresh".into()
+                } else {
                     "Tailnet unavailable; connect it and wait for a successful status refresh"
                         .into()
-                })
+                }
             },
             routes: if available {
                 routes
@@ -1820,6 +1858,9 @@ mod tests {
 
         let unavailable = daemon.routing_snapshot().await;
         assert!(!unavailable.available);
+        assert!(!unavailable
+            .detail
+            .contains(daemon.socket_path().to_str().unwrap()));
         assert_eq!(unavailable.routes, RouteTable::default());
         assert!(unavailable.socks_addr.is_none());
 
@@ -1860,6 +1901,8 @@ echo '{"BackendState":"Running","CurrentTailnet":{"MagicDNSSuffix":"example.ts.n
 
         // A vanished control socket is healed by relaunching the daemon.
         std::fs::remove_file(daemon.socket_path()).unwrap();
+        assert!(!daemon.routing_snapshot().await.available);
+        assert!(daemon.routing_snapshot().await.socks_addr.is_none());
         assert!(daemon.heal_missing_socket().await);
         assert!(daemon.socket_path().exists());
         assert!(daemon.status().await.restart_count >= 1);
@@ -1899,7 +1942,12 @@ echo '{"BackendState":"Running","Peer":{"old":{"HostName":"old-peer"}}}'
             .await
             .unwrap();
         std::fs::write(temp.path().join("release-query"), "").unwrap();
-        query.await.unwrap().unwrap();
+        assert!(query.await.unwrap().is_err());
+        assert_ne!(daemon.status().await.state, TailnetState::Running);
+        assert!(daemon.access().await.is_err());
+        assert!(!std::fs::read_to_string(&daemon.inner.ssh_config_path)
+            .unwrap()
+            .contains("old-peer"));
         let stale = daemon.routing_snapshot().await;
         assert!(!stale.available);
         assert_eq!(stale.routes, RouteTable::default());
@@ -1908,7 +1956,7 @@ echo '{"BackendState":"Running","Peer":{"old":{"HostName":"old-peer"}}}'
         assert!(daemon.routing_snapshot().await.available);
 
         // A daemon that stops answering is no longer reported as connected.
-        std::fs::write(&tailscale, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::write(&tailscale, "#!/bin/sh\necho \"$1\" >&2\nexit 1\n").unwrap();
         assert!(
             daemon.routing_snapshot().await.available,
             "reading must not query the CLI"
@@ -1921,6 +1969,9 @@ echo '{"BackendState":"Running","Peer":{"old":{"HostName":"old-peer"}}}'
 
         let unavailable = daemon.routing_snapshot().await;
         assert!(!unavailable.available);
+        assert!(!unavailable
+            .detail
+            .contains(daemon.socket_path().to_str().unwrap()));
         assert_eq!(unavailable.routes, RouteTable::default());
         assert!(unavailable.socks_addr.is_none());
 
