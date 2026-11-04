@@ -41,6 +41,7 @@ enum Script {
     HiddenContinuation,
     HiddenHeld,
     HiddenNeverSettles,
+    HiddenGoalThenClose,
     /// Ask for command approval and finish once the decision arrives.
     Approval,
     /// Ask a blocking question and finish once the answer arrives.
@@ -351,12 +352,19 @@ async fn serve(
         match message.get("method").and_then(Value::as_str) {
             Some("initialized") => {}
             Some("thread/goal/get") => {
-                let goal = if hidden_running || script == Script::HiddenNeverSettles {
+                let goal = if hidden_running
+                    || matches!(
+                        script,
+                        Script::HiddenNeverSettles | Script::HiddenGoalThenClose
+                    ) {
                     json!({"status":"active"})
                 } else {
                     Value::Null
                 };
                 send(&mut output, json!({"id":id,"result":{"goal":goal}})).await;
+                if script == Script::HiddenGoalThenClose {
+                    break;
+                }
             }
             Some("thread/read") => {
                 send(&mut output, json!({"id":id,"result":{"thread":{"id":"thread-fixture","status":{"type":"idle"}}}})).await;
@@ -504,7 +512,10 @@ async fn serve(
                     json!({"jsonrpc":"2.0","id":id,"result":{"turn":{"id":"turn-1"}}}),
                 )
                 .await;
-                if script == Script::HiddenNeverSettles {
+                if matches!(
+                    script,
+                    Script::HiddenNeverSettles | Script::HiddenGoalThenClose
+                ) {
                     send(&mut output, json!({"method":"turn/completed","params":{"threadId":"thread-fixture","turn":{"id":"turn-1","status":"completed"}}})).await;
                     continue;
                 }
@@ -668,6 +679,7 @@ fn opening_frames(script: Script) -> Vec<Value> {
         Script::HiddenContinuation
         | Script::HiddenHeld
         | Script::HiddenNeverSettles
+        | Script::HiddenGoalThenClose
         | Script::Interrupt
         | Script::StalledInterrupt
         | Script::Crash
@@ -2165,5 +2177,19 @@ async fn hidden_settlement_has_a_thirty_second_bound_even_with_a_long_turn_limit
     let failure = turn.wait().await.unwrap_err();
     assert_eq!(failure.kind, RuntimeFailureKind::Timeout);
     assert!(start.elapsed() <= Duration::from_secs(31));
+    assert!(transport.termination_count() > 0);
+}
+
+#[tokio::test]
+async fn one_shot_eof_cannot_succeed_with_an_unfinished_goal() {
+    let transport = AppServer::new(Script::HiddenGoalThenClose);
+    let events = Collector::default();
+    let result = runtime(transport.clone())
+        .run(request(), &events, None)
+        .await;
+    assert!(matches!(
+        result,
+        Err(temps_agent_runtime::RuntimeError::Protocol { .. })
+    ));
     assert!(transport.termination_count() > 0);
 }

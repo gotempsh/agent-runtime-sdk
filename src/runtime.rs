@@ -1978,6 +1978,28 @@ async fn write_provider_frames(
         })
 }
 
+/// Required completion writes share the read-side deadline and cancellation.
+async fn write_completion_frames(
+    provider: Provider,
+    stdin: Option<&mut FrameWriter>,
+    frames: &[Vec<u8>],
+    deadline: Option<tokio::time::Instant>,
+    cancellation: &tokio_util::sync::CancellationToken,
+) -> Result<()> {
+    let write = write_provider_frames(provider, stdin, frames, "provider write");
+    let Some(deadline) = deadline else {
+        return write.await;
+    };
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => Err(RuntimeError::Cancelled { provider }),
+        _ = tokio::time::sleep_until(deadline) => Err(RuntimeError::Timeout {
+            provider, seconds: COMPLETION_SETTLEMENT_TIMEOUT.as_secs(),
+        }),
+        result = write => result,
+    }
+}
+
 /// Deliver an adapter-encoded interrupt, giving up after
 /// [`INTERRUPT_WRITE_TIMEOUT`].
 ///
@@ -6336,6 +6358,13 @@ impl AgentRuntime {
                 process_ready = true;
                 handoff.initialized.store(true, Ordering::Release);
             }
+            if adapter.completion_pending(&state) {
+                settlement_deadline.get_or_insert_with(|| {
+                    tokio::time::Instant::now() + COMPLETION_SETTLEMENT_TIMEOUT
+                });
+            } else {
+                settlement_deadline = None;
+            }
             for event in output.events {
                 if first_text && matches!(&event, TurnEvent::TextDelta { text } if !text.is_empty())
                 {
@@ -6345,15 +6374,20 @@ impl AgentRuntime {
                 let _delivery = trace.event_delivery();
                 events.emit(event).await?;
             }
-            if let Err(error) = write_provider_frames(
+            if let Err(error) = write_completion_frames(
                 provider,
                 Some(&mut io.stdin),
                 &output.writes,
-                "provider write",
+                settlement_deadline,
+                &request.cancellation,
             )
             .await
             {
-                if !adapter.can_finish_after_retirement(&state) {
+                if matches!(
+                    error,
+                    RuntimeError::Timeout { .. } | RuntimeError::Cancelled { .. }
+                ) || !adapter.can_finish_after_retirement(&state)
+                {
                     return Err(error);
                 }
                 io.process
@@ -6767,6 +6801,17 @@ impl AgentRuntime {
                         .await
                         .map_err(|source| RuntimeError::Transport { provider, source })?;
                     protocol_completed = true;
+                } else if adapter.completion_pending(&state) {
+                    process
+                        .terminate()
+                        .await
+                        .map_err(|source| RuntimeError::Transport { provider, source })?;
+                    stderr_task.abort();
+                    return Err(RuntimeError::Protocol {
+                        provider,
+                        message: "Codex exited with an unfinished goal; resume the goal explicitly"
+                            .into(),
+                    });
                 }
                 break;
             };
@@ -6787,6 +6832,13 @@ impl AgentRuntime {
                     });
                 }
             };
+            if adapter.completion_pending(&state) {
+                settlement_deadline.get_or_insert_with(|| {
+                    tokio::time::Instant::now() + COMPLETION_SETTLEMENT_TIMEOUT
+                });
+            } else {
+                settlement_deadline = None;
+            }
             for event in output.events {
                 if first_text && matches!(&event, TurnEvent::TextDelta { text } if !text.is_empty())
                 {
@@ -6798,11 +6850,20 @@ impl AgentRuntime {
                     events.emit(event).await?;
                 }
             }
-            if let Err(error) =
-                write_provider_frames(provider, stdin.as_mut(), &output.writes, "provider write")
-                    .await
+            if let Err(error) = write_completion_frames(
+                provider,
+                stdin.as_mut(),
+                &output.writes,
+                settlement_deadline,
+                &request.cancellation,
+            )
+            .await
             {
-                if !adapter.can_finish_after_retirement(&state) {
+                if matches!(
+                    error,
+                    RuntimeError::Timeout { .. } | RuntimeError::Cancelled { .. }
+                ) || !adapter.can_finish_after_retirement(&state)
+                {
                     return Err(error);
                 }
                 process
@@ -7732,6 +7793,37 @@ mod tests {
             written, "1234567\n",
             "the dropped frame left no partial bytes"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn completion_writes_obey_deadline_and_stop_when_stdin_stalls() {
+        for cancel in [false, true] {
+            let (writer, _reader) = tokio::io::duplex(1);
+            let mut writer = FrameWriter::new(Box::new(writer));
+            let cancellation = tokio_util::sync::CancellationToken::new();
+            let start = tokio::time::Instant::now();
+            if cancel {
+                cancellation.cancel();
+            }
+            let result = write_completion_frames(
+                Provider::Codex,
+                Some(&mut writer),
+                &[b"probe".to_vec()],
+                Some(start + COMPLETION_SETTLEMENT_TIMEOUT),
+                &cancellation,
+            )
+            .await;
+            if cancel {
+                assert!(matches!(result, Err(RuntimeError::Cancelled { .. })));
+                assert_eq!(start.elapsed(), Duration::ZERO);
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(RuntimeError::Timeout { seconds: 30, .. })
+                ));
+                assert_eq!(start.elapsed(), COMPLETION_SETTLEMENT_TIMEOUT);
+            }
+        }
     }
 
     #[tokio::test]

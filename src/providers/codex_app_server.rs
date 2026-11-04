@@ -553,6 +553,13 @@ pub(super) fn parse_line(line: &str, state: &mut AdapterState) -> Result<Adapter
         store(state, &turn);
         return Ok(output);
     }
+    // A rename names its thread but no turn, so a retained connection would
+    // otherwise drop it as uncorrelated.
+    if method == "thread/name/updated" && value.get("id").is_none() {
+        notification(&value, &method, &mut turn, state, &mut output);
+        store(state, &turn);
+        return Ok(output);
+    }
     if turn.completion_pending && !method.is_empty() {
         // Once the segment ended, its late output is stale. A request from
         // that segment cannot safely be answered: retire before returning.
@@ -563,13 +570,6 @@ pub(super) fn parse_line(line: &str, state: &mut AdapterState) -> Result<Adapter
             turn.retire = true;
             output.terminal = true;
         }
-        store(state, &turn);
-        return Ok(output);
-    }
-    // A rename names its thread but no turn, so a retained connection would
-    // otherwise drop it as uncorrelated.
-    if method == "thread/name/updated" && value.get("id").is_none() {
-        notification(&value, &method, &mut turn, state, &mut output);
         store(state, &turn);
         return Ok(output);
     }
@@ -2297,6 +2297,26 @@ mod tests {
             load(&current).completion_probe.as_deref(),
             new_goal["id"].as_str()
         );
+    }
+
+    #[test]
+    fn session_rename_is_delivered_while_completion_is_pending() {
+        let mut state = continuation_state();
+        segment_end(&mut state, "turn-1");
+        let foreign = feed(
+            &mut state,
+            json!({"method":"thread/name/updated", "params":{"threadId":"other", "threadName":"wrong"}}),
+        );
+        assert_eq!(foreign.events, [] as [TurnEvent; 0]);
+        let renamed = feed(
+            &mut state,
+            json!({"method":"thread/name/updated", "params":{"threadId":"thread-1", "threadName":"New title"}}),
+        );
+        assert!(renamed.events.iter().any(
+            |event| matches!(event, TurnEvent::SessionTitle { title } if title == "New title")
+        ));
+        assert!(completion_pending(&state));
+        assert!(!renamed.terminal);
     }
 
     #[test]
