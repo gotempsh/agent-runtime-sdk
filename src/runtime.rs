@@ -8958,6 +8958,8 @@ mod tests {
             "https_proxy",
             "ALL_PROXY",
             "GIT_CONFIG_VALUE_0",
+            "git_config_value_0",
+            "Git_Config_Value_0",
         ] {
             assert!(S::non_secret_configuration("xy").diagnostic_secret(name));
         }
