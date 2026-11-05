@@ -286,10 +286,17 @@ async fn serve_connection(
                                 }
                                 head.push(origin_read.read_u8().await?);
                             }
-                            let status = std::str::from_utf8(&head)
-                                .ok()
-                                .and_then(|text| text.lines().next())
-                                .and_then(|line| line.split_whitespace().nth(1))
+                            // Field values and the reason phrase may contain
+                            // opaque non-UTF-8 bytes. Only decode the status code.
+                            let status = head
+                                .split(|byte| *byte == b'\n')
+                                .next()
+                                .and_then(|line| {
+                                    line.split(u8::is_ascii_whitespace)
+                                        .filter(|part| !part.is_empty())
+                                        .nth(1)
+                                })
+                                .and_then(|code| std::str::from_utf8(code).ok())
                                 .and_then(|code| code.parse::<u16>().ok());
                             client_write.write_all(&head).await?;
                             if status == Some(101) {
@@ -319,9 +326,16 @@ async fn serve_connection(
                 }
                 return Ok(());
             }
-            // Keep the write half open: EOF can cancel an origin handler
-            // before it finishes its response. Connection: close ends it.
-            let send = forward_body(BufReader::new(input), &mut origin_write, body);
+            let send = async {
+                let mut input = BufReader::new(input);
+                forward_body(&mut input, &mut origin_write, body).await?;
+                // Finishing the framed body is not a disconnect. Keep watching
+                // the client, discarding any pipelined requests rather than
+                // sending them to this origin. Propagate only an actual EOF;
+                // a half-closed client can still receive the origin's reply.
+                tokio::io::copy(&mut input, &mut tokio::io::sink()).await?;
+                origin_write.shutdown().await
+            };
             // Forward interim responses (e.g. 100 Continue) while uploading,
             // and stop reading a body if the origin rejects it early.
             let reply = tokio::io::copy(&mut origin_read, &mut client_write);
@@ -963,6 +977,87 @@ mod tests {
                 assert!(tokio::time::timeout(std::time::Duration::from_millis(30), client.read(&mut extra)).await.is_err(), "pipelined request or premature EOF reached origin");
             }
         }).await.expect("one-request HTTP connections must close");
+    }
+
+    #[tokio::test]
+    async fn cancelled_http_requests_release_connections_and_preserve_half_close() {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let proxy = SplitProxy::start(SocksUpstream { addr }, RouteTable::default())
+                .await
+                .unwrap();
+            // More than the entire permit budget: cancelled idle requests must
+            // reach origin EOF and release their permits without a response.
+            for _ in 0..257 {
+                let mut client = TcpStream::connect(proxy.local_addr()).await.unwrap();
+                client
+                    .write_all(format!("GET http://{addr}/poll HTTP/1.1\r\n\r\n").as_bytes())
+                    .await
+                    .unwrap();
+                let (mut origin, _) = listener.accept().await.unwrap();
+                assert_eq!(read_head(&mut origin).await.unwrap().1, [] as [u8; 0]);
+                drop(client);
+                let mut byte = [0];
+                assert_eq!(
+                    tokio::time::timeout(std::time::Duration::from_secs(2), origin.read(&mut byte))
+                        .await
+                        .expect("cancelled GET must reach origin EOF")
+                        .unwrap(),
+                    0
+                );
+                drop(origin);
+            }
+            let mut client = TcpStream::connect(proxy.local_addr()).await.unwrap();
+            client
+                .write_all(format!("GET http://{addr}/reply-after-eof HTTP/1.1\r\n\r\n").as_bytes())
+                .await
+                .unwrap();
+            let (mut origin, _) = listener.accept().await.unwrap();
+            read_head(&mut origin).await.unwrap();
+            client.shutdown().await.unwrap();
+            let mut byte = [0];
+            assert_eq!(origin.read(&mut byte).await.unwrap(), 0);
+            origin
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await
+                .unwrap();
+            drop(origin);
+            let mut reply = String::new();
+            client.read_to_string(&mut reply).await.unwrap();
+            assert!(reply.ends_with("\r\n\r\nok"));
+        })
+        .await
+        .expect("cancelled requests must not exhaust permits");
+    }
+
+    #[tokio::test]
+    async fn upgrade_accepts_opaque_response_headers() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut origin, _) = listener.accept().await.unwrap();
+                read_head(&mut origin).await.unwrap();
+                origin.write_all(b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: fixture\r\nX-Label: caf\xe9\r\n\r\n").await.unwrap();
+                let mut payload = [0; 4];
+                origin.read_exact(&mut payload).await.unwrap();
+                assert_eq!(&payload, b"ping");
+                origin.write_all(b"pong").await.unwrap();
+            });
+            let proxy = SplitProxy::start(SocksUpstream { addr }, RouteTable::default()).await.unwrap();
+            let mut client = TcpStream::connect(proxy.local_addr()).await.unwrap();
+            client.write_all(format!("GET http://{addr}/ HTTP/1.1\r\nConnection: Upgrade\r\nUpgrade: fixture\r\n\r\n").as_bytes()).await.unwrap();
+            let (head, extra) = read_head(&mut client).await.unwrap();
+            assert!(head.windows(11).any(|bytes| bytes == b"Label: caf\xe9"));
+            assert_eq!(extra, [] as [u8; 0]);
+            client.write_all(b"ping").await.unwrap();
+            client.shutdown().await.unwrap();
+            let mut reply = String::new();
+            client.read_to_string(&mut reply).await.unwrap();
+            assert_eq!(reply, "pong");
+            server.await.unwrap();
+        }).await.expect("opaque headers must not block upgraded traffic");
     }
 
     #[tokio::test]
