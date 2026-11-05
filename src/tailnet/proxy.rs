@@ -542,6 +542,16 @@ fn parse_request(head: &[u8]) -> Result<ProxyRequest, &'static str> {
     let mut nominated = Vec::new();
     for line in &headers {
         let (name, value) = line.split_once(':').ok_or("invalid HTTP header")?;
+        // Field names are HTTP tokens; values cannot hide another field behind
+        // a bare line ending or NUL interpreted differently by the origin.
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte))
+            || value.bytes().any(|byte| matches!(byte, b'\r' | b'\n' | 0))
+        {
+            return Err("invalid HTTP header");
+        }
         if name.eq_ignore_ascii_case("connection") {
             for token in value.split(',').map(str::trim) {
                 if token.eq_ignore_ascii_case("content-length")
@@ -565,9 +575,12 @@ fn parse_request(head: &[u8]) -> Result<ProxyRequest, &'static str> {
             if length.is_some() {
                 return Err("duplicate content length");
             }
+            let digits = value.trim_matches([' ', '\t']);
+            if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err("invalid content length");
+            }
             length = Some(
-                value
-                    .trim()
+                digits
                     .parse::<u64>()
                     .map_err(|_| "invalid content length")?,
             );
@@ -1460,6 +1473,23 @@ mod tests {
             "{response}"
         );
         assert!(response.contains("tailnet connect to box.jerboa-altered.ts.net:22 failed"));
+    }
+
+    #[tokio::test]
+    async fn malformed_headers_are_rejected_before_connecting() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let proxy = SplitProxy::start(SocksUpstream { addr: "127.0.0.1:1".parse().unwrap() }, RouteTable::default()).await.unwrap();
+            for field in ["X-A: b\nHost: other", "X-A: b\rHost: other", "X-A: b\0c", "Content-Length : 5", ": empty", "X(A): bad", "Content-Length: +5", "Content-Length: "] {
+                let request = format!("GET http://127.0.0.1:1/ HTTP/1.1\r\n{field}\r\n\r\n");
+                assert!(parse_request(request.as_bytes()).is_err(), "accepted {field:?}");
+                let mut client = TcpStream::connect(proxy.local_addr()).await.unwrap();
+                client.write_all(request.as_bytes()).await.unwrap();
+                let mut response = String::new();
+                client.read_to_string(&mut response).await.unwrap();
+                assert!(response.starts_with("HTTP/1.1 400 Bad Request"), "{field:?}: {response}");
+            }
+            assert!(parse_request(b"POST http://127.0.0.1:1/ HTTP/1.1\r\nX-Token_!#$%&'*+-.^`|~: ok\r\nContent-Length:\t005 \t\r\n\r\n").is_ok());
+        }).await.unwrap();
     }
 
     #[tokio::test]

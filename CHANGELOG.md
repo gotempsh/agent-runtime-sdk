@@ -17,7 +17,8 @@ Versioning and Keep a Changelog conventions.
   regenerated `Host` header. Each connection forwards one framed request and
   discards pipelined requests; CONNECT/TLS forwarding is unchanged. Invalid
   targets (userinfo or fragments), conflicting/unsupported body framing and
-  connection-nominated framing headers return 400. Protocol upgrades tunnel
+  connection-nominated framing headers, malformed header names/values, and
+  non-decimal content lengths return 400. Protocol upgrades tunnel
   only after a valid 101; refused upgrades stream the original response.
   Pending upgrade input is limited to 64 KiB and negotiation to 30 seconds;
   invalid, oversized or timed-out upgrade handshakes return 502.
