@@ -1639,3 +1639,104 @@ async fn retained_continuation_scrubs_original_launch_secrets() {
         f.dispose().await;
     }
 }
+
+#[tokio::test]
+async fn retained_reclassification_remains_secret_after_downgrade() {
+    for terminal in [false, true] {
+        for downgrade in [false, true] {
+            let f = Fixture::new(true, Duration::from_secs(30)).await;
+            let path = f.dir.path().join("claude-fixture");
+            let ending = if terminal {
+                "  emit({'type':'result','subtype':'error_during_execution','is_error':True,'result':'permission denied '+os.environ['LAUNCH_ONLY']})"
+            } else {
+                "  sys.stderr.write('nono: permission denied '+os.environ['LAUNCH_ONLY']+'\\n');sys.stderr.flush()\n  os._exit(2)"
+            };
+            let script = fs::read_to_string(&path).unwrap().replace(
+                "  result('SHELL-FOLLOWUP')",
+                &format!("  while not os.path.exists(RELEASE+'-eof'):time.sleep(.01)\n{ending}"),
+            );
+            fs::write(path, script).unwrap();
+            let mut first = Fixture::input("promote", "spawn-shell");
+            let secret = "v7Q2m9R4p6T8n3L5";
+            let mut warm = Fixture::input("warm", "hello");
+            warm.environment.insert(
+                "LAUNCH_ONLY".into(),
+                temps_agent_runtime::SecretString::non_secret_configuration(secret),
+            );
+            f.handle
+                .start_turn(warm)
+                .await
+                .unwrap()
+                .wait()
+                .await
+                .unwrap();
+            if downgrade {
+                let mut promote = Fixture::input("promote-warm", "hello");
+                promote.environment.insert(
+                    "LAUNCH_ONLY".into(),
+                    temps_agent_runtime::SecretString::credential(secret),
+                );
+                f.handle
+                    .start_turn(promote)
+                    .await
+                    .unwrap()
+                    .wait()
+                    .await
+                    .unwrap();
+            }
+            first.environment.insert(
+                "LAUNCH_ONLY".into(),
+                if downgrade {
+                    temps_agent_runtime::SecretString::non_secret_configuration(secret)
+                } else {
+                    temps_agent_runtime::SecretString::credential(secret)
+                },
+            );
+            let mut follow_ups = f.runtime.subscribe_background_follow_ups();
+            assert_eq!(
+                f.handle
+                    .start_turn(first)
+                    .await
+                    .unwrap()
+                    .wait()
+                    .await
+                    .unwrap()
+                    .text,
+                "SERVING"
+            );
+            f.wait_for_log("shell-start").await;
+            f.release_background();
+            tokio::time::timeout(Duration::from_secs(10), follow_ups.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let continuation = Fixture::continuation("continue");
+            let turn = f.handle.start_turn(continuation).await.unwrap();
+            let (mut events, completion) = turn.into_parts();
+            tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(envelope) = events.next().await {
+                if matches!(envelope.event, RuntimeEvent::ProviderEvent { event: TurnEvent::TextDelta { text } } if text.contains("SHELL-FOLLOWUP")) {
+                    return;
+                }
+            }
+            panic!("continuation must claim its pending answer before EOF");
+        }).await.unwrap();
+            fs::write(f.dir.path().join("release-eof"), "go").unwrap();
+            let failure = tokio::time::timeout(Duration::from_secs(10), completion.wait())
+                .await
+                .unwrap()
+                .unwrap_err();
+            assert!(
+                failure.message.contains("permission denied"),
+                "{}",
+                failure.message
+            );
+            assert_eq!(f.spawns().len(), 1);
+            assert!(
+                !failure.message.contains(secret),
+                "credential must remain redacted"
+            );
+            f.dispose().await;
+        }
+    }
+}

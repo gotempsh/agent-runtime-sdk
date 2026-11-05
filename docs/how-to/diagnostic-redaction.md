@@ -35,3 +35,8 @@ it for both runtime acquisition and turn input. Older frames without it keep the
 name-based defaults; older hosts still redact all values, so preserving caller
 configuration remotely requires upgrading both ends. Debug output remains
 redacted throughout transport.
+
+A retained process accumulates known secret values on every accepted turn,
+including continuations and classification-only changes that reuse the process.
+Once secret, a value stays redacted for that process even if a later request
+omits it or marks it as configuration. Repeated values are deduplicated.

@@ -5754,6 +5754,17 @@ impl AgentRuntime {
             provider,
             message: format!("retained {provider} process is no longer available"),
         })?;
+        // Classification can change without changing the command fingerprint.
+        // Once this process has seen a value as secret, later turns and
+        // continuations must never downgrade it. Deduplicate by raw value so
+        // repeated turns do not grow the lifetime set.
+        io.launch_secrets.extend(diagnostic_launch_secrets(
+            &request.environment,
+            &spec.environment,
+        ));
+        io.launch_secrets
+            .sort_unstable_by(|a, b| a.expose().cmp(b.expose()));
+        io.launch_secrets.dedup_by(|a, b| a.expose() == b.expose());
         let reused = generation > 1;
         if let Some(previous) = inherited_state.take() {
             if request.continuation {
