@@ -389,13 +389,26 @@ fn header_tokens<'a>(head: &'a [u8], name: &'a [u8]) -> impl Iterator<Item = &'a
 }
 
 /// A switch needs the connection option and only protocols offered by this request.
-/// Protocol identifiers are case-sensitive; connection-option names are not.
+/// Protocol names and connection options ignore ASCII case (RFC 9110 §7.8);
+/// version identifiers retain their exact spelling.
 fn valid_upgrade_selection(request: &[u8], response: &[u8]) -> bool {
     let offered: Vec<_> = header_tokens(request, b"upgrade").collect();
     let selected: Vec<_> = header_tokens(response, b"upgrade").collect();
     header_tokens(response, b"connection").any(|token| token.eq_ignore_ascii_case(b"upgrade"))
         && !selected.is_empty()
-        && selected.iter().all(|protocol| offered.contains(protocol))
+        && selected.iter().all(|protocol| {
+            let mut selected_parts = protocol.splitn(2, |byte| *byte == b'/');
+            let selected_name = selected_parts.next().unwrap_or_default();
+            let selected_version = selected_parts.next();
+            offered.iter().any(|offer| {
+                let mut parts = offer.splitn(2, |byte| *byte == b'/');
+                parts
+                    .next()
+                    .unwrap_or_default()
+                    .eq_ignore_ascii_case(selected_name)
+                    && parts.next() == selected_version
+            })
+        })
 }
 
 /// Bound negotiation, including a silent origin after buffered client EOF.
@@ -1232,12 +1245,29 @@ mod tests {
     }
 
     #[test]
-    fn upgrade_selection_preserves_protocol_case_and_multiple_offers() {
+    fn upgrade_selection_matches_names_without_case_and_preserves_versions() {
         let request = b"GET / HTTP/1.1\r\nUpgrade: first, fixture/2\r\nUpgrade: third\r\n\r\n";
         assert!(valid_upgrade_selection(request, b"HTTP/1.1 101 Switching\r\nConnection: keep-alive, UpGrAdE\r\nUpgrade: fixture/2\r\nX-Opaque: caf\xe9\r\n\r\n"));
-        assert!(!valid_upgrade_selection(
+        assert!(valid_upgrade_selection(
             request,
             b"HTTP/1.1 101 Switching\r\nConnection: Upgrade\r\nUpgrade: Fixture/2\r\n\r\n"
+        ));
+    }
+
+    #[test]
+    fn upgrade_selection_accepts_websocket_case_but_not_another_version() {
+        let request = b"GET / HTTP/1.1\r\nUpgrade: WebSocket, fixture/V1\r\n\r\n";
+        assert!(valid_upgrade_selection(
+            request,
+            b"HTTP/1.1 101 Switching\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"
+        ));
+        assert!(!valid_upgrade_selection(
+            request,
+            b"HTTP/1.1 101 Switching\r\nConnection: Upgrade\r\nUpgrade: fixture/v1\r\n\r\n"
+        ));
+        assert!(!valid_upgrade_selection(
+            request,
+            b"HTTP/1.1 101 Switching\r\nConnection: Upgrade\r\nUpgrade: other\r\n\r\n"
         ));
     }
 
