@@ -13,6 +13,17 @@ Versioning and Keep a Changelog conventions.
 
 ### Fixed
 
+- Plain HTTP through the tailnet proxy now uses origin-form targets and a
+  regenerated `Host` header. Each connection forwards one framed request and
+  discards pipelined requests; CONNECT/TLS forwarding is unchanged. Invalid
+  targets (userinfo or fragments), conflicting/unsupported body framing and
+  connection-nominated framing headers, malformed header names/values, and
+  non-decimal content lengths return 400. Protocol upgrades tunnel
+  only after a framed 101 with the upgrade connection option and a protocol
+  offered by the request; refused upgrades stream the original response.
+  Pending upgrade input is limited to 64 KiB and negotiation to 30 seconds;
+  invalid, oversized or timed-out upgrade handshakes return 502.
+
 - Diagnostic scrubbing preserves status codes and the exact missing-Bearer error
   when launch environment contains named configuration. Unknown and short secrets
   remain protected. Callers can explicitly classify configuration and credentials
