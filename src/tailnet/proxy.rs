@@ -259,7 +259,7 @@ async fn serve_connection(
                 // Keep this future alive across 101: a pending body write may
                 // own bytes already consumed from input. Cancelling it here
                 // would silently discard those bytes before tunneling.
-                let send = async {
+                let mut send = Box::pin(async {
                     forward_body(&mut input, &mut origin_write, body).await?;
                     let mut accepted = accepted;
                     let mut pending = Vec::new();
@@ -292,39 +292,46 @@ async fn serve_connection(
                     origin_write.write_all(&pending).await?;
                     tokio::io::copy(&mut input, &mut origin_write).await?;
                     origin_write.shutdown().await
-                };
-                tokio::pin!(send);
-                let accepted = {
-                    let reply = async {
-                        let decision =
-                            negotiate_upgrade(&mut origin_read, &mut client_write).await?;
-                        match decision {
-                            UpgradeResponse::Accepted => Ok::<bool, std::io::Error>(true),
-                            UpgradeResponse::Final => {
-                                tokio::io::copy(&mut origin_read, &mut client_write).await?;
-                                Ok(false)
-                            }
-                            UpgradeResponse::Rejected => Ok(false),
-                        }
-                    };
+                });
+                let decision = {
+                    let reply = negotiate_upgrade(&mut origin_read, &mut client_write);
                     tokio::pin!(reply);
                     tokio::select! {
                         result = &mut reply => result,
-                        result = &mut send => result.map(|_| false),
+                        result = &mut send => result.map(|_| UpgradeResponse::Rejected),
                     }
                 };
-                let Ok(accepted) = accepted else {
-                    client_write.write_all(UPGRADE_FAILURE).await?;
-                    return Ok(());
-                };
-                if accepted {
-                    let _ = accept.send(());
-                    // Preserve TCP half-close: a client can finish its upload
-                    // and still wait for a final reply from the upgraded peer.
-                    tokio::try_join!(send, async {
-                        tokio::io::copy(&mut origin_read, &mut client_write).await?;
-                        client_write.shutdown().await
-                    })?;
+                match decision {
+                    Ok(UpgradeResponse::Accepted(head)) => {
+                        client_write.write_all(&head).await?;
+                        let _ = accept.send(());
+                        // Preserve TCP half-close and the in-flight upload.
+                        tokio::try_join!(send, async {
+                            tokio::io::copy(&mut origin_read, &mut client_write).await?;
+                            client_write.shutdown().await
+                        })?;
+                    }
+                    Ok(UpgradeResponse::Final(prefix)) => {
+                        // Once a final response starts, never replace it with
+                        // an upgrade error or interrupt it with input limits.
+                        drop(send);
+                        client_write.write_all(&prefix).await?;
+                        // Discard further client bytes without an upgrade limit,
+                        // while still propagating an actual half-close.
+                        let drain = async {
+                            tokio::io::copy(&mut input, &mut tokio::io::sink()).await?;
+                            origin_write.shutdown().await
+                        };
+                        let reply = tokio::io::copy(&mut origin_read, &mut client_write);
+                        tokio::pin!(drain, reply);
+                        tokio::select! {
+                            result = &mut reply => { result?; }
+                            result = &mut drain => { result?; reply.await?; }
+                        }
+                    }
+                    Ok(UpgradeResponse::Rejected) | Err(_) => {
+                        client_write.write_all(UPGRADE_FAILURE).await?;
+                    }
                 }
                 return Ok(());
             }
@@ -357,8 +364,8 @@ const MAX_UPGRADE_BUFFER_BYTES: usize = 64 * 1024;
 const UPGRADE_FAILURE: &[u8] = b"HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain\r\nContent-Length: 65\r\nConnection: close\r\n\r\nUpgrade handshake invalid, oversized, timed out, or unavailable.\n";
 
 enum UpgradeResponse {
-    Accepted,
-    Final,
+    Accepted(Vec<u8>),
+    Final(Vec<u8>),
     Rejected,
 }
 
@@ -376,7 +383,6 @@ async fn negotiate_upgrade<R: tokio::io::AsyncRead + Unpin, W: tokio::io::AsyncW
     {
         result
     } else {
-        client.write_all(UPGRADE_FAILURE).await?;
         Ok(UpgradeResponse::Rejected)
     }
 }
@@ -400,6 +406,9 @@ async fn read_upgrade_response<
                 Err(error) => return Err(error),
             }
         }
+        if !head.ends_with(b"\n") {
+            return Ok(UpgradeResponse::Rejected);
+        }
         let status = head
             .split(u8::is_ascii_whitespace)
             .filter(|part| !part.is_empty())
@@ -407,34 +416,30 @@ async fn read_upgrade_response<
             .and_then(|code| std::str::from_utf8(code).ok())
             .and_then(|code| code.parse::<u16>().ok());
         if !status.is_some_and(|code| (100..200).contains(&code)) {
-            client.write_all(&head).await?;
-            return Ok(UpgradeResponse::Final);
+            return Ok(UpgradeResponse::Final(head));
         }
         // A real protocol switch must have a complete, bounded HTTP head.
         if !head.ends_with(b"\r\n")
             || !(head.starts_with(b"HTTP/1.1 ") || head.starts_with(b"HTTP/1.0 "))
         {
-            client.write_all(UPGRADE_FAILURE).await?;
             return Ok(UpgradeResponse::Rejected);
         }
         while !head.ends_with(b"\r\n\r\n") {
             if head.len() >= MAX_HEAD_BYTES || head.ends_with(b"\n\n") {
-                client.write_all(UPGRADE_FAILURE).await?;
                 return Ok(UpgradeResponse::Rejected);
             }
             match origin.read_u8().await {
                 Ok(byte) => head.push(byte),
                 Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
-                    client.write_all(UPGRADE_FAILURE).await?;
                     return Ok(UpgradeResponse::Rejected);
                 }
                 Err(error) => return Err(error),
             }
         }
-        client.write_all(&head).await?;
         if status == Some(101) {
-            return Ok(UpgradeResponse::Accepted);
+            return Ok(UpgradeResponse::Accepted(head));
         }
+        client.write_all(&head).await?;
     }
 }
 
@@ -1184,19 +1189,62 @@ mod tests {
         }).await.unwrap();
     }
 
+    #[tokio::test]
+    async fn upgrade_closed_before_status_line_returns_502() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            for prefix in [&b""[..], &b"HTTP/1.1 403 Forbidden"[..]] {
+                let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+                let addr = listener.local_addr().unwrap();
+                let proxy = SplitProxy::start(SocksUpstream { addr }, RouteTable::default()).await.unwrap();
+                let mut client = TcpStream::connect(proxy.local_addr()).await.unwrap();
+                client.write_all(format!("GET http://{addr}/ HTTP/1.1\r\nConnection: Upgrade\r\nUpgrade: fixture\r\n\r\n").as_bytes()).await.unwrap();
+                let (mut origin, _) = listener.accept().await.unwrap();
+                read_head(&mut origin).await.unwrap();
+                origin.write_all(prefix).await.unwrap();
+                origin.shutdown().await.unwrap();
+                let mut received = Vec::new();
+                client.read_to_end(&mut received).await.unwrap();
+                assert_eq!(received, UPGRADE_FAILURE);
+            }
+        }).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn upgrade_refusal_body_survives_excess_client_input() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let proxy = SplitProxy::start(SocksUpstream { addr }, RouteTable::default()).await.unwrap();
+            let mut client = TcpStream::connect(proxy.local_addr()).await.unwrap();
+            client.write_all(format!("GET http://{addr}/ HTTP/1.1\r\nConnection: Upgrade\r\nUpgrade: fixture\r\n\r\n").as_bytes()).await.unwrap();
+            let (mut origin, _) = listener.accept().await.unwrap();
+            read_head(&mut origin).await.unwrap();
+            let prefix = b"HTTP/1.1 403 Forbidden\r\nContent-Length: 8\r\n\r\nfirst";
+            origin.write_all(prefix).await.unwrap();
+            let mut received = vec![0; prefix.len()];
+            client.read_exact(&mut received).await.unwrap();
+            assert_eq!(received, prefix);
+            client.write_all(&vec![b'x'; MAX_UPGRADE_BUFFER_BYTES + 1]).await.unwrap();
+            // Give the input reader a chance to hit its limit before the body ends.
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            origin.write_all(b"end").await.unwrap();
+            origin.shutdown().await.unwrap();
+            let mut rest = Vec::new();
+            client.read_to_end(&mut rest).await.unwrap();
+            assert_eq!(rest, b"end");
+        }).await.unwrap();
+    }
+
     #[tokio::test(start_paused = true)]
     async fn silent_upgrade_negotiation_has_a_visible_bounded_timeout() {
         let (_origin_peer, mut origin) = tokio::io::duplex(4096);
-        let (mut client_peer, mut client) = tokio::io::duplex(4096);
+        let (_client_peer, mut client) = tokio::io::duplex(4096);
         let started = tokio::time::Instant::now();
         assert!(matches!(
             negotiate_upgrade(&mut origin, &mut client).await.unwrap(),
             UpgradeResponse::Rejected
         ));
         assert_eq!(started.elapsed(), std::time::Duration::from_secs(30));
-        let mut received = vec![0; UPGRADE_FAILURE.len()];
-        client_peer.read_exact(&mut received).await.unwrap();
-        assert_eq!(received, UPGRADE_FAILURE);
     }
 
     #[tokio::test]
