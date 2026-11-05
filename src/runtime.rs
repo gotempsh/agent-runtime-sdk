@@ -2062,15 +2062,25 @@ async fn finish_retained_turn(
     request: &TurnRequest,
     events: &dyn EventSink,
     state: &mut AdapterState,
+    launch_secrets: &[crate::SecretString],
 ) -> Result<TurnResult> {
     let provider = request.provider;
     if let Some(failure) = state.terminal_failure.take() {
+        let scrub = |value: &str| {
+            crate::diagnostic_scrub::scrub(
+                value,
+                launch_secrets
+                    .iter()
+                    .chain(diagnostic_environment_values(&request.environment))
+                    .map(crate::SecretString::expose),
+            )
+        };
         return Err(RuntimeError::ProcessFailed {
             provider,
             kind: failure.kind,
             exit_code: None,
-            stderr: redact_secrets(&failure.diagnostic, &request.environment),
-            provider_code: failure.provider_code,
+            stderr: scrub(&failure.diagnostic),
+            provider_code: failure.provider_code.as_deref().map(scrub),
             delivery: failure.delivery,
         });
     }
@@ -2115,8 +2125,9 @@ async fn complete_retained_turn(
     request: &TurnRequest,
     events: &dyn EventSink,
     mut state: AdapterState,
+    launch_secrets: &[crate::SecretString],
 ) -> Result<RetainedTurnEnd> {
-    let result = finish_retained_turn(adapter, request, events, &mut state).await?;
+    let result = finish_retained_turn(adapter, request, events, &mut state, launch_secrets).await?;
     let keep_state = adapter.retained_background_work(&state) || request.provider == Provider::Acp;
     if request.provider == Provider::Acp {
         state.result = TurnResult::default();
@@ -5699,14 +5710,10 @@ impl AgentRuntime {
                         stderr,
                         STDERR_TAIL_BYTES,
                     )),
-                    launch_secrets: request
-                        .environment
-                        .values()
-                        .cloned()
-                        .chain(spec.environment.values().map(|value| {
-                            crate::SecretString::new(value.to_string_lossy().into_owned())
-                        }))
-                        .collect(),
+                    launch_secrets: diagnostic_launch_secrets(
+                        &request.environment,
+                        &spec.environment,
+                    ),
                     launch_environment_cleared: spec.clear_environment,
                     stdout_task,
                 })),
@@ -5747,6 +5754,17 @@ impl AgentRuntime {
             provider,
             message: format!("retained {provider} process is no longer available"),
         })?;
+        // Classification can change without changing the command fingerprint.
+        // Once this process has seen a value as secret, later turns and
+        // continuations must never downgrade it. Deduplicate by raw value so
+        // repeated turns do not grow the lifetime set.
+        io.launch_secrets.extend(diagnostic_launch_secrets(
+            &request.environment,
+            &spec.environment,
+        ));
+        io.launch_secrets
+            .sort_unstable_by(|a, b| a.expose().cmp(b.expose()));
+        io.launch_secrets.dedup_by(|a, b| a.expose() == b.expose());
         let reused = generation > 1;
         if let Some(previous) = inherited_state.take() {
             if request.continuation {
@@ -5833,7 +5851,8 @@ impl AgentRuntime {
             && parked_output.interactions.is_empty()
             && !adapter.retained_follow_up_pending(&state)
         {
-            complete_retained_turn(adapter.as_ref(), request, events, state).await
+            complete_retained_turn(adapter.as_ref(), request, events, state, &io.launch_secrets)
+                .await
         } else {
             self.drive_retained_codex_turn(
                 adapter.as_ref(),
@@ -6223,7 +6242,7 @@ impl AgentRuntime {
                                 })
                                 .await?;
                         }
-                        return complete_retained_turn(adapter, request, events, state).await;
+                        return complete_retained_turn(adapter, request, events, state, &io.launch_secrets).await;
                     }
                 }
                 // Finish a frame that has begun even if the turn is cancelled
@@ -6293,7 +6312,7 @@ impl AgentRuntime {
                         &diagnostic,
                         io.launch_secrets
                             .iter()
-                            .chain(request.environment.values())
+                            .chain(diagnostic_environment_values(&request.environment))
                             .map(crate::SecretString::expose),
                     )
                     .trim()
@@ -6306,7 +6325,14 @@ impl AgentRuntime {
                         .terminate()
                         .await
                         .map_err(|source| RuntimeError::Transport { provider, source })?;
-                    let result = finish_retained_turn(adapter, request, events, &mut state).await?;
+                    let result = finish_retained_turn(
+                        adapter,
+                        request,
+                        events,
+                        &mut state,
+                        &io.launch_secrets,
+                    )
+                    .await?;
                     return Ok(RetainedTurnEnd::Retired(result));
                 }
                 return Err(RuntimeError::ProcessFailed {
@@ -6397,7 +6423,9 @@ impl AgentRuntime {
                     .terminate()
                     .await
                     .map_err(|source| RuntimeError::Transport { provider, source })?;
-                let result = finish_retained_turn(adapter, request, events, &mut state).await?;
+                let result =
+                    finish_retained_turn(adapter, request, events, &mut state, &io.launch_secrets)
+                        .await?;
                 return Ok(RetainedTurnEnd::Retired(result));
             }
             write_optional_frames(Some(&mut io.stdin), &output.optional_writes).await;
@@ -6428,10 +6456,18 @@ impl AgentRuntime {
                         .terminate()
                         .await
                         .map_err(|source| RuntimeError::Transport { provider, source })?;
-                    let result = finish_retained_turn(adapter, request, events, &mut state).await?;
+                    let result = finish_retained_turn(
+                        adapter,
+                        request,
+                        events,
+                        &mut state,
+                        &io.launch_secrets,
+                    )
+                    .await?;
                     return Ok(RetainedTurnEnd::Retired(result));
                 }
-                return complete_retained_turn(adapter, request, events, state).await;
+                return complete_retained_turn(adapter, request, events, state, &io.launch_secrets)
+                    .await;
             }
             if request.cancellation.is_cancelled() {
                 return self
@@ -7143,11 +7179,43 @@ fn redact_transport_error(
     error
 }
 
+fn diagnostic_environment_values(
+    environment: &std::collections::BTreeMap<String, crate::SecretString>,
+) -> impl Iterator<Item = &crate::SecretString> {
+    environment
+        .iter()
+        .filter(|(name, value)| value.diagnostic_secret(name))
+        .map(|(_, value)| value)
+}
+
+fn diagnostic_launch_secrets(
+    environment: &std::collections::BTreeMap<String, crate::SecretString>,
+    launch: &std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString>,
+) -> Vec<crate::SecretString> {
+    diagnostic_environment_values(environment)
+        .cloned()
+        .chain(launch.iter().filter_map(|(name, value)| {
+            let name = name.to_string_lossy();
+            let value = value.to_string_lossy();
+            // Only reuse caller metadata for the exact value actually launched.
+            let secret = environment
+                .get(name.as_ref())
+                .filter(|original| original.expose() == value)
+                .cloned()
+                .unwrap_or_else(|| crate::SecretString::new(value.as_ref()));
+            secret.diagnostic_secret(&name).then_some(secret)
+        }))
+        .collect()
+}
+
 fn redact_secrets(
     value: &str,
     environment: &std::collections::BTreeMap<String, crate::SecretString>,
 ) -> String {
-    crate::diagnostic_scrub::scrub(value, environment.values().map(crate::SecretString::expose))
+    crate::diagnostic_scrub::scrub(
+        value,
+        diagnostic_environment_values(environment).map(crate::SecretString::expose),
+    )
 }
 
 const fn provider_order(provider: Provider) -> u8 {
@@ -8874,6 +8942,150 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "claude")]
+    #[tokio::test]
+    async fn retained_terminal_failure_scrubs_launch_and_current_secrets_in_both_fields() {
+        let adapter = crate::providers::Claude::default();
+        let mut request = TurnRequest::new(Provider::Claude, ".", "test");
+        request
+            .environment
+            .insert("CURRENT_SECRET".into(), crate::SecretString::new("xy"));
+        request
+            .environment
+            .insert("GIT_CONFIG_COUNT".into(), crate::SecretString::new("1"));
+        let launch = vec![crate::SecretString::credential("launch-opaque")];
+        for complete in [false, true] {
+            let mut state = AdapterState {
+                terminal_failure: Some(
+                    crate::ProviderTerminalFailure::new(
+                        ProviderProcessErrorKind::Unknown,
+                        "401 launch-opaque xy",
+                        crate::lifecycle::DeliveryState::Accepted,
+                    )
+                    .with_provider_code("401 launch-opaque xy"),
+                ),
+                ..AdapterState::default()
+            };
+            let error = if complete {
+                match complete_retained_turn(
+                    &adapter,
+                    &request,
+                    &crate::NoopEventSink,
+                    state,
+                    &launch,
+                )
+                .await
+                {
+                    Err(error) => error,
+                    Ok(_) => panic!("expected terminal failure"),
+                }
+            } else {
+                finish_retained_turn(
+                    &adapter,
+                    &request,
+                    &crate::NoopEventSink,
+                    &mut state,
+                    &launch,
+                )
+                .await
+                .unwrap_err()
+            };
+            assert!(
+                matches!(error, RuntimeError::ProcessFailed { stderr, provider_code, .. }
+                if stderr == "401 [REDACTED] [REDACTED]" && provider_code.as_deref() == Some("401 [REDACTED] [REDACTED]"))
+            );
+        }
+    }
+
+    #[test]
+    fn diagnostic_configuration_preserves_errors_and_fails_closed() {
+        use crate::SecretString as S;
+        let mut environment = std::collections::BTreeMap::new();
+        for name in [
+            "CODEX_HOME",
+            "CLAUDE_CONFIG_DIR",
+            "NO_PROXY",
+            "no_proxy",
+            "NODE_USE_ENV_PROXY",
+            "GIT_CONFIG_COUNT",
+            "GIT_CONFIG_KEY_0",
+        ] {
+            environment.insert(name.into(), S::new("1"));
+        }
+        environment.insert("GIT_CONFIG_VALUE_0".into(), S::new("*"));
+        environment.insert("CALLER_FLAG".into(), S::non_secret_configuration("1"));
+        let error = "unexpected status 401 Unauthorized: Missing bearer authentication in header, url: https://api.openai.com/v1/responses *";
+        let launch = environment
+            .iter()
+            .map(|(name, value)| {
+                (
+                    std::ffi::OsString::from(name),
+                    std::ffi::OsString::from(value.expose()),
+                )
+            })
+            .collect();
+        assert_eq!(redact_secrets(error, &environment), error);
+        assert_eq!(
+            crate::diagnostic_scrub::scrub(
+                error,
+                diagnostic_launch_secrets(&environment, &launch)
+                    .iter()
+                    .map(S::expose)
+            ),
+            error
+        );
+        for name in [
+            "UNKNOWN",
+            "TEMPS_CODE_FLAG",
+            "TEMPS_TAILNET_NAME",
+            "HTTP_PROXY",
+            "https_proxy",
+            "ALL_PROXY",
+            "GIT_CONFIG_VALUE_0",
+        ] {
+            for value in ["xy", "1", "http://user:pass@proxy"] {
+                let env = [(name.into(), S::new(value))].into_iter().collect();
+                assert_eq!(redact_secrets(value, &env), "[REDACTED]");
+            }
+        }
+        for name in [
+            "HTTP_PROXY",
+            "https_proxy",
+            "ALL_PROXY",
+            "GIT_CONFIG_VALUE_0",
+            "git_config_value_0",
+            "Git_Config_Value_0",
+        ] {
+            assert!(S::non_secret_configuration("xy").diagnostic_secret(name));
+        }
+        environment.insert("CODEX_HOME".into(), S::credential("1"));
+        assert_eq!(redact_secrets("401", &environment), "40[REDACTED]");
+        assert_eq!(
+            crate::diagnostic_scrub::scrub(
+                "401",
+                diagnostic_launch_secrets(&environment, &launch)
+                    .iter()
+                    .map(S::expose)
+            ),
+            "40[REDACTED]"
+        );
+        let changed = [(
+            std::ffi::OsString::from("CALLER_FLAG"),
+            std::ffi::OsString::from("xy"),
+        )]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            crate::diagnostic_scrub::scrub(
+                "xy",
+                diagnostic_launch_secrets(&environment, &changed)
+                    .iter()
+                    .map(S::expose)
+            ),
+            "[REDACTED]"
+        );
+    }
+
     #[test]
     fn diagnostic_redaction_prefers_longer_overlapping_secrets() {
         let environment = std::collections::BTreeMap::from([
@@ -10054,6 +10266,35 @@ mod tests {
                 RuntimeError::ProcessFailed { stderr, .. }
                     if stderr == "authentication failed"
             ));
+        }
+
+        #[tokio::test]
+        async fn provider_failure_preserves_docker_401_diagnostic() {
+            let error = "unexpected status 401 Unauthorized: Missing bearer authentication in header, url: https://api.openai.com/v1/responses";
+            let mut builder = AgentRuntime::builder();
+            builder.register(ShellAdapter {
+                script: format!("printf '%s\\n' '{error}' >&2; exit 7"),
+                args: Vec::new(),
+            });
+            let runtime = builder.build().unwrap();
+            let directory = tempfile::tempdir().unwrap();
+            let mut request = TurnRequest::new(Provider::Claude, directory.path(), "test");
+            for (name, value) in [
+                ("GIT_CONFIG_COUNT", "1"),
+                ("NODE_USE_ENV_PROXY", "1"),
+                ("GIT_CONFIG_VALUE_0", "*"),
+            ] {
+                request
+                    .environment
+                    .insert(name.into(), crate::SecretString::new(value));
+            }
+            let result = runtime
+                .run(request, &crate::NoopEventSink, None)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(result, RuntimeError::ProcessFailed { stderr, .. } if stderr == error)
+            );
         }
 
         #[tokio::test]

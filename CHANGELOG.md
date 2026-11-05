@@ -13,6 +13,11 @@ Versioning and Keep a Changelog conventions.
 
 ### Fixed
 
+- Diagnostic scrubbing preserves status codes and the exact missing-Bearer error
+  when launch environment contains named configuration. Unknown and short secrets
+  remain protected. Callers can explicitly classify configuration and credentials
+  with `SecretString::non_secret_configuration` and `SecretString::credential`.
+
 - Retained provider processes now preserve startup stderr on unexpected stdout
   EOF, so sandbox launcher failures carry their actual diagnostic. Capture keeps
   up to 32 KiB and waits at most two seconds for inherited stderr pipes. Overflow
