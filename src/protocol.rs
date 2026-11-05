@@ -78,6 +78,11 @@ pub struct ProtocolEnvironmentVariable {
     pub name: String,
     /// Secret-bearing value with redacted debug output.
     pub value: ProtocolSecret,
+    /// Diagnostic classification: true forces credential redaction, false marks
+    /// caller-owned configuration, and absence uses name-based defaults.
+    /// Proxy URLs and non-wildcard Git values remain protected on the host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostic_secret: Option<bool>,
 }
 
 /// Host-resolved sandbox selection safe to put on the wire.
@@ -780,6 +785,7 @@ mod tests {
                     environment: vec![ProtocolEnvironmentVariable {
                         name: "API_TOKEN".to_owned(),
                         value: ProtocolSecret::new("wire-secret"),
+                        diagnostic_secret: None,
                     }],
                     attachments: vec![TurnAttachment::new("uploads/report.pdf")],
                     interaction_policy: InteractionPolicy::RequireHandler,

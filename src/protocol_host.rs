@@ -949,7 +949,10 @@ fn protocol_environment(
         .map(|variable| {
             (
                 variable.name,
-                SecretString::new(variable.value.expose().to_owned()),
+                SecretString::with_diagnostic_classification(
+                    variable.value.expose().to_owned(),
+                    variable.diagnostic_secret,
+                ),
             )
         })
         .collect()
@@ -1037,6 +1040,42 @@ mod tests {
 
     struct TestExecutor {
         calls: AtomicUsize,
+    }
+
+    #[test]
+    fn environment_classification_survives_client_wire_and_host() {
+        let original = BTreeMap::from([
+            ("CODEX_HOME".into(), SecretString::credential("xy")),
+            (
+                "CALLER_FLAG".into(),
+                SecretString::non_secret_configuration("1"),
+            ),
+            ("UNKNOWN".into(), SecretString::new("ab")),
+            (
+                "HTTPS_PROXY".into(),
+                SecretString::non_secret_configuration("proxy-opaque"),
+            ),
+            (
+                "GIT_CONFIG_VALUE_0".into(),
+                SecretString::non_secret_configuration("git-opaque"),
+            ),
+        ]);
+        let wire = crate::protocol_client::protocol_environment(original.clone());
+        let encoded = serde_json::to_vec(&wire).unwrap();
+        let decoded = serde_json::from_slice(&encoded).unwrap();
+        let restored = protocol_environment(decoded);
+        assert_eq!(restored, original);
+        let secrets = restored
+            .iter()
+            .filter(|(name, value)| value.diagnostic_secret(name))
+            .map(|(_, value)| value.expose());
+        assert_eq!(
+            crate::diagnostic_scrub::scrub("401 xy ab proxy-opaque git-opaque", secrets),
+            "401 [REDACTED] [REDACTED] [REDACTED] [REDACTED]"
+        );
+        // Older frames omit the additive metadata and retain name-based defaults.
+        let legacy = serde_json::from_str(r#"[{"name":"UNKNOWN","value":"xy"}]"#).unwrap();
+        assert!(protocol_environment(legacy)["UNKNOWN"].diagnostic_secret("UNKNOWN"));
     }
 
     #[async_trait]
