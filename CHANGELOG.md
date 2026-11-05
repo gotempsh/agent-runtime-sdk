@@ -19,7 +19,8 @@ Versioning and Keep a Changelog conventions.
   targets (userinfo or fragments), conflicting/unsupported body framing and
   connection-nominated framing headers, malformed header names/values, and
   non-decimal content lengths return 400. Protocol upgrades tunnel
-  only after a valid 101; refused upgrades stream the original response.
+  only after a framed 101 with the upgrade connection option and a protocol
+  offered by the request; refused upgrades stream the original response.
   Pending upgrade input is limited to 64 KiB and negotiation to 30 seconds;
   invalid, oversized or timed-out upgrade handshakes return 502.
 

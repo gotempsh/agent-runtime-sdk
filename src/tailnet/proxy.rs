@@ -303,6 +303,10 @@ async fn serve_connection(
                 };
                 match decision {
                     Ok(UpgradeResponse::Accepted(head)) => {
+                        if !valid_upgrade_selection(&origin_head, &head) {
+                            client_write.write_all(UPGRADE_FAILURE).await?;
+                            return Ok(());
+                        }
                         client_write.write_all(&head).await?;
                         let _ = accept.send(());
                         // Preserve TCP half-close and the in-flight upload.
@@ -367,6 +371,31 @@ enum UpgradeResponse {
     Accepted(Vec<u8>),
     Final(Vec<u8>),
     Rejected,
+}
+
+/// Read comma-separated upgrade metadata without decoding unrelated field values.
+fn header_tokens<'a>(head: &'a [u8], name: &'a [u8]) -> impl Iterator<Item = &'a [u8]> {
+    head.split(|byte| *byte == b'\n')
+        .skip(1)
+        .filter_map(move |line| {
+            let colon = line.iter().position(|byte| *byte == b':')?;
+            line[..colon]
+                .eq_ignore_ascii_case(name)
+                .then_some(&line[colon + 1..])
+        })
+        .flat_map(|value| value.split(|byte| *byte == b','))
+        .map(<[u8]>::trim_ascii)
+        .filter(|token| !token.is_empty())
+}
+
+/// A switch needs the connection option and only protocols offered by this request.
+/// Protocol identifiers are case-sensitive; connection-option names are not.
+fn valid_upgrade_selection(request: &[u8], response: &[u8]) -> bool {
+    let offered: Vec<_> = header_tokens(request, b"upgrade").collect();
+    let selected: Vec<_> = header_tokens(response, b"upgrade").collect();
+    header_tokens(response, b"connection").any(|token| token.eq_ignore_ascii_case(b"upgrade"))
+        && !selected.is_empty()
+        && selected.iter().all(|protocol| offered.contains(protocol))
 }
 
 /// Bound negotiation, including a silent origin after buffered client EOF.
@@ -1198,6 +1227,37 @@ mod tests {
                 let mut received = Vec::new();
                 client.read_to_end(&mut received).await.unwrap();
                 assert_eq!(received, UPGRADE_FAILURE);
+            }
+        }).await.unwrap();
+    }
+
+    #[test]
+    fn upgrade_selection_preserves_protocol_case_and_multiple_offers() {
+        let request = b"GET / HTTP/1.1\r\nUpgrade: first, fixture/2\r\nUpgrade: third\r\n\r\n";
+        assert!(valid_upgrade_selection(request, b"HTTP/1.1 101 Switching\r\nConnection: keep-alive, UpGrAdE\r\nUpgrade: fixture/2\r\nX-Opaque: caf\xe9\r\n\r\n"));
+        assert!(!valid_upgrade_selection(
+            request,
+            b"HTTP/1.1 101 Switching\r\nConnection: Upgrade\r\nUpgrade: Fixture/2\r\n\r\n"
+        ));
+    }
+
+    #[tokio::test]
+    async fn invalid_upgrade_selection_never_releases_protocol_bytes() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            for fields in ["", "Upgrade: fixture\r\n", "Connection: Upgrade\r\n", "Connection: Upgrade\r\nUpgrade: other\r\n"] {
+                let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+                let addr = listener.local_addr().unwrap();
+                let proxy = SplitProxy::start(SocksUpstream { addr }, RouteTable::default()).await.unwrap();
+                let mut client = TcpStream::connect(proxy.local_addr()).await.unwrap();
+                client.write_all(format!("GET http://{addr}/ HTTP/1.1\r\nConnection: Upgrade\r\nUpgrade: fixture\r\n\r\nping").as_bytes()).await.unwrap();
+                let (mut origin, _) = listener.accept().await.unwrap();
+                assert_eq!(read_head(&mut origin).await.unwrap().1, [] as [u8; 0]);
+                origin.write_all(format!("HTTP/1.1 101 Switching Protocols\r\n{fields}\r\n").as_bytes()).await.unwrap();
+                let mut received = vec![0; 12];
+                client.read_exact(&mut received).await.unwrap();
+                assert_eq!(&received, b"HTTP/1.1 502");
+                let mut byte = [0];
+                assert_eq!(origin.read(&mut byte).await.unwrap(), 0);
             }
         }).await.unwrap();
     }
