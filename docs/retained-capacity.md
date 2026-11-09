@@ -52,3 +52,10 @@ follow-up after attempted reclamation and asserts one process and one prompt.
 A native fixture also completes and reclaims 257 distinct provider runtimes
 before idle expiry. Ordinary completed processes carry no parser state and are
 reclaimable; absent parser state must not be mistaken for pending work.
+
+Provider cleanup also retains its exact supervisor entry and transport until
+termination acknowledges success. Cancellation, idle-cleanup timeout or transport
+failure leaves that ownership available for explicit retry; an empty provider
+registry cannot falsely confirm termination. The real-supervisor regression
+checks both cancellation and timeout, blocks identity reuse during retry, then
+releases it only after the transport acknowledgement.
