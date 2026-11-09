@@ -78,3 +78,9 @@ at page selection, so a partial page is not evidence of fewer retained slots.
 Local transport termination retains the blocking process-tree cleanup task and
 awaits that same acknowledgement after cancellation; failed joins remain failed
 rather than becoming a successful empty-guard retry.
+
+External executors can own a `RetainedIdentityRegistry` (clones share its
+namespace) and return `registry.claim(runtime_id).map(Some)` from their ownership
+hook. The public guard releases on entry drop as well as successful disposal.
+An external-crate integration test covers client/handle drop, duplicate rejection,
+explicit disposal and old-handle replacement safety.

@@ -478,6 +478,31 @@ pub enum DisposeOutcome {
     NotFound,
 }
 
+/// Shared provider-identity ownership for custom retained executors.
+/// Keep one registry per provider namespace and return `claim` from
+/// [`RuntimeTurnExecutor::claim_retained_identity`]. Clones share ownership.
+#[derive(Clone, Default)]
+pub struct RetainedIdentityRegistry {
+    owners: Arc<std::sync::Mutex<HashSet<RuntimeId>>>,
+}
+impl RetainedIdentityRegistry {
+    /// Acquire exclusive ownership until the returned guard is dropped.
+    /// A duplicate is rejected before any provider effect occurs.
+    pub fn claim(&self, runtime_id: &RuntimeId) -> RetainedRuntimeResult<RetainedIdentityClaim> {
+        let mut owners = self
+            .owners
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !owners.insert(runtime_id.clone()) {
+            return Err(lifecycle_failure(Some(runtime_id.clone()), None, RuntimeFailureKind::RuntimeAlreadyExists, RetryAdvice::Never, DeliveryState::NotSent, "this provider runtime identity belongs to another retained client; use that client or dispose it before reacquiring"));
+        }
+        Ok(RetainedIdentityClaim {
+            owners: self.owners.clone(),
+            runtime_id: runtime_id.clone(),
+        })
+    }
+}
+
 /// Ownership of one provider identity across registries sharing an executor.
 /// Dropping the claim releases that identity; successful disposal releases it
 /// early so old, already-disposed handles cannot hold up a replacement.
@@ -602,17 +627,11 @@ impl RuntimeTurnExecutor for AgentRuntime {
         &self,
         runtime_id: &RuntimeId,
     ) -> RetainedRuntimeResult<Option<RetainedIdentityClaim>> {
-        let mut owners = self
-            .retained_identity_owners
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !owners.insert(runtime_id.clone()) {
-            return Err(lifecycle_failure(Some(runtime_id.clone()), None, RuntimeFailureKind::RuntimeAlreadyExists, RetryAdvice::Never, DeliveryState::NotSent, "this provider runtime identity belongs to another retained client; use that client or dispose it before reacquiring"));
-        }
-        Ok(Some(RetainedIdentityClaim {
+        RetainedIdentityRegistry {
             owners: self.retained_identity_owners.clone(),
-            runtime_id: runtime_id.clone(),
-        }))
+        }
+        .claim(runtime_id)
+        .map(Some)
     }
 
     async fn retained_background_task_count(&self, runtime_id: &RuntimeId) -> Option<usize> {
