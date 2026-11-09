@@ -175,6 +175,7 @@ impl ProcessTreeGuard {
 
     /// Transfer ownership before awaiting so cancellation cannot drop an armed
     /// guard on the async worker or cancel cleanup already queued for execution.
+    #[cfg(any(feature = "acp", test))]
     pub(crate) async fn terminate_async(&mut self) -> Result<(), tokio::task::JoinError> {
         let mut guard = std::mem::take(self);
         tokio::task::spawn_blocking(move || guard.terminate()).await
