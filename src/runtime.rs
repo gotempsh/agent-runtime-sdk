@@ -2991,13 +2991,17 @@ impl AgentRuntime {
             .inherited
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let state = inherited.as_ref()?;
-        let count = adapter.retained_background_task_ids(state).len();
-        if count > 0 {
-            return Some(count);
-        }
-        if adapter.retained_background_work(state) || adapter.retained_follow_up_pending(state) {
-            return None;
+        // Ordinary completed turns deliberately carry no parser state. They
+        // are idle, not unknown; active turns are fenced by the retained entry.
+        if let Some(state) = inherited.as_ref() {
+            let count = adapter.retained_background_task_ids(state).len();
+            if count > 0 {
+                return Some(count);
+            }
+            if adapter.retained_background_work(state) || adapter.retained_follow_up_pending(state)
+            {
+                return None;
+            }
         }
         let parked = process
             .handoff

@@ -48,3 +48,7 @@ Provider follow-ups are protected even after their last background task ID drain
 Pending answers, buffered continuations and queued interactions report unknown
 reclamation state rather than zero. The provider regression consumes the original
 follow-up after attempted reclamation and asserts one process and one prompt.
+
+A native fixture also completes and reclaims 257 distinct provider runtimes
+before idle expiry. Ordinary completed processes carry no parser state and are
+reclaimable; absent parser state must not be mistaken for pending work.

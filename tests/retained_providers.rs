@@ -1854,3 +1854,52 @@ async fn idle_capacity_cleanup_preserves_a_buffered_follow_up() {
     );
     f.dispose().await;
 }
+
+#[tokio::test]
+async fn idle_capacity_cleanup_reclaims_more_than_256_completed_provider_entries() {
+    let f = Fixture::new(true, Duration::from_secs(30)).await;
+    for index in 0..257 {
+        let id = RuntimeId::new(format!("completed-{index}")).unwrap();
+        let handle = f
+            .client
+            .acquire(RuntimeSpec::new(id.clone(), Provider::Claude, f.dir.path()))
+            .await
+            .unwrap();
+        let (_, result) = Running::new(
+            handle
+                .start_turn(Fixture::input("original", "plain"))
+                .await
+                .unwrap(),
+        )
+        .finish()
+        .await;
+        assert_eq!(result.unwrap().text, "reply:plain");
+        drop(handle);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if f.client
+                    .retained_snapshot(0, 100)
+                    .await
+                    .2
+                    .iter()
+                    .any(|row| row.runtime_id == id && !row.borrowed)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            f.client.try_dispose_idle(&id).await.unwrap(),
+            "completed runtime {index} remains reclaimable before provider idle expiry"
+        );
+        assert_eq!(f.client.retained_snapshot(0, 100).await.0, 1);
+    }
+    assert_eq!(
+        f.events().iter().filter(|v| v["kind"] == "prompt").count(),
+        257
+    );
+    f.dispose().await;
+}
