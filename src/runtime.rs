@@ -2965,6 +2965,51 @@ impl AgentRuntime {
             .unwrap_or_default()
     }
 
+    /// A conservative reclamation observation, distinct from the task-ID list.
+    /// Unknown means that pending or buffered provider output must be consumed
+    /// before this runtime can be reclaimed, even when no task IDs remain.
+    pub(crate) async fn parked_reclamation_task_count(
+        &self,
+        runtime_id: &crate::lifecycle::RuntimeId,
+    ) -> Option<usize> {
+        let Some(supervisor) = &self.codex_process_retention else {
+            return Some(0);
+        };
+        let Some(process) = supervisor
+            .inner
+            .processes
+            .lock()
+            .await
+            .get(runtime_id)
+            .cloned()
+        else {
+            return Some(0);
+        };
+        let adapter = self.adapters.get(&process.provider)?;
+        let inherited = process
+            .handoff
+            .inherited
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = inherited.as_ref()?;
+        let count = adapter.retained_background_task_ids(state).len();
+        if count > 0 {
+            return Some(count);
+        }
+        if adapter.retained_background_work(state) || adapter.retained_follow_up_pending(state) {
+            return None;
+        }
+        let parked = process
+            .handoff
+            .parked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if parked.follow_up || !parked.interactions.is_empty() {
+            return None;
+        }
+        Some(0)
+    }
+
     /// Inspect one compiled adapter inside the configured execution transport.
     ///
     /// An adapter that runs one of several registered executables, such as

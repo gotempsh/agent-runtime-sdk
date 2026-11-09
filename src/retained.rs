@@ -574,7 +574,7 @@ pub trait RuntimeTurnExecutor: Send + Sync {
 #[async_trait]
 impl RuntimeTurnExecutor for AgentRuntime {
     async fn retained_background_task_count(&self, runtime_id: &RuntimeId) -> Option<usize> {
-        Some(self.parked_background_tasks(runtime_id).await.len())
+        self.parked_reclamation_task_count(runtime_id).await
     }
 
     async fn send_identified_input(

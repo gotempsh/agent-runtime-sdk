@@ -43,3 +43,8 @@ once. Custom executors default to an unknown background-task count, which blocks
 automatic reclamation; implement `retained_background_task_count` only when the
 executor can report that fact authoritatively. Explicit disposal remains a
 cancellation operation. Snapshots are advisory and do not authorize disposal.
+
+Provider follow-ups are protected even after their last background task ID drains.
+Pending answers, buffered continuations and queued interactions report unknown
+reclamation state rather than zero. The provider regression consumes the original
+follow-up after attempted reclamation and asserts one process and one prompt.
