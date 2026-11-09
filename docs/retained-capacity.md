@@ -59,3 +59,15 @@ failure leaves that ownership available for explicit retry; an empty provider
 registry cannot falsely confirm termination. The real-supervisor regression
 checks both cancellation and timeout, blocks identity reuse during retry, then
 releases it only after the transport acknowledgement.
+
+Diagnostics release the registry and state locks before executor observations.
+The page shares a one-second observation budget and reports unknown when it
+expires; weak page references do not count as attached owners. Buffered events,
+not only explicit follow-up flags, protect pending provider output.
+
+Clients sharing the same built-in AgentRuntime now share identity claims:
+acquiring an already-owned provider runtime ID returns RuntimeAlreadyExists.
+Use the owning client for attach/resume, or dispose successfully before moving
+that identity to another client. Failed/cancelled cleanup retains the claim.
+Custom executors using independent provider namespaces keep their existing
+behavior; shared namespaces must fence identity ownership as well.

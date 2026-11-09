@@ -478,12 +478,37 @@ pub enum DisposeOutcome {
     NotFound,
 }
 
+/// Ownership of one provider identity across registries sharing an executor.
+/// Dropping the claim releases that identity; successful disposal releases it
+/// early so old, already-disposed handles cannot hold up a replacement.
+pub struct RetainedIdentityClaim {
+    pub(crate) owners: Arc<std::sync::Mutex<HashSet<RuntimeId>>>,
+    pub(crate) runtime_id: RuntimeId,
+}
+impl Drop for RetainedIdentityClaim {
+    fn drop(&mut self) {
+        self.owners
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.runtime_id);
+    }
+}
+
 /// Executor used by an in-process retained-runtime host.
 ///
 /// Implementations must preserve the existing event backpressure and
 /// interaction contracts. [`AgentRuntime`] implements this trait directly.
 #[async_trait]
 pub trait RuntimeTurnExecutor: Send + Sync {
+    /// Fence provider identity when multiple registries share this executor.
+    /// Custom executors with independent provider namespaces may use the default.
+    fn claim_retained_identity(
+        &self,
+        _runtime_id: &RuntimeId,
+    ) -> RetainedRuntimeResult<Option<RetainedIdentityClaim>> {
+        Ok(None)
+    }
+
     /// Reports driver behavior for the selected provider.
     fn capabilities(&self, provider: Provider) -> RuntimeDriverCapabilities;
 
@@ -573,6 +598,23 @@ pub trait RuntimeTurnExecutor: Send + Sync {
 
 #[async_trait]
 impl RuntimeTurnExecutor for AgentRuntime {
+    fn claim_retained_identity(
+        &self,
+        runtime_id: &RuntimeId,
+    ) -> RetainedRuntimeResult<Option<RetainedIdentityClaim>> {
+        let mut owners = self
+            .retained_identity_owners
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !owners.insert(runtime_id.clone()) {
+            return Err(lifecycle_failure(Some(runtime_id.clone()), None, RuntimeFailureKind::RuntimeAlreadyExists, RetryAdvice::Never, DeliveryState::NotSent, "this provider runtime identity belongs to another retained client; use that client or dispose it before reacquiring"));
+        }
+        Ok(Some(RetainedIdentityClaim {
+            owners: self.retained_identity_owners.clone(),
+            runtime_id: runtime_id.clone(),
+        }))
+    }
+
     async fn retained_background_task_count(&self, runtime_id: &RuntimeId) -> Option<usize> {
         self.parked_reclamation_task_count(runtime_id).await
     }
@@ -765,20 +807,41 @@ async fn snapshot_registry(
     let total = registry.len();
     let mut entries: Vec<_> = registry.values().collect();
     entries.sort_by(|a, b| a.spec.runtime_id.as_str().cmp(b.spec.runtime_id.as_str()));
+    // Snapshot references must not become borrowers or hold up admission while
+    // an entry is busy delivering input. Entries removed meanwhile are omitted.
+    let entries: Vec<_> = entries
+        .into_iter()
+        .skip(offset)
+        .take(limit.min(100))
+        .map(|entry| (Arc::downgrade(entry), Arc::strong_count(entry) != 1))
+        .collect();
+    drop(registry);
+    let observation_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
     let mut rows = Vec::new();
-    for entry in entries.into_iter().skip(offset).take(limit.min(100)) {
+    for (entry, borrowed) in entries {
+        let Some(entry) = entry.upgrade() else {
+            continue;
+        };
         let state = entry.state.lock().await;
-        let borrowed = Arc::strong_count(entry) != 1;
-        let background_tasks = entry
-            .executor
-            .retained_background_task_count(&entry.spec.runtime_id)
-            .await;
+        let status = state.status;
+        let invocation_kind = state.active.as_ref().map(|active| active.kind);
+        let inactive = state.active.is_none();
+        drop(state);
+        let background_tasks = tokio::time::timeout_at(
+            observation_deadline,
+            entry
+                .executor
+                .retained_background_task_count(&entry.spec.runtime_id),
+        )
+        .await
+        .ok()
+        .flatten();
         let reclaim_eligible = !borrowed
             && !entry.disposed.load(Ordering::Acquire)
-            && state.active.is_none()
+            && inactive
             && background_tasks == Some(0)
             && matches!(
-                state.status,
+                status,
                 RuntimeStatus::Ready | RuntimeStatus::Stopped | RuntimeStatus::Failed
             );
         rows.push(RetainedRuntimeObservation {
@@ -789,8 +852,8 @@ async fn snapshot_registry(
             runtime_id: entry.spec.runtime_id.clone(),
             provider: entry.spec.provider,
             model: entry.spec.model.clone(),
-            status: state.status,
-            invocation_kind: state.active.as_ref().map(|active| active.kind),
+            status,
+            invocation_kind,
             retained_at_unix_ms: entry.retained_at_unix_ms,
             last_used_at_unix_ms: entry.last_used_at_unix_ms.load(Ordering::Relaxed),
         });
@@ -966,7 +1029,8 @@ impl RuntimeClient for InProcessRuntimeClient {
                 ),
             ));
         }
-        let entry = Arc::new(RuntimeEntry::new(spec, Arc::clone(&self.executor)));
+        let claim = self.executor.claim_retained_identity(&runtime_id)?;
+        let entry = Arc::new(RuntimeEntry::new(spec, Arc::clone(&self.executor), claim));
         runtimes.insert(runtime_id, Arc::clone(&entry));
         Ok(RuntimeHandle::in_process(entry))
     }
@@ -1578,6 +1642,7 @@ struct RuntimeEntry {
     executor: Arc<dyn RuntimeTurnExecutor>,
     state: Mutex<EntryState>,
     disposal_completed: Mutex<bool>,
+    identity_claim: Mutex<Option<RetainedIdentityClaim>>,
     disposed: Arc<AtomicBool>,
 }
 
@@ -1603,7 +1668,11 @@ struct ActiveTurn {
 }
 
 impl RuntimeEntry {
-    fn new(spec: RuntimeSpec, executor: Arc<dyn RuntimeTurnExecutor>) -> Self {
+    fn new(
+        spec: RuntimeSpec,
+        executor: Arc<dyn RuntimeTurnExecutor>,
+        claim: Option<RetainedIdentityClaim>,
+    ) -> Self {
         let provider_session_id = spec.provider_session_id.clone();
         Self {
             retained_at_unix_ms: unix_time_ms(),
@@ -1619,6 +1688,7 @@ impl RuntimeEntry {
                 recent_invocation_order: VecDeque::new(),
             }),
             disposal_completed: Mutex::new(false),
+            identity_claim: Mutex::new(claim),
             disposed: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -1683,6 +1753,7 @@ impl RuntimeEntry {
             });
         let result = confirmation.and(cleanup);
         if result.is_ok() {
+            self.identity_claim.lock().await.take();
             *completed = true;
         }
         result
@@ -3976,6 +4047,10 @@ mod disposal_race_tests {
     impl RuntimeTurnExecutor for PausedCleanup {
         async fn retained_background_task_count(&self, _: &RuntimeId) -> Option<usize> {
             let count = self.background.load(Ordering::SeqCst);
+            if count == u64::MAX - 1 {
+                self.entered.add_permits(1);
+                std::future::pending::<()>().await;
+            }
             (count != u64::MAX)
                 .then(|| usize::try_from(count).ok())
                 .flatten()
@@ -4013,6 +4088,67 @@ mod disposal_race_tests {
             Ok(())
         }
     }
+    #[tokio::test]
+    async fn clients_sharing_an_executor_cannot_own_the_same_runtime_identity() {
+        let runtime = AgentRuntime::builder().build().unwrap();
+        let first = InProcessRuntimeClient::new(runtime.clone());
+        let second = InProcessRuntimeClient::new(runtime);
+        let id = RuntimeId::new("shared-id").unwrap();
+        let spec = RuntimeSpec::new(id.clone(), Provider::Claude, ".");
+        let old_handle = first.acquire(spec.clone()).await.unwrap();
+        assert!(
+            second.acquire(spec.clone()).await.is_err(),
+            "a second registry must not control the same provider identity"
+        );
+        first.dispose(&id).await.unwrap();
+        let replacement = second.acquire(spec).await.unwrap();
+        drop(old_handle);
+        assert!(second.attach(&id).await.is_ok());
+        drop(replacement);
+        second.dispose(&id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn diagnostics_do_not_hold_admission_locks_during_observation() {
+        let executor = Arc::new(PausedCleanup::ready());
+        executor.background.store(u64::MAX - 1, Ordering::SeqCst);
+        let client = InProcessRuntimeClient::from_executor(executor.clone());
+        let id = RuntimeId::new("observed").unwrap();
+        let handle = client
+            .acquire(RuntimeSpec::new(id.clone(), Provider::Claude, "."))
+            .await
+            .unwrap();
+        let snapshot = tokio::spawn({
+            let client = client.clone();
+            async move { client.retained_snapshot(0, 100).await }
+        });
+        executor.entered.acquire().await.unwrap().forget();
+        let another = tokio::time::timeout(
+            Duration::from_millis(100),
+            client.acquire(RuntimeSpec::new(
+                RuntimeId::new("unrelated").unwrap(),
+                Provider::Claude,
+                ".",
+            )),
+        )
+        .await
+        .expect("diagnostics must not block unrelated admission")
+        .unwrap();
+        tokio::time::timeout(Duration::from_millis(100), handle.health())
+            .await
+            .expect("diagnostics must not hold entry state");
+        let rows = tokio::time::timeout(Duration::from_secs(2), snapshot)
+            .await
+            .expect("observation is bounded")
+            .unwrap()
+            .2;
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].borrowed);
+        assert_eq!(rows[0].background_tasks, None);
+        assert!(!rows[0].reclaim_eligible);
+        drop(another);
+    }
+
     #[tokio::test]
     async fn idle_reclamation_preserves_borrowers_background_and_uncertain_cleanup() {
         let executor = Arc::new(PausedCleanup::ready());

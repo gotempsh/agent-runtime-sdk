@@ -2515,6 +2515,7 @@ impl AgentRuntimeBuilder {
                 })
         });
         Ok(AgentRuntime {
+            retained_identity_owners: Arc::new(Mutex::new(std::collections::HashSet::new())),
             adapters: self.adapters,
             transport: self.transport,
             permits: Arc::new(Semaphore::new(self.concurrency_limit)),
@@ -2859,6 +2860,8 @@ fn retain_installed_agents(groups: &mut Vec<HarnessControlGroup>, installed: &[S
 /// Bounded process runtime shared by all provider adapters.
 #[derive(Clone)]
 pub struct AgentRuntime {
+    pub(crate) retained_identity_owners:
+        Arc<Mutex<std::collections::HashSet<crate::lifecycle::RuntimeId>>>,
     adapters: HashMap<Provider, Arc<dyn AgentAdapter>>,
     transport: Arc<dyn ExecutionTransport>,
     permits: Arc<Semaphore>,
@@ -3016,7 +3019,7 @@ impl AgentRuntime {
             .parked
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if parked.follow_up || !parked.interactions.is_empty() {
+        if parked.follow_up || !parked.interactions.is_empty() || !parked.events.is_empty() {
             return None;
         }
         Some(0)
@@ -10807,6 +10810,48 @@ mod tests {
             drop(client.acquire(spec).await.unwrap());
             client.dispose(&id).await.unwrap();
         }
+    }
+
+    #[cfg(feature = "claude")]
+    #[tokio::test]
+    async fn buffered_task_events_protect_a_parked_runtime_without_follow_up_flags() {
+        let (adapter, process) = parked_claude_process();
+        *process.handoff.inherited.lock().unwrap() = None;
+        process
+            .handoff
+            .parked
+            .lock()
+            .unwrap()
+            .events
+            .push_back(TurnEvent::Warning {
+                message: "background task changed".into(),
+            });
+        let mut builder = AgentRuntime::builder();
+        builder.register(adapter);
+        let runtime = builder
+            .provider_process_retention(ProviderProcessRetention {
+                max_processes: 2,
+                idle_timeout: Duration::from_secs(30),
+                initialization_timeout: Duration::from_secs(2),
+                active_inactivity_timeout: None,
+                held_task_quiet_timeout: None,
+            })
+            .build()
+            .unwrap();
+        let id = crate::lifecycle::RuntimeId::new("buffered-event").unwrap();
+        runtime
+            .codex_process_retention
+            .as_ref()
+            .unwrap()
+            .inner
+            .processes
+            .lock()
+            .await
+            .insert(id.clone(), process.clone());
+        assert_eq!(runtime.parked_reclamation_task_count(&id).await, None);
+        process.handoff.parked.lock().unwrap().events.clear();
+        assert_eq!(runtime.parked_reclamation_task_count(&id).await, Some(0));
+        runtime.dispose_retained_process(&id).await.unwrap();
     }
 
     #[cfg(feature = "claude")]
