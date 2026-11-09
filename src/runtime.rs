@@ -246,9 +246,13 @@ impl CodexProcessSupervisor {
     }
 
     async fn dispose(&self, runtime_id: &crate::lifecycle::RuntimeId) -> Result<()> {
-        let process = self.inner.processes.lock().await.remove(runtime_id);
+        // Keep the exact process owned until termination is acknowledged.
+        // Cancellation or transport failure must leave something a retry can
+        // terminate, rather than turning an absent entry into false success.
+        let process = self.inner.processes.lock().await.get(runtime_id).cloned();
         if let Some(process) = process {
             process.terminate().await?;
+            self.remove_if_same(runtime_id, &process).await;
         }
         Ok(())
     }
@@ -1284,7 +1288,8 @@ impl RetainedCodexProcess {
     async fn terminate(&self) -> Result<()> {
         self.usable.store(false, Ordering::Release);
         self.generation.fetch_add(1, Ordering::AcqRel);
-        if let Some(mut io) = self.io.lock().await.take() {
+        let mut owned_io = self.io.lock().await;
+        if let Some(io) = owned_io.as_mut() {
             if let Some(stderr) = &io.stderr_task {
                 stderr.abort();
             }
@@ -1298,6 +1303,9 @@ impl RetainedCodexProcess {
                     provider: Provider::Codex,
                     source,
                 })?;
+            // Do not take the transport before the awaited acknowledgement:
+            // a cancelled future must leave it available to the next retry.
+            owned_io.take();
         }
         Ok(())
     }
@@ -2507,6 +2515,7 @@ impl AgentRuntimeBuilder {
                 })
         });
         Ok(AgentRuntime {
+            retained_identity_owners: Arc::new(Mutex::new(std::collections::HashSet::new())),
             adapters: self.adapters,
             transport: self.transport,
             permits: Arc::new(Semaphore::new(self.concurrency_limit)),
@@ -2851,6 +2860,8 @@ fn retain_installed_agents(groups: &mut Vec<HarnessControlGroup>, installed: &[S
 /// Bounded process runtime shared by all provider adapters.
 #[derive(Clone)]
 pub struct AgentRuntime {
+    pub(crate) retained_identity_owners:
+        Arc<Mutex<std::collections::HashSet<crate::lifecycle::RuntimeId>>>,
     adapters: HashMap<Provider, Arc<dyn AgentAdapter>>,
     transport: Arc<dyn ExecutionTransport>,
     permits: Arc<Semaphore>,
@@ -2963,6 +2974,55 @@ impl AgentRuntime {
             .as_ref()
             .map(|state| adapter.retained_background_task_ids(state))
             .unwrap_or_default()
+    }
+
+    /// A conservative reclamation observation, distinct from the task-ID list.
+    /// Unknown means that pending or buffered provider output must be consumed
+    /// before this runtime can be reclaimed, even when no task IDs remain.
+    pub(crate) async fn parked_reclamation_task_count(
+        &self,
+        runtime_id: &crate::lifecycle::RuntimeId,
+    ) -> Option<usize> {
+        let Some(supervisor) = &self.codex_process_retention else {
+            return Some(0);
+        };
+        let Some(process) = supervisor
+            .inner
+            .processes
+            .lock()
+            .await
+            .get(runtime_id)
+            .cloned()
+        else {
+            return Some(0);
+        };
+        let adapter = self.adapters.get(&process.provider)?;
+        let inherited = process
+            .handoff
+            .inherited
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Ordinary completed turns deliberately carry no parser state. They
+        // are idle, not unknown; active turns are fenced by the retained entry.
+        if let Some(state) = inherited.as_ref() {
+            let count = adapter.retained_background_task_ids(state).len();
+            if count > 0 {
+                return Some(count);
+            }
+            if adapter.retained_background_work(state) || adapter.retained_follow_up_pending(state)
+            {
+                return None;
+            }
+        }
+        let parked = process
+            .handoff
+            .parked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if parked.follow_up || !parked.interactions.is_empty() || !parked.events.is_empty() {
+            return None;
+        }
+        Some(0)
     }
 
     /// Inspect one compiled adapter inside the configured execution transport.
@@ -10648,6 +10708,152 @@ mod tests {
 
     /// A parked Claude process on fake streams, its output already closed,
     /// still running background shell `sh-1`, and the adapter tracking it.
+    #[cfg(feature = "claude")]
+    #[tokio::test]
+    async fn cancelled_idle_cleanup_retries_the_owned_transport_before_releasing_identity() {
+        use crate::retained::{InProcessRuntimeClient, RuntimeClient, RuntimeSpec};
+        struct DelayedTermination(Arc<Notify>, Arc<Notify>);
+        #[async_trait::async_trait]
+        impl crate::TransportProcessControl for DelayedTermination {
+            async fn wait(&mut self) -> crate::TransportResult<crate::TransportExitStatus> {
+                std::future::pending().await
+            }
+            async fn terminate(&mut self) -> crate::TransportResult<()> {
+                self.0.notify_one();
+                self.1.notified().await;
+                Ok(())
+            }
+        }
+        for let_timeout_expire in [false, true] {
+            let entered = Arc::new(Notify::new());
+            let release = Arc::new(Notify::new());
+            let (adapter, process) = parked_claude_process();
+            *process.handoff.inherited.lock().unwrap() = None;
+            process.io.lock().await.as_mut().unwrap().process = crate::TransportProcess::new(
+                crate::TransportProcessHandle {
+                    transport: "delayed".into(),
+                    native_id: "owned".into(),
+                },
+                None,
+                None,
+                Box::new(tokio::io::empty()),
+                Box::new(tokio::io::empty()),
+                DelayedTermination(entered.clone(), release.clone()),
+            );
+            let mut builder = AgentRuntime::builder();
+            builder.register(adapter);
+            let runtime = builder
+                .provider_process_retention(ProviderProcessRetention {
+                    max_processes: 2,
+                    idle_timeout: Duration::from_secs(30),
+                    initialization_timeout: Duration::from_secs(2),
+                    active_inactivity_timeout: None,
+                    held_task_quiet_timeout: None,
+                })
+                .build()
+                .unwrap();
+            let id = crate::lifecycle::RuntimeId::new("cancel-cleanup").unwrap();
+            let client = InProcessRuntimeClient::new(runtime.clone());
+            let spec = RuntimeSpec::new(id.clone(), Provider::Claude, ".");
+            drop(client.acquire(spec.clone()).await.unwrap());
+            let supervisor = runtime.codex_process_retention.as_ref().unwrap();
+            supervisor
+                .inner
+                .processes
+                .lock()
+                .await
+                .insert(id.clone(), process.clone());
+            let first = tokio::spawn({
+                let client = client.clone();
+                let id = id.clone();
+                async move { client.try_dispose_idle(&id).await }
+            });
+            tokio::time::timeout(Duration::from_secs(1), entered.notified())
+                .await
+                .unwrap();
+            if let_timeout_expire {
+                assert!(tokio::time::timeout(Duration::from_secs(7), first)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .is_err());
+            } else {
+                first.abort();
+                assert!(first.await.unwrap_err().is_cancelled());
+            }
+            assert!(
+                supervisor.inner.processes.lock().await.contains_key(&id),
+                "cancelled cleanup must retain provider ownership"
+            );
+            assert!(
+                process.io.lock().await.is_some(),
+                "transport acknowledgement is still outstanding"
+            );
+            let retry = tokio::spawn({
+                let client = client.clone();
+                let id = id.clone();
+                async move { client.dispose(&id).await }
+            });
+            tokio::time::timeout(Duration::from_secs(1), entered.notified())
+                .await
+                .unwrap();
+            assert!(!retry.is_finished());
+            assert!(client.acquire(spec.clone()).await.is_err());
+            release.notify_one();
+            tokio::time::timeout(Duration::from_secs(1), retry)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert!(!supervisor.inner.processes.lock().await.contains_key(&id));
+            assert!(process.io.lock().await.is_none());
+            drop(client.acquire(spec).await.unwrap());
+            client.dispose(&id).await.unwrap();
+        }
+    }
+
+    #[cfg(feature = "claude")]
+    #[tokio::test]
+    async fn buffered_task_events_protect_a_parked_runtime_without_follow_up_flags() {
+        let (adapter, process) = parked_claude_process();
+        *process.handoff.inherited.lock().unwrap() = None;
+        process
+            .handoff
+            .parked
+            .lock()
+            .unwrap()
+            .events
+            .push_back(TurnEvent::Warning {
+                message: "background task changed".into(),
+            });
+        let mut builder = AgentRuntime::builder();
+        builder.register(adapter);
+        let runtime = builder
+            .provider_process_retention(ProviderProcessRetention {
+                max_processes: 2,
+                idle_timeout: Duration::from_secs(30),
+                initialization_timeout: Duration::from_secs(2),
+                active_inactivity_timeout: None,
+                held_task_quiet_timeout: None,
+            })
+            .build()
+            .unwrap();
+        let id = crate::lifecycle::RuntimeId::new("buffered-event").unwrap();
+        runtime
+            .codex_process_retention
+            .as_ref()
+            .unwrap()
+            .inner
+            .processes
+            .lock()
+            .await
+            .insert(id.clone(), process.clone());
+        assert_eq!(runtime.parked_reclamation_task_count(&id).await, None);
+        process.handoff.parked.lock().unwrap().events.clear();
+        assert_eq!(runtime.parked_reclamation_task_count(&id).await, Some(0));
+        runtime.dispose_retained_process(&id).await.unwrap();
+    }
+
     #[cfg(feature = "claude")]
     fn parked_claude_process() -> (crate::providers::Claude, Arc<RetainedCodexProcess>) {
         parked_claude_process_reading(Box::new(tokio::io::empty()))

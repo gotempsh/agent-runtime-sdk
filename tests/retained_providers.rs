@@ -60,6 +60,7 @@ def shell(follow_up):
  emit({'type':'system','subtype':'background_tasks_changed','tasks':[]})
  emit({'type':'system','subtype':'task_notification','task_id':'sh-1','status':'completed','summary':'server exited'})
  log('shell-finished')
+ while os.path.exists(RELEASE+'-hold'):time.sleep(.02)
  if follow_up:
   emit({'type':'system','subtype':'init','session_id':'fixture-session'})
   emit({'type':'assistant','parent_tool_use_id':None,'message':{'content':[{'type':'text','text':'SHELL-FOLLOWUP'}]}})
@@ -1739,4 +1740,169 @@ async fn retained_reclassification_remains_secret_after_downgrade() {
             f.dispose().await;
         }
     }
+}
+
+#[tokio::test]
+async fn idle_capacity_cleanup_preserves_a_real_parked_shell_and_session() {
+    let mut f = Fixture::new(true, Duration::from_secs(30)).await;
+    assert_eq!(f.turn("park", "spawn-shell").await.unwrap().text, "SERVING");
+    f.wait_for_log("shell-start").await;
+    let id = RuntimeId::new("claude-native").unwrap();
+    let dummy = f
+        .client
+        .acquire(RuntimeSpec::new(
+            RuntimeId::new("unused-handle").unwrap(),
+            Provider::Claude,
+            f.dir.path(),
+        ))
+        .await
+        .unwrap();
+    drop(std::mem::replace(&mut f.handle, dummy));
+    // Wait only for the completed invocation's sender to release its internal
+    // handle, then prove the parked task rather than a borrow protects it.
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let rows = f.client.retained_snapshot(0, 100).await.2;
+            if rows.iter().any(|row| row.runtime_id == id && !row.borrowed) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("completed invocation releases its handle");
+    assert!(!f.client.try_dispose_idle(&id).await.unwrap());
+    let snapshot = f.client.retained_snapshot(0, 100).await.2;
+    let observed = snapshot.iter().find(|row| row.runtime_id == id).unwrap();
+    assert_eq!(observed.background_tasks, Some(1));
+    assert!(!observed.reclaim_eligible);
+    assert_eq!(f.logged("shell-finished"), 0);
+    f.handle = f.client.attach(&id).await.unwrap();
+    assert!(f
+        .turn("resume", "second")
+        .await
+        .unwrap()
+        .text
+        .contains("reply:second"));
+    assert_eq!(
+        f.spawns().len(),
+        1,
+        "capacity observation must preserve the same provider process"
+    );
+    assert_eq!(f.logged("shell-finished"), 0);
+    f.dispose().await;
+}
+
+#[tokio::test]
+async fn idle_capacity_cleanup_preserves_a_buffered_follow_up() {
+    let mut f = Fixture::new(true, Duration::from_secs(30)).await;
+    let mut follow_ups = f.runtime.subscribe_background_follow_ups();
+    assert_eq!(f.turn("park", "spawn-shell").await.unwrap().text, "SERVING");
+    f.wait_for_log("shell-start").await;
+    let id = RuntimeId::new("claude-native").unwrap();
+    let dummy = f
+        .client
+        .acquire(RuntimeSpec::new(
+            RuntimeId::new("unused").unwrap(),
+            Provider::Claude,
+            f.dir.path(),
+        ))
+        .await
+        .unwrap();
+    drop(std::mem::replace(&mut f.handle, dummy));
+    // The fixture's release path is derived below; keep the provider between
+    // its terminal task notification and the follow-up answer.
+    let hold = std::path::PathBuf::from(format!("{}-hold", f.release.display()));
+    std::fs::write(&hold, "hold").unwrap();
+    f.release_background();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !f.runtime.parked_background_tasks(&id).await.is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        !f.client.try_dispose_idle(&id).await.unwrap(),
+        "awaiting follow-up must prevent reclamation"
+    );
+    std::fs::remove_file(hold).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), follow_ups.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        f.runtime.parked_background_tasks(&id).await,
+        [] as [String; 0]
+    );
+    assert!(
+        !f.client.try_dispose_idle(&id).await.unwrap(),
+        "zero task IDs must not discard the original follow-up"
+    );
+    f.handle = f.client.attach(&id).await.unwrap();
+    let (_, result) = Running::new(
+        f.handle
+            .start_turn(Fixture::continuation("original-follow-up"))
+            .await
+            .unwrap(),
+    )
+    .finish()
+    .await;
+    assert_eq!(result.unwrap().text, "SHELL-FOLLOWUP");
+    assert_eq!(f.spawns().len(), 1);
+    assert_eq!(
+        f.events().iter().filter(|v| v["kind"] == "prompt").count(),
+        1
+    );
+    f.dispose().await;
+}
+
+#[tokio::test]
+async fn idle_capacity_cleanup_reclaims_more_than_256_completed_provider_entries() {
+    let f = Fixture::new(true, Duration::from_secs(30)).await;
+    for index in 0..257 {
+        let id = RuntimeId::new(format!("completed-{index}")).unwrap();
+        let handle = f
+            .client
+            .acquire(RuntimeSpec::new(id.clone(), Provider::Claude, f.dir.path()))
+            .await
+            .unwrap();
+        let (_, result) = Running::new(
+            handle
+                .start_turn(Fixture::input("original", "plain"))
+                .await
+                .unwrap(),
+        )
+        .finish()
+        .await;
+        assert_eq!(result.unwrap().text, "reply:plain");
+        drop(handle);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if f.client
+                    .retained_snapshot(0, 100)
+                    .await
+                    .2
+                    .iter()
+                    .any(|row| row.runtime_id == id && !row.borrowed)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            f.client.try_dispose_idle(&id).await.unwrap(),
+            "completed runtime {index} remains reclaimable before provider idle expiry"
+        );
+        assert_eq!(f.client.retained_snapshot(0, 100).await.0, 1);
+    }
+    assert_eq!(
+        f.events().iter().filter(|v| v["kind"] == "prompt").count(),
+        257
+    );
+    f.dispose().await;
 }
