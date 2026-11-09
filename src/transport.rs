@@ -452,6 +452,7 @@ impl ExecutionTransport for LocalTransport {
             LocalProcessControl {
                 child,
                 process_tree,
+                termination: LocalTermination::default(),
             },
         ))
     }
@@ -533,6 +534,51 @@ fn directory_parent_and_prefix(path: &Path, trailing_separator: bool) -> (PathBu
 struct LocalProcessControl {
     child: Child,
     process_tree: crate::process::ProcessTreeGuard,
+    termination: LocalTermination,
+}
+
+#[derive(Default)]
+struct LocalTermination {
+    task: Option<tokio::task::JoinHandle<()>>,
+    failure: Option<String>,
+    completed: bool,
+}
+impl LocalTermination {
+    async fn finish(
+        &mut self,
+        guard: &mut crate::process::ProcessTreeGuard,
+    ) -> TransportResult<()> {
+        if let Some(error) = &self.failure {
+            return Err(TransportError::local(
+                "terminate",
+                std::io::Error::other(error.clone()),
+            ));
+        }
+        if self.completed {
+            return Ok(());
+        }
+        let task = self.task.get_or_insert_with(|| {
+            let mut owned = std::mem::take(guard);
+            tokio::task::spawn_blocking(move || owned.terminate())
+        });
+        // Await by reference: cancellation must not detach the acknowledgement.
+        let result = task.await;
+        self.task.take();
+        match result {
+            Ok(()) => {
+                self.completed = true;
+                Ok(())
+            }
+            Err(error) => {
+                let message = error.to_string();
+                self.failure = Some(message.clone());
+                Err(TransportError::local(
+                    "terminate",
+                    std::io::Error::other(message),
+                ))
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -546,10 +592,7 @@ impl TransportProcessControl for LocalProcessControl {
     }
 
     async fn terminate(&mut self) -> TransportResult<()> {
-        self.process_tree
-            .terminate_async()
-            .await
-            .map_err(|error| TransportError::local("terminate", std::io::Error::other(error)))
+        self.termination.finish(&mut self.process_tree).await
     }
 
     fn disarm(&mut self) {
@@ -623,6 +666,39 @@ fn resolve_local_executable(program: &Path) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn local_termination_retry_awaits_the_original_blocking_cleanup() {
+        let (release, blocked) = std::sync::mpsc::channel();
+        let mut termination = super::LocalTermination {
+            task: Some(tokio::task::spawn_blocking(move || {
+                blocked.recv().unwrap();
+            })),
+            ..Default::default()
+        };
+        let mut guard = crate::process::ProcessTreeGuard::default();
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            termination.finish(&mut guard)
+        )
+        .await
+        .is_err());
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            termination.finish(&mut guard)
+        )
+        .await
+        .is_err());
+        release.send(()).unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            termination.finish(&mut guard),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        termination.finish(&mut guard).await.unwrap();
+    }
+
     use super::*;
 
     #[tokio::test]

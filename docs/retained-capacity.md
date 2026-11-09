@@ -71,3 +71,10 @@ Use the owning client for attach/resume, or dispose successfully before moving
 that identity to another client. Failed/cancelled cleanup retains the claim.
 Custom executors using independent provider namespaces keep their existing
 behavior; shared namespaces must fence identity ownership as well.
+
+The page deadline also bounds entry-state lock acquisition. Entries whose state
+cannot be read within that budget are omitted; total remains the registry count
+at page selection, so a partial page is not evidence of fewer retained slots.
+Local transport termination retains the blocking process-tree cleanup task and
+awaits that same acknowledgement after cancellation; failed joins remain failed
+rather than becoming a successful empty-guard retry.

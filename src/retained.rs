@@ -822,7 +822,10 @@ async fn snapshot_registry(
         let Some(entry) = entry.upgrade() else {
             continue;
         };
-        let state = entry.state.lock().await;
+        let Ok(state) = tokio::time::timeout_at(observation_deadline, entry.state.lock()).await
+        else {
+            continue;
+        };
         let status = state.status;
         let invocation_kind = state.active.as_ref().map(|active| active.kind);
         let inactive = state.active.is_none();
@@ -4106,6 +4109,25 @@ mod disposal_race_tests {
         assert!(second.attach(&id).await.is_ok());
         drop(replacement);
         second.dispose(&id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn snapshot_state_wait_is_bounded_without_blocking_other_admission() {
+        let client = InProcessRuntimeClient::from_executor(Arc::new(PausedCleanup::ready()));
+        let id = RuntimeId::new("locked-state").unwrap();
+        let handle = client
+            .acquire(RuntimeSpec::new(id.clone(), Provider::Claude, "."))
+            .await
+            .unwrap();
+        let entry = client.runtimes.read().await.get(&id).unwrap().clone();
+        let _state = entry.state.lock().await;
+        let snapshot =
+            tokio::time::timeout(Duration::from_secs(2), client.retained_snapshot(0, 100))
+                .await
+                .expect("state wait shares page deadline");
+        assert_eq!(snapshot.0, 1);
+        assert_eq!(snapshot.2.len(), 0);
+        drop(handle);
     }
 
     #[tokio::test]
