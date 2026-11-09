@@ -1832,7 +1832,10 @@ async fn idle_capacity_cleanup_preserves_a_buffered_follow_up() {
         .unwrap()
         .unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
-    assert!(f.runtime.parked_background_tasks(&id).await.is_empty());
+    assert_eq!(
+        f.runtime.parked_background_tasks(&id).await,
+        [] as [String; 0]
+    );
     assert!(
         !f.client.try_dispose_idle(&id).await.unwrap(),
         "zero task IDs must not discard the original follow-up"
