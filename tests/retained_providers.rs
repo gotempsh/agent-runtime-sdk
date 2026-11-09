@@ -1740,3 +1740,54 @@ async fn retained_reclassification_remains_secret_after_downgrade() {
         }
     }
 }
+
+#[tokio::test]
+async fn idle_capacity_cleanup_preserves_a_real_parked_shell_and_session() {
+    let mut f = Fixture::new(true, Duration::from_secs(30)).await;
+    assert_eq!(f.turn("park", "spawn-shell").await.unwrap().text, "SERVING");
+    f.wait_for_log("shell-start").await;
+    let id = RuntimeId::new("claude-native").unwrap();
+    let dummy = f
+        .client
+        .acquire(RuntimeSpec::new(
+            RuntimeId::new("unused-handle").unwrap(),
+            Provider::Claude,
+            f.dir.path(),
+        ))
+        .await
+        .unwrap();
+    drop(std::mem::replace(&mut f.handle, dummy));
+    // Wait only for the completed invocation's sender to release its internal
+    // handle, then prove the parked task rather than a borrow protects it.
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let rows = f.client.retained_snapshot(0, 100).await.2;
+            if rows.iter().any(|row| row.runtime_id == id && !row.borrowed) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("completed invocation releases its handle");
+    assert!(!f.client.try_dispose_idle(&id).await.unwrap());
+    let snapshot = f.client.retained_snapshot(0, 100).await.2;
+    let observed = snapshot.iter().find(|row| row.runtime_id == id).unwrap();
+    assert_eq!(observed.background_tasks, Some(1));
+    assert!(!observed.reclaim_eligible);
+    assert_eq!(f.logged("shell-finished"), 0);
+    f.handle = f.client.attach(&id).await.unwrap();
+    assert!(f
+        .turn("resume", "second")
+        .await
+        .unwrap()
+        .text
+        .contains("reply:second"));
+    assert_eq!(
+        f.spawns().len(),
+        1,
+        "capacity observation must preserve the same provider process"
+    );
+    assert_eq!(f.logged("shell-finished"), 0);
+    f.dispose().await;
+}

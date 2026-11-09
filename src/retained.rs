@@ -513,6 +513,13 @@ pub trait RuntimeTurnExecutor: Send + Sync {
         self.execute(request, events, interactions).await
     }
 
+    /// Cheap, local observation of background work retained after a turn.
+    /// `None` means unknown and prevents automatic idle reclamation. This must
+    /// not call back into the retained client or perform external discovery.
+    async fn retained_background_task_count(&self, _runtime_id: &RuntimeId) -> Option<usize> {
+        None
+    }
+
     /// Release resources owned by one logical retained runtime.
     async fn dispose_retained(&self, _runtime_id: &RuntimeId) -> crate::Result<()> {
         Ok(())
@@ -566,6 +573,10 @@ pub trait RuntimeTurnExecutor: Send + Sync {
 
 #[async_trait]
 impl RuntimeTurnExecutor for AgentRuntime {
+    async fn retained_background_task_count(&self, runtime_id: &RuntimeId) -> Option<usize> {
+        Some(self.parked_background_tasks(runtime_id).await.len())
+    }
+
     async fn send_identified_input(
         &self,
         runtime_id: &RuntimeId,
@@ -695,7 +706,163 @@ pub struct InProcessRuntimeClient {
     max_runtimes: usize,
 }
 
+/// A read-only observation of the actual retained registry. Never includes secrets.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetainedRuntimeObservation {
+    /// Stable SDK runtime identity; no inferred owner.
+    pub runtime_id: RuntimeId,
+    /// Provider selected at acquisition.
+    pub provider: Provider,
+    /// Model selected at acquisition, when known.
+    pub model: Option<String>,
+    /// Observed runtime lifecycle state.
+    pub status: RuntimeStatus,
+    /// Kind of the active invocation, if any.
+    pub invocation_kind: Option<RuntimeInvocationKind>,
+    /// Time this registry entry was acquired.
+    pub retained_at_unix_ms: u64,
+    /// Time its latest invocation was accepted, or acquisition time.
+    pub last_used_at_unix_ms: u64,
+    /// An attached handle or invocation still owns this entry.
+    pub borrowed: bool,
+    /// Disposal has started; retained entries may be awaiting or have failed cleanup.
+    pub disposal_started: bool,
+    /// Local retained background work; unknown prevents automatic reclamation.
+    pub background_tasks: Option<usize>,
+    /// Snapshot only. `try_dispose_idle` rechecks atomically before disposal.
+    pub reclaim_eligible: bool,
+}
+
+/// Weak, read-only pool observation for retired host generations.
+#[derive(Clone)]
+pub struct RetainedRuntimeObserver {
+    runtimes: std::sync::Weak<RwLock<HashMap<RuntimeId, Arc<RuntimeEntry>>>>,
+    max_runtimes: usize,
+}
+impl RetainedRuntimeObserver {
+    /// Whether a client still owns the registry. This does not keep it alive.
+    pub fn is_live(&self) -> bool {
+        self.runtimes.strong_count() > 0
+    }
+    /// Bounded actual-registry snapshot, or None after the owner released it.
+    pub async fn snapshot(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Option<(usize, usize, Vec<RetainedRuntimeObservation>)> {
+        let registry = self.runtimes.upgrade()?;
+        Some(snapshot_registry(&registry, self.max_runtimes, offset, limit).await)
+    }
+}
+
+async fn snapshot_registry(
+    runtimes: &Arc<RwLock<HashMap<RuntimeId, Arc<RuntimeEntry>>>>,
+    max_runtimes: usize,
+    offset: usize,
+    limit: usize,
+) -> (usize, usize, Vec<RetainedRuntimeObservation>) {
+    let registry = runtimes.read().await;
+    let total = registry.len();
+    let mut entries: Vec<_> = registry.values().collect();
+    entries.sort_by(|a, b| a.spec.runtime_id.as_str().cmp(b.spec.runtime_id.as_str()));
+    let mut rows = Vec::new();
+    for entry in entries.into_iter().skip(offset).take(limit.min(100)) {
+        let state = entry.state.lock().await;
+        let borrowed = Arc::strong_count(entry) != 1;
+        let background_tasks = entry
+            .executor
+            .retained_background_task_count(&entry.spec.runtime_id)
+            .await;
+        let reclaim_eligible = !borrowed
+            && !entry.disposed.load(Ordering::Acquire)
+            && state.active.is_none()
+            && background_tasks == Some(0)
+            && matches!(
+                state.status,
+                RuntimeStatus::Ready | RuntimeStatus::Stopped | RuntimeStatus::Failed
+            );
+        rows.push(RetainedRuntimeObservation {
+            borrowed,
+            background_tasks,
+            reclaim_eligible,
+            disposal_started: entry.disposed.load(Ordering::Acquire),
+            runtime_id: entry.spec.runtime_id.clone(),
+            provider: entry.spec.provider,
+            model: entry.spec.model.clone(),
+            status: state.status,
+            invocation_kind: state.active.as_ref().map(|active| active.kind),
+            retained_at_unix_ms: entry.retained_at_unix_ms,
+            last_used_at_unix_ms: entry.last_used_at_unix_ms.load(Ordering::Relaxed),
+        });
+    }
+    (total, max_runtimes, rows)
+}
+
 impl InProcessRuntimeClient {
+    /// Reclaim one unborrowed, inactive entry, without cancelling accepted work.
+    /// The registry write lock fences acquire/attach while ownership, lifecycle
+    /// and local background-work observations are checked. Unknown work is kept.
+    /// Returns false when missing or protected. Cleanup failure retains the
+    /// disposed entry as a tombstone until an explicit disposal succeeds.
+    pub async fn try_dispose_idle(&self, runtime_id: &RuntimeId) -> RetainedRuntimeResult<bool> {
+        let mut registry = self.runtimes.write().await;
+        let Some(entry) = registry.get(runtime_id) else {
+            return Ok(false);
+        };
+        if Arc::strong_count(entry) != 1 || entry.disposed.load(Ordering::Acquire) {
+            return Ok(false);
+        }
+        {
+            let state = entry.state.lock().await;
+            if state.active.is_some()
+                || !matches!(
+                    state.status,
+                    RuntimeStatus::Ready | RuntimeStatus::Stopped | RuntimeStatus::Failed
+                )
+            {
+                return Ok(false);
+            }
+        }
+        let background = tokio::time::timeout(
+            INTERRUPT_CONFIRMATION_TIMEOUT,
+            entry.executor.retained_background_task_count(runtime_id),
+        )
+        .await;
+        if !matches!(background, Ok(Some(0))) {
+            return Ok(false);
+        }
+        tokio::time::timeout(INTERRUPT_CONFIRMATION_TIMEOUT, entry.dispose())
+            .await
+            .map_err(|_| {
+                lifecycle_failure(
+                    Some(runtime_id.clone()),
+                    None,
+                    RuntimeFailureKind::Indeterminate,
+                    RetryAdvice::RequiresUserAction,
+                    DeliveryState::PossiblySent,
+                    "idle runtime cleanup was not confirmed; its retained identity is preserved",
+                )
+            })??;
+        registry.remove(runtime_id);
+        Ok(true)
+    }
+    /// Bounded stable-ID page; counts come from the same registry as acquire.
+    pub async fn retained_snapshot(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> (usize, usize, Vec<RetainedRuntimeObservation>) {
+        snapshot_registry(&self.runtimes, self.max_runtimes, offset, limit).await
+    }
+
+    /// Observe this pool without extending its lifetime or gaining control.
+    pub fn observer(&self) -> RetainedRuntimeObserver {
+        RetainedRuntimeObserver {
+            runtimes: Arc::downgrade(&self.runtimes),
+            max_runtimes: self.max_runtimes,
+        }
+    }
+
     /// Creates a retained client around the existing provider runtime.
     pub fn new(runtime: AgentRuntime) -> Self {
         Self::from_executor(Arc::new(runtime))
@@ -825,8 +992,14 @@ impl RuntimeClient for InProcessRuntimeClient {
             return Ok(DisposeOutcome::NotFound);
         };
         let result = entry.dispose().await;
-        self.runtimes.write().await.remove(runtime_id);
         result?;
+        let mut registry = self.runtimes.write().await;
+        if registry
+            .get(runtime_id)
+            .is_some_and(|current| Arc::ptr_eq(current, &entry))
+        {
+            registry.remove(runtime_id);
+        }
         Ok(DisposeOutcome::Disposed)
     }
 }
@@ -1399,9 +1572,12 @@ impl TurnHandle {
 }
 
 struct RuntimeEntry {
+    retained_at_unix_ms: u64,
+    last_used_at_unix_ms: AtomicU64,
     spec: RuntimeSpec,
     executor: Arc<dyn RuntimeTurnExecutor>,
     state: Mutex<EntryState>,
+    disposal_completed: Mutex<bool>,
     disposed: Arc<AtomicBool>,
 }
 
@@ -1415,6 +1591,7 @@ struct EntryState {
 }
 
 struct ActiveTurn {
+    kind: RuntimeInvocationKind,
     invocation_id: InvocationId,
     cancellation: CancellationToken,
     terminal: Arc<CompletionSignal>,
@@ -1429,6 +1606,8 @@ impl RuntimeEntry {
     fn new(spec: RuntimeSpec, executor: Arc<dyn RuntimeTurnExecutor>) -> Self {
         let provider_session_id = spec.provider_session_id.clone();
         Self {
+            retained_at_unix_ms: unix_time_ms(),
+            last_used_at_unix_ms: AtomicU64::new(unix_time_ms()),
             spec,
             executor,
             state: Mutex::new(EntryState {
@@ -1439,6 +1618,7 @@ impl RuntimeEntry {
                 recent_invocations: HashSet::new(),
                 recent_invocation_order: VecDeque::new(),
             }),
+            disposal_completed: Mutex::new(false),
             disposed: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -1454,6 +1634,10 @@ impl RuntimeEntry {
     }
 
     async fn dispose(&self) -> RetainedRuntimeResult<()> {
+        let mut completed = self.disposal_completed.lock().await;
+        if *completed {
+            return Ok(());
+        }
         self.disposed.store(true, Ordering::Release);
         let mut state = self.state.lock().await;
         let terminal = if let Some(active) = &state.active {
@@ -1497,7 +1681,11 @@ impl RuntimeEntry {
                     InvocationId::new("dispose").expect("static invocation id is valid"),
                 )
             });
-        confirmation.and(cleanup)
+        let result = confirmation.and(cleanup);
+        if result.is_ok() {
+            *completed = true;
+        }
+        result
     }
 
     async fn start_turn(
@@ -1592,7 +1780,10 @@ impl RuntimeEntry {
             }
             state.status = RuntimeStatus::Busy;
             state.detail = None;
+            self.last_used_at_unix_ms
+                .store(unix_time_ms(), Ordering::Relaxed);
             state.active = Some(ActiveTurn {
+                kind: input.invocation_kind,
                 invocation_id: input.invocation_id.clone(),
                 cancellation: cancellation.clone(),
                 terminal: Arc::clone(&terminal),
@@ -3706,5 +3897,312 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .is_empty());
+    }
+}
+
+#[cfg(test)]
+mod registry_snapshot_tests {
+    use super::*;
+    #[tokio::test]
+    async fn observer_follows_remaining_owner_without_retaining_pool() {
+        let client = InProcessRuntimeClient::new(AgentRuntime::builder().build().unwrap());
+        let owner = client.clone();
+        let observer = client.observer();
+        drop(client);
+        drop(
+            owner
+                .acquire(RuntimeSpec::new(
+                    RuntimeId::new("old-owner").unwrap(),
+                    Provider::Claude,
+                    ".",
+                ))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(observer.snapshot(0, 100).await.unwrap().0, 1);
+        drop(owner);
+        assert!(!observer.is_live());
+        assert!(observer.snapshot(0, 100).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn snapshot_counts_actual_entries_and_preserves_unknown_owners() {
+        let client = InProcessRuntimeClient::with_limits(
+            AgentRuntime::builder().build().unwrap(),
+            RetainedRuntimeLimits { max_runtimes: 128 },
+        )
+        .unwrap();
+        for i in 0..105 {
+            let spec = RuntimeSpec::new(
+                RuntimeId::new(format!("unknown-owner-{i:03}")).unwrap(),
+                Provider::Claude,
+                ".",
+            );
+            client.acquire(spec).await.unwrap();
+        }
+        let (used, cap, first) = client.retained_snapshot(0, usize::MAX).await;
+        assert_eq!((used, cap, first.len()), (105, 128, 100));
+        assert_eq!(first[0].runtime_id.as_str(), "unknown-owner-000");
+        let (_, _, tail) = client.retained_snapshot(100, 100).await;
+        assert_eq!(tail.len(), 5);
+        client.dispose(&first[0].runtime_id).await.unwrap();
+        assert_eq!(client.retained_snapshot(0, 0).await.0, 104);
+        assert!(client.retained_snapshot(999, 25).await.2.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod disposal_race_tests {
+    use super::*;
+    struct PausedCleanup {
+        entered: tokio::sync::Semaphore,
+        release: tokio::sync::Semaphore,
+        calls: AtomicU64,
+        background: AtomicU64,
+        fail_cleanup: AtomicBool,
+    }
+    impl PausedCleanup {
+        fn ready() -> Self {
+            Self {
+                entered: tokio::sync::Semaphore::new(0),
+                release: tokio::sync::Semaphore::new(1),
+                calls: AtomicU64::new(0),
+                background: AtomicU64::new(0),
+                fail_cleanup: AtomicBool::new(false),
+            }
+        }
+    }
+    #[async_trait]
+    impl RuntimeTurnExecutor for PausedCleanup {
+        async fn retained_background_task_count(&self, _: &RuntimeId) -> Option<usize> {
+            let count = self.background.load(Ordering::SeqCst);
+            (count != u64::MAX)
+                .then(|| usize::try_from(count).ok())
+                .flatten()
+        }
+        fn capabilities(&self, _: Provider) -> RuntimeDriverCapabilities {
+            RuntimeDriverCapabilities::default()
+        }
+        fn configuration_impact(&self, _: RuntimeConfigurationKey) -> ConfigurationImpact {
+            ConfigurationImpact::ReacquireRequired
+        }
+        async fn execute(
+            &self,
+            request: TurnRequest,
+            _: &dyn EventSink,
+            _: Option<&dyn InteractionHandler>,
+        ) -> crate::Result<TurnResult> {
+            Err(RuntimeError::Cancelled {
+                provider: request.provider,
+            })
+        }
+        async fn dispose_retained(&self, _: &RuntimeId) -> crate::Result<()> {
+            if self.fail_cleanup.swap(false, Ordering::SeqCst) {
+                return Err(RuntimeError::Cancelled {
+                    provider: Provider::Claude,
+                });
+            }
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.entered.add_permits(1);
+                self.release
+                    .acquire()
+                    .await
+                    .expect("release cleanup")
+                    .forget();
+            }
+            Ok(())
+        }
+    }
+    #[tokio::test]
+    async fn idle_reclamation_preserves_borrowers_background_and_uncertain_cleanup() {
+        let executor = Arc::new(PausedCleanup::ready());
+        let client = InProcessRuntimeClient::from_executor(executor.clone());
+        let id = RuntimeId::new("protected").unwrap();
+        let handle = client
+            .acquire(RuntimeSpec::new(id.clone(), Provider::Claude, "."))
+            .await
+            .unwrap();
+        let clone = handle.clone();
+        drop(handle);
+        assert!(!client.try_dispose_idle(&id).await.unwrap());
+        assert!(client.retained_snapshot(0, 1).await.2[0].borrowed);
+        drop(clone);
+        for background in [1, u64::MAX] {
+            executor.background.store(background, Ordering::SeqCst);
+            assert!(!client.try_dispose_idle(&id).await.unwrap());
+            assert!(!client.retained_snapshot(0, 1).await.2[0].reclaim_eligible);
+        }
+        executor.background.store(0, Ordering::SeqCst);
+        assert!(client.retained_snapshot(0, 1).await.2[0].reclaim_eligible);
+        executor.fail_cleanup.store(true, Ordering::SeqCst);
+        assert!(client.try_dispose_idle(&id).await.is_err());
+        assert_eq!(client.retained_snapshot(0, 1).await.0, 1);
+        assert!(!client.try_dispose_idle(&id).await.unwrap());
+        assert!(client
+            .acquire(RuntimeSpec::new(id.clone(), Provider::Claude, "."))
+            .await
+            .is_err());
+        client.dispose(&id).await.unwrap();
+        assert_eq!(client.retained_snapshot(0, 1).await.0, 0);
+    }
+
+    #[tokio::test]
+    async fn idle_reclamation_excludes_in_flight_lifecycle_and_fences_attach() {
+        let client = InProcessRuntimeClient::from_executor(Arc::new(PausedCleanup::ready()));
+        let id = RuntimeId::new("race").unwrap();
+        let spec = RuntimeSpec::new(id.clone(), Provider::Claude, ".");
+        drop(client.acquire(spec.clone()).await.unwrap());
+        for status in [
+            RuntimeStatus::Starting,
+            RuntimeStatus::Busy,
+            RuntimeStatus::Degraded,
+            RuntimeStatus::Stopping,
+        ] {
+            client
+                .runtimes
+                .read()
+                .await
+                .get(&id)
+                .unwrap()
+                .state
+                .lock()
+                .await
+                .status = status;
+            assert!(!client.try_dispose_idle(&id).await.unwrap());
+        }
+        client
+            .runtimes
+            .read()
+            .await
+            .get(&id)
+            .unwrap()
+            .state
+            .lock()
+            .await
+            .status = RuntimeStatus::Ready;
+        for round in 0..300 {
+            let (attached, reclaimed) = if round % 2 == 0 {
+                tokio::join!(client.attach(&id), client.try_dispose_idle(&id))
+            } else {
+                let (reclaimed, attached) =
+                    tokio::join!(client.try_dispose_idle(&id), client.attach(&id));
+                (attached, reclaimed)
+            };
+            match attached {
+                Ok(handle) => {
+                    assert!(!reclaimed.unwrap());
+                    drop(handle);
+                    assert!(client.try_dispose_idle(&id).await.unwrap());
+                }
+                Err(_) => assert!(reclaimed.unwrap()),
+            }
+            drop(client.acquire(spec.clone()).await.unwrap());
+            assert_eq!(client.retained_snapshot(0, 1).await.0, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn reclamation_fences_attach_and_acquire_until_cleanup_finishes() {
+        let executor = Arc::new(PausedCleanup {
+            release: tokio::sync::Semaphore::new(0),
+            ..PausedCleanup::ready()
+        });
+        let client = InProcessRuntimeClient::from_executor(executor.clone());
+        let id = RuntimeId::new("reclaim-race").unwrap();
+        let spec = RuntimeSpec::new(id.clone(), Provider::Claude, ".");
+        drop(client.acquire(spec.clone()).await.unwrap());
+        let reclaim = {
+            let c = client.clone();
+            let id = id.clone();
+            tokio::spawn(async move { c.try_dispose_idle(&id).await })
+        };
+        executor.entered.acquire().await.unwrap().forget();
+        let attach = {
+            let c = client.clone();
+            let id = id.clone();
+            tokio::spawn(async move { c.attach(&id).await })
+        };
+        tokio::task::yield_now().await;
+        let acquire = {
+            let c = client.clone();
+            tokio::spawn(async move { c.acquire(spec).await })
+        };
+        tokio::task::yield_now().await;
+        assert!(!attach.is_finished());
+        assert!(!acquire.is_finished());
+        executor.release.add_permits(1);
+        assert!(reclaim.await.unwrap().unwrap());
+        assert!(attach.await.unwrap().is_err());
+        let replacement = acquire.await.unwrap().unwrap();
+        assert_eq!(replacement.health().await.status, RuntimeStatus::Ready);
+        assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelled_cleanup_keeps_identity_until_explicit_recovery() {
+        let executor = Arc::new(PausedCleanup {
+            release: tokio::sync::Semaphore::new(0),
+            ..PausedCleanup::ready()
+        });
+        let client = InProcessRuntimeClient::from_executor(executor.clone());
+        let id = RuntimeId::new("cancel-cleanup").unwrap();
+        let spec = RuntimeSpec::new(id.clone(), Provider::Claude, ".");
+        drop(client.acquire(spec.clone()).await.unwrap());
+        let reclaim = {
+            let c = client.clone();
+            let id = id.clone();
+            tokio::spawn(async move { c.try_dispose_idle(&id).await })
+        };
+        executor.entered.acquire().await.unwrap().forget();
+        reclaim.abort();
+        assert!(reclaim.await.unwrap_err().is_cancelled());
+        let snapshot = client.retained_snapshot(0, 1).await;
+        assert_eq!(snapshot.0, 1);
+        assert!(snapshot.2[0].disposal_started);
+        assert!(!snapshot.2[0].reclaim_eligible);
+        assert!(!client.try_dispose_idle(&id).await.unwrap());
+        assert!(client.acquire(spec.clone()).await.is_err());
+        client.dispose(&id).await.unwrap();
+        assert!(client.acquire(spec).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn overlapping_disposals_share_cleanup_and_cannot_remove_replacement() {
+        let executor = Arc::new(PausedCleanup {
+            entered: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Semaphore::new(0),
+            ..PausedCleanup::ready()
+        });
+        let client = InProcessRuntimeClient::from_executor(executor.clone());
+        let id = RuntimeId::new("disposal-race").unwrap();
+        let spec = RuntimeSpec::new(id.clone(), Provider::Claude, ".");
+        drop(client.acquire(spec.clone()).await.unwrap());
+        let first = {
+            let client = client.clone();
+            let id = id.clone();
+            tokio::spawn(async move { client.dispose(&id).await })
+        };
+        executor.entered.acquire().await.unwrap().forget();
+        let second = {
+            let client = client.clone();
+            let id = id.clone();
+            tokio::spawn(async move { client.dispose(&id).await })
+        };
+        // While cleanup is blocked, a second dispose must not publish completion
+        // or permit another generation with the same runtime key.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert!(
+            !second.is_finished(),
+            "overlapping disposal completed before the original cleanup"
+        );
+        assert!(client.acquire(spec.clone()).await.is_err());
+        executor.release.add_permits(1);
+        first.await.unwrap().unwrap();
+        second.await.unwrap().unwrap();
+        let replacement = client.acquire(spec).await.unwrap();
+        assert!(client.attach(&id).await.is_ok());
+        assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(replacement.health().await.status, RuntimeStatus::Ready);
     }
 }

@@ -1,0 +1,45 @@
+# Retained capacity and safe reclamation
+
+Retained entries are SDK handles, not visible root agents or live provider slots.
+Dropping a handle does not remove its registry entry. Capacity admission remains
+explicit: acquire does not silently dispose anything or replay a turn.
+
+`InProcessRuntimeClient::try_dispose_idle` is the application's bounded cleanup
+primitive. It rechecks exclusive registry ownership, inactive lifecycle and a
+known zero local background-task count while fencing acquire/attach. Unknown
+custom-executor background state is protected by default. Applications should
+select a bounded candidate list, invoke this operation only before external
+submission, and release their own capabilities only once their entries are gone.
+
+Cleanup timeout/failure retains the disposed identity and refuses subsequent
+automatic reclamation. An explicit disposal may retry cleanup; success removes
+only that exact entry. Concurrent disposals share successful cleanup and cannot
+remove a replacement generation. Existing explicit disposal still cancels active
+work; it must not be used as an idle-capacity sweep.
+
+`retained_snapshot` provides actual registry totals plus at most 100 selected
+entries, stable IDs, provider/model, lifecycle/invocation kind, age, borrowed
+ownership, known/unknown background count and advisory reclaim eligibility.
+It returns no secrets or launch context. Eligibility is a snapshot, never
+permission to use unchecked disposal later.
+
+Tests reproduce overlapping disposal completion before cleanup, then prove
+coalesced cleanup, borrowed/background/unknown protection, cleanup failure
+retention, and 300 acquire/attach/reclaim interleavings. The retained lifecycle
+suite also covers real accepted fixture turns, manual compaction, session resume,
+background handoff and cancellation. No external model calls are required.
+
+`RetainedRuntimeObserver` holds a weak registry reference. Applications can keep
+replaced host generations discoverable while another operation owns the client,
+without retaining the host, credentials or transport themselves. Once the last
+client owner drops, snapshot returns `None`; an observer does not offer control.
+
+## Compatibility and adoption
+
+No existing acquire/dispose call needs to change. Acquisition still refuses a full
+registry and never silently replays an invocation. Applications may choose the
+new idle-only primitive before submitting external effects, then retry admission
+once. Custom executors default to an unknown background-task count, which blocks
+automatic reclamation; implement `retained_background_task_count` only when the
+executor can report that fact authoritatively. Explicit disposal remains a
+cancellation operation. Snapshots are advisory and do not authorize disposal.

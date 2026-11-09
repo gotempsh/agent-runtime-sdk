@@ -7,11 +7,20 @@ Versioning and Keep a Changelog conventions.
 
 ### Added
 
+- Retained runtime registry snapshots and weak observers expose bounded ownership,
+  lifecycle, background work and capacity diagnostics without retaining a pool.
+- `try_dispose_idle` lets applications reclaim an unborrowed inactive runtime
+  only after confirming that no background work remains.
+
 - Read-only tailnet routing snapshots expose current peer routes and daemon
   generation without CLI requests or control-socket diagnostics. Unavailable
   daemons withhold routing endpoints; responses spanning restarts are rejected.
 
 ### Fixed
+
+- Concurrent retained-runtime disposal shares cleanup and removes only the exact
+  entry it cleaned up. Failed or cancelled cleanup preserves its identity; idle
+  reclamation cannot cancel active, borrowed or parked work.
 
 - Plain HTTP through the tailnet proxy now uses origin-form targets and a
   regenerated `Host` header. Each connection forwards one framed request and
