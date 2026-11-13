@@ -969,6 +969,16 @@ impl AgentAdapter for Codex {
             spec.interactive_stdin = true;
             return Ok(spec);
         }
+        if request
+            .harness_options
+            .get("mcp_elicitations")
+            .is_some_and(|value| value != "false")
+        {
+            return Err(RuntimeError::InvalidRequest {
+                field: "harness_options.mcp_elicitations",
+                message: "MCP permission routing requires Codex::app_server()".into(),
+            });
+        }
         spec.args.extend([
             "exec".into(),
             "--json".into(),
@@ -1236,6 +1246,16 @@ impl AgentAdapter for Codex {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exec_refuses_mcp_routing_it_cannot_deliver() {
+        let mut request = TurnRequest::new(Provider::Codex, ".", "inspect");
+        request
+            .harness_options
+            .insert("mcp_elicitations".into(), "true".into());
+        assert!(Codex::default().command(&request).is_err());
+        assert!(Codex::app_server().command(&request).is_ok());
+    }
 
     #[test]
     fn only_the_app_server_reports_the_compaction_lifecycle() {

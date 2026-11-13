@@ -7,6 +7,11 @@ Versioning and Keep a Changelog conventions.
 
 ### Added
 
+- Codex app-server hosts can opt into MCP permission routing with
+  `harness_options.mcp_elicitations = "true"` while keeping command approval
+  policy `never`. Requests still require a host verdict, and sandbox/rule
+  escalation stays disabled. The one-shot exec adapter rejects the option.
+
 - Retained runtime registry snapshots and weak observers expose bounded ownership,
   lifecycle, background work and capacity diagnostics without retaining a pool.
 - `try_dispose_idle` lets applications reclaim an unborrowed inactive runtime
