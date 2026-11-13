@@ -4605,6 +4605,14 @@ impl AgentRuntime {
             if key == "service_tier" && provider == Provider::Codex {
                 continue;
             }
+            // Host-owned permission routing, not a model-selectable command
+            // approval mode. The adapter refuses it in noninteractive exec.
+            if key == "mcp_elicitations"
+                && provider == Provider::Codex
+                && matches!(value.as_str(), "true" | "false")
+            {
+                continue;
+            }
             if key == "fast_mode"
                 && provider == Provider::Claude
                 && matches!(value.as_str(), "true" | "false")
@@ -9328,6 +9336,42 @@ mod tests {
                 provider: Provider::Codex
             }
         ));
+    }
+
+    #[cfg(feature = "codex")]
+    #[tokio::test]
+    async fn codex_mcp_routing_passes_public_runtime_validation_only_for_booleans() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = AgentRuntime::builder().build().unwrap();
+        for value in ["true", "false", "yes"] {
+            let mut request = TurnRequest::new(Provider::Codex, directory.path(), "test");
+            request
+                .harness_options
+                .insert("mcp_elicitations".into(), value.into());
+            // Cancellation is checked after option validation and before any
+            // process starts, so this tests the public path without an account.
+            request.cancellation.cancel();
+            let error = runtime
+                .run(request, &crate::NoopEventSink, None)
+                .await
+                .unwrap_err();
+            if value == "yes" {
+                assert!(matches!(
+                    error,
+                    RuntimeError::InvalidRequest {
+                        field: "harness_options",
+                        ..
+                    }
+                ));
+            } else {
+                assert!(matches!(
+                    error,
+                    RuntimeError::Cancelled {
+                        provider: Provider::Codex
+                    }
+                ));
+            }
+        }
     }
 
     #[cfg(feature = "codex")]

@@ -40,7 +40,7 @@ features.
 | `Plan` | yes | yes, read-only sandbox | `Serve`: both categories denied; `Run`: built-in `plan` agent | yes, `--tools` limited to `read`, `grep`, `find`, `ls` |
 | `FullAccess` | yes | yes | `Serve`: `edit: allow`, `bash: allow`; `Run`: `--auto`, explicit configured denies remain | yes, pi's configured tools |
 | Custom mode | yes | yes, native approval policy | yes, configured agent | no |
-| Live approvals | yes | app-server mode only (`exec` is configured non-interactively) | `Serve` mode only (`run` is non-interactive) | only from pi extensions (`confirm`) |
+| Live approvals | yes | app-server mode only; optional MCP routing under `never` (`exec` is non-interactive) | `Serve` mode only (`run` is non-interactive) | only from pi extensions (`confirm`) |
 | Live user questions | yes | app-server mode only, blocking and async | no; OpenCode has no question channel | only from pi extensions (`select`, `input`, `editor`) |
 | Cooperative interrupt on cancellation | retained process only (`interrupt` control request; keeps the process and background shells; Claude stops background subagents unless it had already answered) | app-server mode only (`turn/interrupt`) | `Serve` mode only (`session/abort`) | yes (`abort`) |
 | Messages into a running turn | retained process only | no | no | no |
@@ -79,6 +79,13 @@ The app-server mode requires a transport whose capabilities include
 resumed thread identifier travel in `thread/start`/`thread/resume` and
 `turn/start` instead of argv; turn-scoped stdio and HTTP MCP servers and the
 model relay still use `--config` overrides.
+
+Migration is opt-in: existing hosts keep their current behavior. A host that
+already supplies an MCP permission handler can add `mcp_elicitations = "true"`
+to its harness options to receive MCP requests under `never`; see `TurnRequest`
+below. Use a Codex version supporting granular approval policy (validated with
+the installed CLI's generated protocol schema); unsupported providers fail
+rather than falling back to a broader approval policy.
 
 ### OpenCode turn modes
 
@@ -312,6 +319,16 @@ turn-scoped automation. Cancellation, timeout, sink failure, and a dropped
 in-flight future always terminate the supervised tree. Its `Debug`
 implementation prints prompt length, environment keys, and non-secret sandbox
 capabilities—never prompt or secret values.
+
+Hosts using `Codex::app_server()` can set the string harness option
+`mcp_elicitations = "true"` to route MCP permission requests to their
+`InteractionHandler` even with command approval policy `never`. This uses
+Codex's granular approval policy: MCP elicitations are enabled while rules,
+sandbox escalation, permission requests and skill approvals stay disabled.
+It does not approve calls, change the sandbox, or change `on-request` and
+`untrusted` policies. The handler must authorize each request; missing handlers
+continue to fail closed. The default is unchanged. One-shot `Codex::default()`
+rejects this option because it cannot deliver live permission requests.
 
 Explicit environment input is bounded to 128 variables, 64 KiB per value, and
 256 KiB across names and values. These values are injected into the harness;

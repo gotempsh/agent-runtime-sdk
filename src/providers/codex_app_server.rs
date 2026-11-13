@@ -262,6 +262,32 @@ pub(super) fn prepare_turn(request: &TurnRequest, state: &mut AdapterState) -> R
         "sandbox": sandbox,
         "approvalPolicy": approval,
     });
+    // Hosts with an MCP permission handler must be able to classify the call
+    // before Codex rejects it. This opts into elicitation delivery, not approval:
+    // the host still answers every request. Keep all execution escalation paths
+    // closed when the selected command policy is `never`.
+    match request
+        .harness_options
+        .get("mcp_elicitations")
+        .map(String::as_str)
+    {
+        Some("true") if approval == "never" => {
+            thread_params["approvalPolicy"] = json!({"granular": {
+                "mcp_elicitations": true,
+                "rules": false,
+                "sandbox_approval": false,
+                "request_permissions": false,
+                "skill_approval": false,
+            }});
+        }
+        None | Some("false") | Some("true") => {}
+        Some(_) => {
+            return Err(RuntimeError::InvalidRequest {
+                field: "harness_options.mcp_elicitations",
+                message: "expected true or false".into(),
+            })
+        }
+    }
     if let Some(instructions) = request.launch_context.system_prompt_append.as_deref() {
         thread_params["developerInstructions"] = json!(instructions);
     }
@@ -2797,6 +2823,58 @@ mod tests {
             turn.turn_params["input"][0],
             json!({"type": "text", "text": "inspect"})
         );
+    }
+
+    #[test]
+    fn hosted_mcp_approvals_reach_the_handler_without_enabling_execution_escalation() {
+        for sandbox in ["read-only", "workspace-write", "danger-full-access"] {
+            let mut request = TurnRequest::new(Provider::Codex, ".", "inspect");
+            request
+                .harness_options
+                .insert("approval_policy".into(), "never".into());
+            request
+                .harness_options
+                .insert("sandbox_mode".into(), sandbox.into());
+            request
+                .harness_options
+                .insert("mcp_elicitations".into(), "true".into());
+            let mut state = AdapterState::default();
+            prepare_turn(&request, &mut state).unwrap();
+            let turn = load(&state);
+            assert_eq!(turn.thread_params["sandbox"], sandbox);
+            assert_eq!(
+                turn.thread_params["approvalPolicy"],
+                json!({"granular": {
+                    "mcp_elicitations": true, "rules": false,
+                    "sandbox_approval": false, "request_permissions": false,
+                    "skill_approval": false,
+                }})
+            );
+            // The transport still waits for the host's verdict, including deny.
+            let output = feed(&mut state, serde_json::from_str(MCP_TOOL_APPROVAL).unwrap());
+            assert!(matches!(
+                output.interaction,
+                Some(InteractionRequest::Approval { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn hosted_mcp_routing_preserves_manual_approval_and_rejects_invalid_options() {
+        let mut request = TurnRequest::new(Provider::Codex, ".", "inspect");
+        request
+            .harness_options
+            .insert("approval_policy".into(), "on-request".into());
+        request
+            .harness_options
+            .insert("mcp_elicitations".into(), "true".into());
+        let mut state = AdapterState::default();
+        prepare_turn(&request, &mut state).unwrap();
+        assert_eq!(load(&state).thread_params["approvalPolicy"], "on-request");
+        request
+            .harness_options
+            .insert("mcp_elicitations".into(), "yes".into());
+        assert!(prepare_turn(&request, &mut state).is_err());
     }
 
     #[test]
