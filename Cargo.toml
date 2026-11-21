@@ -59,7 +59,7 @@ tokio-util = { version = "0.7", features = ["rt"] }
 url = "2"
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.31", features = ["process", "signal"] }
+nix = { version = "0.32", features = ["process", "signal"] }
 
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 # Only process inspection is needed. sysinfo 0.39 requires Rust 1.95, the SDK minimum.
