@@ -1457,6 +1457,20 @@ impl AgentAdapter for Claude {
             };
             settings.insert("fastMode".into(), serde_json::Value::Bool(enabled));
         }
+        // Comma-separated Claude permission rules that must ask the
+        // application first (`permissions.ask`), even in auto or bypass
+        // modes. The application answers through its approval handler; an
+        // application can take over a tool this way, such as CronCreate.
+        if let Some(tools) = request.harness_options.get("permission_ask_tools") {
+            let rules: Vec<&str> = tools.split(',').map(str::trim).filter(|rule| !rule.is_empty()).collect();
+            if rules.is_empty() || rules.iter().any(|rule| rule.chars().any(char::is_control)) {
+                return Err(RuntimeError::InvalidRequest {
+                    field: "harness_options.permission_ask_tools",
+                    message: "Claude permission ask rules must be a comma-separated list of tool rules".into(),
+                });
+            }
+            settings.insert("permissions".into(), json!({ "ask": rules }));
+        }
         if !settings.is_empty() {
             spec.args.extend([
                 "--settings".into(),
@@ -4091,6 +4105,34 @@ setTimeout(() => {
                 serde_json::from_str(&settings[0][1].to_string_lossy()).unwrap();
             assert_eq!(value["fastMode"], enabled);
             assert_eq!(value["ultracode"], true);
+        }
+    }
+
+    #[test]
+    fn permission_ask_tools_become_claude_ask_rules() {
+        let adapter = Claude::default();
+        let mut request = TurnRequest::new(Provider::Claude, ".", "test");
+        request.harness_options.insert("fast_mode".into(), "false".into());
+        request
+            .harness_options
+            .insert("permission_ask_tools".into(), "CronCreate, ScheduleWakeup,,".into());
+        let command = adapter.command(&request).unwrap();
+        let settings: Vec<_> = command
+            .args
+            .windows(2)
+            .filter(|args| args[0] == "--settings")
+            .collect();
+        assert_eq!(settings.len(), 1);
+        let value: serde_json::Value =
+            serde_json::from_str(&settings[0][1].to_string_lossy()).unwrap();
+        assert_eq!(value["permissions"]["ask"], json!(["CronCreate", "ScheduleWakeup"]));
+        assert_eq!(value["fastMode"], false);
+
+        for invalid in [" , ", "CronCreate\nBash"] {
+            request
+                .harness_options
+                .insert("permission_ask_tools".into(), invalid.into());
+            assert!(adapter.command(&request).is_err(), "{invalid:?}");
         }
     }
 

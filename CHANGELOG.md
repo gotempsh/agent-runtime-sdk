@@ -7,6 +7,13 @@ Versioning and Keep a Changelog conventions.
 
 ### Added
 
+- Claude hosts can require an approval request for chosen tools with
+  `harness_options.permission_ask_tools` (comma-separated permission rules,
+  passed as `permissions.ask` in `--settings`). Claude asks even in auto and
+  bypass modes, so a host can answer a tool itself, for example taking over
+  `CronCreate` and `ScheduleWakeup` timers that would otherwise live only in
+  the process.
+
 - Codex app-server hosts can opt into MCP permission routing with
   `harness_options.mcp_elicitations = "true"` while keeping command approval
   policy `never`. Requests still require a host verdict, and sandbox/rule
