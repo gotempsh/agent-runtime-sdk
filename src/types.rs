@@ -1155,6 +1155,17 @@ pub enum TurnEvent {
         /// Provider-native display title, trimmed and non-empty.
         title: String,
     },
+    /// The harness's own account of what fills its context window, sent once
+    /// per turn when the host sets `harness_options.context_breakdown` to
+    /// `true`. Claude answers with the data behind its `/context` view:
+    /// tokens per category (system prompt, tools, memory files, skills, MCP
+    /// tools, messages), the window size and the files and tools behind
+    /// each category. The report is the provider's JSON as it stands, so a
+    /// host reads the fields it knows and ignores the rest.
+    ContextBreakdown {
+        /// Provider-native report.
+        report: Value,
+    },
     /// Incremental assistant prose.
     TextDelta {
         /// Newly generated prose.

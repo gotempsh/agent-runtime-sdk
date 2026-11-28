@@ -7,6 +7,13 @@ Versioning and Keep a Changelog conventions.
 
 ### Added
 
+- Claude hosts can ask what fills the context window with
+  `harness_options.context_breakdown = "true"`. Once per turn the adapter sends
+  Claude's `get_context_usage` request and reports the answer as
+  `TurnEvent::ContextBreakdown`: tokens per category (system prompt, tools,
+  memory files, skills, MCP tools, messages), the window size and the files and
+  tools behind each. A CLI without the request is left as it was.
+
 - Claude hosts can require an approval request for chosen tools with
   `harness_options.permission_ask_tools` (comma-separated permission rules,
   passed as `permissions.ask` in `--settings`). Claude asks even in auto and

@@ -49,6 +49,7 @@ const FOLLOW_UP_GRACE: Duration = Duration::from_secs(3);
 /// Request ID of the native interrupt the runtime sends to a retained turn.
 const INTERRUPT_REQUEST_ID: &str = "temps-agent-runtime-interrupt";
 const SESSION_TITLE_REQUEST_ID: &str = "temps-agent-runtime-session-title";
+const CONTEXT_USAGE_REQUEST_ID: &str = "temps-agent-runtime-context-usage";
 /// Claude Code's own client titles from at most this much of the prompt.
 const SESSION_TITLE_DESCRIPTION_CHARS: usize = 1000;
 /// Upper bound on user messages one turn may submit, its prompt included.
@@ -465,6 +466,11 @@ struct ClaudeNativeState {
     /// is written after the turn's first frame.
     #[serde(default)]
     session_title_description: Option<String>,
+    /// The host asked for this turn's context breakdown
+    /// (`harness_options.context_breakdown`); cleared when the request is
+    /// written after the turn's first frame.
+    #[serde(default)]
+    context_breakdown_wanted: bool,
 }
 
 fn accept_input_receipt(previous: &str, next: &str) -> bool {
@@ -1140,6 +1146,10 @@ impl AgentAdapter for Claude {
                     .take(SESSION_TITLE_DESCRIPTION_CHARS)
                     .collect()
             });
+        native.context_breakdown_wanted = request
+            .harness_options
+            .get("context_breakdown")
+            .is_some_and(|value| value == "true");
         native
             .own_commands
             .insert(new_message_uuid(), "pending".to_string());
@@ -1544,6 +1554,14 @@ impl AgentAdapter for Claude {
             output
                 .optional_writes
                 .push(session_title_frame(&description)?);
+        }
+        // The same moment suits the context breakdown: the session then holds
+        // this turn's message. A CLI without `get_context_usage` answers with
+        // an error, which is ignored below.
+        if std::mem::take(&mut native.context_breakdown_wanted) {
+            if let Some(frame) = context_usage_frame() {
+                output.optional_writes.push(frame);
+            }
         }
         match value
             .get("type")
@@ -2078,6 +2096,22 @@ impl AgentAdapter for Claude {
                             super::report_session_title(title, state, &mut output);
                         }
                     }
+                    // Only a successful report with a body is passed on; a
+                    // refusal leaves the host with its last one.
+                    Some(CONTEXT_USAGE_REQUEST_ID) => {
+                        if value.pointer("/response/subtype").and_then(Value::as_str)
+                            == Some("success")
+                        {
+                            if let Some(report) = value
+                                .pointer("/response/response")
+                                .filter(|report| report.is_object())
+                            {
+                                output.events.push(TurnEvent::ContextBreakdown {
+                                    report: report.clone(),
+                                });
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -2146,6 +2180,16 @@ impl AgentAdapter for Claude {
         };
         encode_control_response(&request.id, response).map(Some)
     }
+}
+
+/// Claude's `get_context_usage` control request: the data behind `/context`.
+fn context_usage_frame() -> Option<Vec<u8>> {
+    serde_json::to_vec(&json!({
+        "type": "control_request",
+        "request_id": CONTEXT_USAGE_REQUEST_ID,
+        "request": { "subtype": "get_context_usage" }
+    }))
+    .ok()
 }
 
 fn session_title_frame(description: &str) -> Result<Vec<u8>> {
@@ -4106,6 +4150,63 @@ setTimeout(() => {
             assert_eq!(value["fastMode"], enabled);
             assert_eq!(value["ultracode"], true);
         }
+    }
+
+    #[test]
+    fn context_breakdown_is_asked_once_per_turn_and_reported() {
+        let adapter = Claude::default();
+        let mut state = AdapterState::default();
+        let mut request = TurnRequest::new(Provider::Claude, ".", "test");
+        request
+            .harness_options
+            .insert("context_breakdown".into(), "true".into());
+        adapter.prepare_turn(&request, &mut state).unwrap();
+
+        let first = adapter
+            .parse_line(r#"{"type":"system","subtype":"init","session_id":"s"}"#, &mut state)
+            .unwrap();
+        let asked: Vec<serde_json::Value> = first
+            .optional_writes
+            .iter()
+            .map(|frame| serde_json::from_slice(frame).unwrap())
+            .collect();
+        assert!(asked.iter().any(|frame| frame["request_id"] == CONTEXT_USAGE_REQUEST_ID
+            && frame["request"]["subtype"] == "get_context_usage"));
+        // Asked once: later frames don't repeat it.
+        let second = adapter
+            .parse_line(r#"{"type":"system","subtype":"status","session_id":"s"}"#, &mut state)
+            .unwrap();
+        assert!(second.optional_writes.is_empty());
+
+        let answered = adapter
+            .parse_line(
+                &json!({"type":"control_response","response":{"subtype":"success","request_id":CONTEXT_USAGE_REQUEST_ID,"response":{"totalTokens":19720,"maxTokens":1000000,"categories":[{"id":"system_prompt","name":"System prompt","tokens":2685,"kind":"used"}]}}}).to_string(),
+                &mut state,
+            )
+            .unwrap();
+        assert!(matches!(
+            answered.events.as_slice(),
+            [TurnEvent::ContextBreakdown { report }] if report["totalTokens"] == 19720
+                && report["categories"][0]["id"] == "system_prompt"
+        ));
+        // A CLI without the request refuses it: nothing is reported.
+        let refused = adapter
+            .parse_line(
+                &json!({"type":"control_response","response":{"subtype":"error","request_id":CONTEXT_USAGE_REQUEST_ID,"error":"unsupported"}}).to_string(),
+                &mut state,
+            )
+            .unwrap();
+        assert!(refused.events.is_empty());
+
+        // Without the option nothing is asked.
+        let mut quiet = AdapterState::default();
+        adapter
+            .prepare_turn(&TurnRequest::new(Provider::Claude, ".", "test"), &mut quiet)
+            .unwrap();
+        let frame = adapter
+            .parse_line(r#"{"type":"system","subtype":"init","session_id":"s"}"#, &mut quiet)
+            .unwrap();
+        assert!(frame.optional_writes.is_empty());
     }
 
     #[test]
