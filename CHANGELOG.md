@@ -12,6 +12,9 @@ Versioning and Keep a Changelog conventions.
   (`permission_ask_tools`, `context_breakdown`) now pass request validation;
   the adapter still validates their values.
 
+- A Claude answer to a title or context request that arrives after its turn
+  ended no longer retires the parked process and the background work it holds.
+
 ### Added
 
 - Claude hosts can ask what fills the context window with

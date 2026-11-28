@@ -1538,6 +1538,27 @@ impl AgentAdapter for Claude {
         Ok(spec)
     }
 
+    /// A report or a title asked for during a turn can be answered after
+    /// that turn ended. It says nothing about the parked process, so it must
+    /// not retire it (and stop the background work it holds).
+    fn classify_idle_frame(&self, line: &str) -> crate::adapter::IdleFrame {
+        let late_answer = serde_json::from_str::<Value>(line)
+            .ok()
+            .filter(|frame| frame.get("type").and_then(Value::as_str) == Some("control_response"))
+            .and_then(|frame| {
+                frame
+                    .pointer("/response/request_id")
+                    .and_then(Value::as_str)
+                    .map(|id| id == CONTEXT_USAGE_REQUEST_ID || id == SESSION_TITLE_REQUEST_ID)
+            })
+            .unwrap_or(false);
+        if late_answer {
+            crate::adapter::IdleFrame::Background
+        } else {
+            crate::adapter::IdleFrame::Unexpected
+        }
+    }
+
     fn parse_line(&self, line: &str, state: &mut AdapterState) -> Result<AdapterOutput> {
         let value: Value = serde_json::from_str(line).map_err(|error| RuntimeError::Protocol {
             provider: Provider::Claude,
@@ -4197,6 +4218,16 @@ setTimeout(() => {
             )
             .unwrap();
         assert!(refused.events.is_empty());
+
+        // An answer that arrives after the turn ended leaves the parked
+        // process alone; any other frame between turns still retires it.
+        use crate::adapter::IdleFrame;
+        let late = |id: &str| json!({"type":"control_response","response":{"subtype":"success","request_id":id,"response":{}}}).to_string();
+        assert!(matches!(adapter.classify_idle_frame(&late(CONTEXT_USAGE_REQUEST_ID)), IdleFrame::Background));
+        assert!(matches!(adapter.classify_idle_frame(&late(SESSION_TITLE_REQUEST_ID)), IdleFrame::Background));
+        assert!(matches!(adapter.classify_idle_frame(&late("someone-else")), IdleFrame::Unexpected));
+        assert!(matches!(adapter.classify_idle_frame(r#"{"type":"assistant"}"#), IdleFrame::Unexpected));
+        assert!(matches!(adapter.classify_idle_frame("not json"), IdleFrame::Unexpected));
 
         // Without the option nothing is asked.
         let mut quiet = AdapterState::default();
