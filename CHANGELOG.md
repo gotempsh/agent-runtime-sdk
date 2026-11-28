@@ -5,6 +5,13 @@ Versioning and Keep a Changelog conventions.
 
 ## [Unreleased]
 
+### Fixed
+
+- A Claude turn carrying `harness_options.permission_ask_tools` was refused as
+  an unadvertised control before it started. Host-owned Claude options
+  (`permission_ask_tools`, `context_breakdown`) now pass request validation;
+  the adapter still validates their values.
+
 ### Added
 
 - Claude hosts can ask what fills the context window with

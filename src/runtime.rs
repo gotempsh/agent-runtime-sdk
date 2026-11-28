@@ -1422,6 +1422,20 @@ impl<R: tokio::io::AsyncBufRead + Unpin> tokio::io::AsyncBufRead for ArrivalRead
     }
 }
 
+/// Options a host sets for itself, which the adapter validates: they are not
+/// choices a user makes, so no control group advertises them.
+///
+/// - Claude `permission_ask_tools`: the tools that ask the host before running.
+/// - Claude `context_breakdown`: report what fills the context window.
+fn host_owned_option(provider: Provider, key: &str, value: &str) -> bool {
+    provider == Provider::Claude
+        && match key {
+            "permission_ask_tools" => true,
+            "context_breakdown" => matches!(value, "true" | "false"),
+            _ => false,
+        }
+}
+
 /// The harness options that decide whether a retained process is reused, left
 /// without those the process applies in place: a Claude process switches Fast
 /// mode and permission mode live, and an ACP session applies a changed `config`
@@ -4617,6 +4631,9 @@ impl AgentRuntime {
                 && provider == Provider::Claude
                 && matches!(value.as_str(), "true" | "false")
             {
+                continue;
+            }
+            if host_owned_option(provider, key, value) {
                 continue;
             }
             let Some(group) = control_groups.iter().find(|group| group.id == *key) else {
@@ -8190,6 +8207,19 @@ mod tests {
                 .map(|requests| requests.len()),
             Ok(5)
         );
+    }
+
+    #[test]
+    fn host_owned_claude_options_pass_without_a_control_group() {
+        assert!(host_owned_option(Provider::Claude, "permission_ask_tools", "CronCreate,ScheduleWakeup"));
+        assert!(host_owned_option(Provider::Claude, "context_breakdown", "true"));
+        assert!(host_owned_option(Provider::Claude, "context_breakdown", "false"));
+        // A value the adapter would not understand still fails validation.
+        assert!(!host_owned_option(Provider::Claude, "context_breakdown", "yes"));
+        // Only Claude has them, and nothing else is waved through.
+        assert!(!host_owned_option(Provider::Codex, "permission_ask_tools", "x"));
+        assert!(!host_owned_option(Provider::Codex, "context_breakdown", "true"));
+        assert!(!host_owned_option(Provider::Claude, "made_up", "true"));
     }
 
     #[test]
